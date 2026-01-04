@@ -20,6 +20,12 @@ arch_config_paths = {
         os.path.join("ringformer_v2", "32000.json"),
         os.path.join("ringformer_v2", "24000.json"),
     ],
+    "ringformer_v3": [
+        os.path.join("ringformer_v3", "48000.json"),
+        os.path.join("ringformer_v3", "40000.json"),
+        os.path.join("ringformer_v3", "32000.json"),
+        os.path.join("ringformer_v3", "24000.json"),
+    ],
     "pcph_gan": [
         os.path.join("pcph_gan", "48000.json"),
         os.path.join("pcph_gan", "40000.json"),
