@@ -402,8 +402,8 @@ class RefineGANGenerator(nn.Module):
                 x.contiguous(),
                 orig_freq=int(f0_size * old_size),
                 new_freq=int(f0_size * new_size),
-                lowpass_filter_width=64,
-                rolloff=0.9475937167399596,
+                lowpass_filter_width=6,  # Reduced from 64 for less aggressive filtering
+                rolloff=0.99,  # Increased from 0.9475 to preserve high frequencies
                 resampling_method="sinc_interp_kaiser",
                 beta=14.769656459379492,
             )
