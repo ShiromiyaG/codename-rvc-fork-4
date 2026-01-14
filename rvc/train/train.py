@@ -801,6 +801,7 @@ def run(
     )
 
     # Tensorboard handling
+    writer_eval = None
     if rank == 0:
         writer_eval = SummaryWriter(
             log_dir=os.path.join(experiment_dir, "eval"),
@@ -860,7 +861,7 @@ def run(
             [scheduler_g, scheduler_d],
             train_loader,
             val_loader if use_validation else None,
-            [writer_eval],
+            [writer_eval] if writer_eval is not None else None,
             cache,
             total_epoch_count,
             epoch_save_frequency,
@@ -959,8 +960,7 @@ def training_loop(
     if not benchmark_mode and use_validation:
         val_loader = val_loader if val_loader is not None else None
 
-    if writers is not None:
-        writer = writers[0]
+    writer = writers[0] if writers else None
 
     fn_hinge_loss = fn_hinge_loss if fn_hinge_loss is not None else None
     
@@ -1188,12 +1188,12 @@ def training_loop(
             # Grads:
             if torch.isfinite(grad_norm_d):
                 avg_rolling_cache["grad_norm_d"].append(grad_norm_d)
-            else:
+            elif writer is not None:
                 writer.add_scalar("Grad_Norm/D_Skipped", 1, global_step)
 
             if torch.isfinite(grad_norm_g):
                 avg_rolling_cache["grad_norm_g"].append(grad_norm_g)
-            else:
+            elif writer is not None:
                 writer.add_scalar("Grad_Norm/G_Skipped", 1, global_step)
 
             # Losses:
@@ -1228,7 +1228,8 @@ def training_loop(
                         scalar_dict_rolling[label] = val
 
                 summarize(writer=writer, global_step=global_step, scalars=scalar_dict_rolling)
-                flush_writer(writer, rank)
+                if writer is not None:
+                    flush_writer(writer, rank)
 
             if from_scratch and pretrain_preview and rank == 0 and global_step % 50 == 0:
                 print(f"    ██████  Generating pretrain-preview at step: {global_step}...")
@@ -1240,7 +1241,8 @@ def training_loop(
                     audios=audio_dict,
                     audio_sample_rate=config.data.sample_rate,
                 )
-                flush_writer(writer, rank)
+                if writer is not None:
+                    flush_writer(writer, rank)
                 torch.cuda.empty_cache()
 
             pbar.update(1)
@@ -1295,7 +1297,8 @@ def training_loop(
         # Mel similarity metric:
         mel_similarity = mel_spec_similarity(y_hat_mel, y_mel)
         print(f'Mel Spectrogram Similarity: {mel_similarity:.2f}%')
-        writer.add_scalar('Metric/Mel_Spectrogram_Similarity', mel_similarity, global_step)
+        if writer is not None:
+            writer.add_scalar('Metric/Mel_Spectrogram_Similarity', mel_similarity, global_step)
 
         # Learning rate retrieval for avg-epoch variation:
         lr_d = optim_d.param_groups[0]["lr"]
@@ -1321,7 +1324,8 @@ def training_loop(
                 scalar_dict_avg.update({"loss_avg/loss_env": avg_epoch_loss[6].item()})
 
             summarize(writer=writer, global_step=global_step, scalars=scalar_dict_avg)
-            flush_writer(writer, rank)
+            if writer is not None:
+                flush_writer(writer, rank)
             num_batches_in_epoch = 0
             epoch_loss_tensor.zero_()
 
@@ -1361,14 +1365,16 @@ def training_loop(
                 audios=audio_dict,
                 audio_sample_rate=config.data.sample_rate,
             )
-            flush_writer(writer, rank)
+            if writer is not None:
+                flush_writer(writer, rank)
         else:
             summarize(
                 writer=writer,
                 global_step=global_step,
                 images=image_dict,
             )
-            flush_writer(writer, rank)
+            if writer is not None:
+                flush_writer(writer, rank)
 
     # Save checkpoint
     model_add = []
@@ -1431,7 +1437,7 @@ def training_loop(
             # Clean-up process IDs from memory
             pid_data["process_pids"].clear()  # Clear the PID list when done
 
-            if rank == 0:
+            if rank == 0 and writer is not None:
                 writer.flush()
                 writer.close()
 
