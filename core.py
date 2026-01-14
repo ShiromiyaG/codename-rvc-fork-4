@@ -6,7 +6,7 @@ import argparse
 
 import platform
 import subprocess
-#import signal
+import signal
 #import multiprocessing
 
 
@@ -119,6 +119,7 @@ def run_infer_script(
     delay_mix: float = 0.5,
     sid: int = 0,
     seed: int = 0,
+    uvmp_submodel: str = None,
 ):
     kwargs = {
         "audio_input_path": input_path,
@@ -183,6 +184,7 @@ def run_infer_script(
         "delay_mix": delay_mix,
         "sid": sid,
         "seed": seed,
+        "uvmp_submodel": uvmp_submodel,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio(
@@ -629,23 +631,21 @@ def stop_train_script():
     global training_process
     if training_process and training_process.poll() is None:
         try:
-        # Get the parent process
             pid = training_process.pid
             parent_process = psutil.Process(pid)
-        # Since we use 'mp.spawn' we need to get all worker processes
+
             worker_pids = []
             for child in parent_process.children(recursive=True):
                 worker_pids.append(child.pid)
-        # Terminate all child processes / workers spawned by mp.spawn or DDP
+
             for pid in worker_pids:
                 worker_process = psutil.Process(pid)
                 worker_process.terminate()
                 print(f"[TRAINING] Terminated child worker process PID: {pid}")
 
-        # Now terminate the main (parent) training process
             parent_process.terminate()
             print(f"[TRAINING] Terminated parent process PID: {pid}")
-            
+
             return ""
 
         except psutil.NoSuchProcess as e:
@@ -664,6 +664,34 @@ def stop_train_script():
         else:
             subprocess.run(["pkill", "-f", "rvc/train/train.py"])
         return "Emergency-Nuke issued."
+
+# Saving the models at given step count and stopping the training
+def early_save_stop(model_name):
+    global training_process
+
+    if training_process and training_process.poll() is None:
+        print(f"[TRAINING]  Sending Early Stopping signal to PID: {training_process.pid}")
+
+        try:
+            if platform.system() == "Windows":
+                os.kill(training_process.pid, signal.CTRL_BREAK_EVENT)
+            else:
+                os.kill(training_process.pid, signal.SIGINT)
+
+            try:
+                training_process.wait(timeout=10)
+                print("[TRAINING] Early Stopping completed.")
+                return ""
+
+            except subprocess.TimeoutExpired:
+                print("[TRAINING] Save timed out! Issuing Hard-Stop.")
+                return stop_train_script()
+
+        except Exception as e:
+            print(f"[TRAINING] Signal Error: {e}")
+            return f"Error during the Early Stopping-stop: {e}"
+    else:
+        return "No active training process to early stop."
 
 
 # Index
