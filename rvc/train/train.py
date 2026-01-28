@@ -973,6 +973,7 @@ def run(
 
     # Tensorboard handling
     writer_eval = None
+    trajectory_tracker = None
     if rank == 0:
         writer_eval = SummaryWriter(
             log_dir=os.path.join(experiment_dir, "eval"),
@@ -982,8 +983,6 @@ def run(
 
         if use_trajectory:
             trajectory_tracker = WeightTrajectoryVisualizer(history_limit=100)
-        else:
-            trajectory_tracker = None
 
         block_tensorboard_flush_on_exit(writer_eval)
 
