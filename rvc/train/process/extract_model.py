@@ -59,7 +59,8 @@ def extract_model(
 
         opt = OrderedDict(
             weight={
-                key: value.half() for key, value in ckpt.items() if "enc_q" not in key
+                key.replace("_orig_mod.", ""): value.half()
+                for key, value in ckpt.items() if "enc_q" not in key
             }
         )
 

@@ -538,6 +538,12 @@ class VoiceConverter:
         Sets up the network configuration based on the loaded checkpoint.
         """
         if self.active_cpt is not None:
+            # Strip _orig_mod. prefix from compiled model checkpoints
+            if any(k.startswith("_orig_mod.") for k in self.active_cpt.get("weight", {})):
+                self.active_cpt["weight"] = {
+                    k.replace("_orig_mod.", ""): v
+                    for k, v in self.active_cpt["weight"].items()
+                }
             self.tgt_sr = self.active_cpt["config"][-1]
             self.active_cpt["config"][-3] = self.active_cpt["weight"]["emb_g.weight"].shape[0]
             self.use_f0 = self.active_cpt.get("f0", 1)
