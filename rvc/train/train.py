@@ -408,6 +408,7 @@ def get_d_model(config, vocoder, use_checkpointing):
         # Normal FireflyGAN:  Use d_mult=0.75 for a lighter MRD while
         # keeping all 5 resolutions for full spectral coverage.
         mrd_config.setdefault("mrd_d_mult", 0.75)
+        mrd_config["use_highband"] = True  # High-Band disc for 8-16 kHz
         return MPD_MSD_MRD_Combined(
             config.model.use_spectral_norm,
             use_checkpointing=use_checkpointing,
@@ -587,7 +588,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
 
             # Load the model and optim states
             _, _, _, epoch_str, gradscaler_dict = load_checkpoint(g_checkpoint_path, net_g, optim_g)
-            _, _, _, epoch_str, _ = load_checkpoint(d_checkpoint_path, net_d, optim_d)
+            _, _, _, epoch_str, _ = load_checkpoint(d_checkpoint_path, net_d, optim_d, strict=False)
 
             if override_pretrain_lr:
                 new_lr_for_pretrain = new_pretrain_lr

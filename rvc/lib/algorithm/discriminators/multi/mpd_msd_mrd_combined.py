@@ -22,6 +22,7 @@ class MPD_MSD_MRD_Combined(torch.nn.Module):
     """
     Class combining:
     Multi-Period, Multi-Scale and Multi-Resolution Discriminators.
+    Optionally includes a High-Band Discriminator for 8-16 kHz.
     """
 
     def __init__(self, use_spectral_norm: bool = False, use_checkpointing: bool = False, **multi_resolution_cfg):
@@ -31,6 +32,7 @@ class MPD_MSD_MRD_Combined(torch.nn.Module):
 
         periods = self.mrd_cfg.get("periods", [2, 3, 5, 7, 11]) # [2, 3, 5, 7, 11, 17, 23, 37]  -  MPD carry style
         mrd_d_mult = float(self.mrd_cfg.get("mrd_d_mult", 1.0))
+        use_highband = bool(self.mrd_cfg.get("use_highband", False))
 
         self.resolutions = self.mrd_cfg["resolutions"]
 
@@ -43,6 +45,10 @@ class MPD_MSD_MRD_Combined(torch.nn.Module):
             + [DiscriminatorP(p, use_spectral_norm=use_spectral_norm) for p in periods]
             + [DiscriminatorR(self.mrd_cfg, resolution, d_mult=mrd_d_mult) for resolution in self.resolutions]
         )
+
+        # Optional: High-Band Discriminator for sharper 8-16 kHz learning
+        if use_highband:
+            self.discriminators.append(DiscriminatorHB())
 
     def forward(self, y, y_hat):
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
@@ -256,3 +262,55 @@ class DiscriminatorR(nn.Module):
         mag = torch.norm(x, p=2, dim=-1)  # [B, F, TT]
 
         return mag
+
+
+class DiscriminatorHB(nn.Module):
+    """High-Band Discriminator: STFT → crop upper-half bins → conv2d.
+
+    Focuses exclusively on the 8–16 kHz band (at 32 kHz SR) where the
+    generator tends to hallucinate phantom harmonics.  Uses n_fft=1024
+    for 31.25 Hz/bin resolution, then keeps only bins 256-512.
+    Lightweight: ~190 K params (vs ~2 M for full 5-resolution MRD).
+    """
+
+    def __init__(self, n_fft: int = 1024, hop_length: int = 256, win_length: int = 1024):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+
+        ch = 32
+        self.convs = nn.ModuleList([
+            weight_norm(nn.Conv2d(1,  ch, (3, 9), padding=(1, 4))),
+            weight_norm(nn.Conv2d(ch, ch, (3, 9), stride=(1, 2), padding=(1, 4))),
+            weight_norm(nn.Conv2d(ch, ch, (3, 9), stride=(1, 2), padding=(1, 4))),
+            weight_norm(nn.Conv2d(ch, ch, (3, 3), padding=(1, 1))),
+        ])
+        self.conv_post = weight_norm(nn.Conv2d(ch, 1, (3, 3), padding=(1, 1)))
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        fmap = []
+        x = self._highband_spectrogram(x)
+        x = x.unsqueeze(1)  # (B, 1, F_high, T)
+        for conv in self.convs:
+            x = F.leaky_relu(conv(x), 0.1)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = torch.flatten(x, 1, -1)
+        return x, fmap
+
+    def _highband_spectrogram(self, x: torch.Tensor) -> torch.Tensor:
+        window = torch.hann_window(self.win_length, device=x.device)
+        pad = (self.n_fft - self.hop_length) // 2
+        x = F.pad(x, (pad, pad), mode="reflect")
+        x = x.squeeze(1)
+        stft = torch.stft(
+            x, n_fft=self.n_fft, hop_length=self.hop_length,
+            win_length=self.win_length, window=window,
+            center=False, return_complex=True,
+        )
+        mag = stft.abs()  # (B, n_fft//2+1, T)
+        # Keep only upper half of frequency bins (8-16 kHz at 32 kHz SR)
+        n_bins = mag.shape[1]
+        return mag[:, n_bins // 2 :, :]

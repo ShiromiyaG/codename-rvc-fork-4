@@ -49,7 +49,7 @@ def replace_keys_in_dict(d, old_key_part, new_key_part):
     return updated_dict
 
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
+def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1, strict=True):
     assert os.path.isfile(checkpoint_path), f"Checkpoint not found: {checkpoint_path}"
     checkpoint_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
 
@@ -63,13 +63,25 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
     if any(k.startswith("_orig_mod.") for k in saved_state):
         saved_state = {k.replace("_orig_mod.", "", 1): v for k, v in saved_state.items()}
 
-    model_state.load_state_dict(saved_state, strict=True)
+    missing, unexpected = model_state.load_state_dict(saved_state, strict=False)
+    if strict and (missing or unexpected):
+        raise RuntimeError(
+            f"Checkpoint mismatch (strict=True): {len(missing)} missing, {len(unexpected)} unexpected keys. "
+            f"Missing: {missing[:5]}{'...' if len(missing)>5 else ''}"
+        )
+    elif missing or unexpected:
+        print(f"[CKPT] Partial load: {len(missing)} new keys (init fresh), {len(unexpected)} old keys skipped.")
 
     if optimizer and load_opt == 1:
         opt_state = checkpoint_dict.get("optimizer")
         if opt_state:
-            optimizer.load_state_dict(opt_state)
-            print("Loaded optimizer state.")
+            try:
+                optimizer.load_state_dict(opt_state)
+                print("Loaded optimizer state.")
+            except (ValueError, KeyError):
+                # Param count changed (e.g. new sub-discriminator added);
+                # optimizer restarts with fresh momentum / variance.
+                print("[WARN] Optimizer state mismatch — reinitialising optimizer.")
 
     print(f"Loaded checkpoint '{checkpoint_path}' (iteration {checkpoint_dict['iteration']})")
     return (
