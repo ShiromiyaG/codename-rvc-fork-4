@@ -63,7 +63,21 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1, strict=T
     if any(k.startswith("_orig_mod.") for k in saved_state):
         saved_state = {k.replace("_orig_mod.", "", 1): v for k, v in saved_state.items()}
 
-    missing, unexpected = model_state.load_state_dict(saved_state, strict=False)
+    if strict:
+        missing, unexpected = model_state.load_state_dict(saved_state, strict=True)
+    else:
+        # strict=False: also skip shape mismatches (PyTorch strict=False only
+        # handles missing/extra keys, NOT shape conflicts which still raise).
+        current_state = model_state.state_dict()
+        filtered = {
+            k: v for k, v in saved_state.items()
+            if k in current_state and current_state[k].shape == v.shape
+        }
+        n_shape = sum(1 for k in saved_state if k in current_state and current_state[k].shape != saved_state[k].shape)
+        missing, unexpected = model_state.load_state_dict(filtered, strict=False)
+        if n_shape:
+            print(f"[CKPT] {n_shape} keys skipped (shape mismatch), {len(missing)} initialized fresh.")
+
     if strict and (missing or unexpected):
         raise RuntimeError(
             f"Checkpoint mismatch (strict=True): {len(missing)} missing, {len(unexpected)} unexpected keys. "

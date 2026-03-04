@@ -648,20 +648,26 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             checkpoint = torch.load(pretrainD, map_location="cpu", weights_only=True)
             state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
 
-            # Use strict=False for D pretrain loading.
-            # This allows loading a "normal" (full) discriminator pretrain into
-            # "fast" mode which has fewer sub-discriminators. Keys that match in
-            # name AND shape are loaded (MSD + shared MPD periods); keys that
-            # don't match (extra MPD periods, MRD with different d_mult or count)
-            # are skipped and start from scratch. The discriminator re-adapts
-            # within a few hundred steps, so this is safe.
-            missing, unexpected = net_d.load_state_dict(state_dict, strict=False)
+            # Use strict=False for D pretrain loading, but also filter out
+            # shape mismatches manually — PyTorch's strict=False only handles
+            # missing/extra keys, NOT shape conflicts (which still raise).
+            # This handles normal→fast and any arch change safely.
+            current_state = (net_d.module if hasattr(net_d, "module") else net_d).state_dict()
+            filtered = {
+                k: v for k, v in state_dict.items()
+                if k in current_state and current_state[k].shape == v.shape
+            }
+            skipped_shape = [k for k in state_dict if k in current_state and current_state[k].shape != state_dict[k].shape]
+            missing, unexpected = (net_d.module if hasattr(net_d, "module") else net_d).load_state_dict(filtered, strict=False)
             if rank == 0:
-                if missing or unexpected:
-                    print(f"[D PRETRAIN] Partial load: {len(unexpected)} pretrain keys skipped, "
-                          f"{len(missing)} model keys initialized fresh.")
+                n_loaded = len(filtered)
+                n_shape  = len(skipped_shape)
+                n_miss   = len(missing)
+                if n_shape or n_miss:
+                    print(f"[D PRETRAIN] Partial load: {n_loaded} keys matched, "
+                          f"{n_shape} skipped (shape mismatch), {n_miss} initialized fresh.")
                 else:
-                    print(f"[D PRETRAIN] Full load: all keys matched.")
+                    print(f"[D PRETRAIN] Full load: all {n_loaded} keys matched.")
 
         # Load the models and optionally wrap with DDP
         net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus)
