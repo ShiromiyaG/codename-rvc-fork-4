@@ -679,7 +679,7 @@ def early_save_stop(model_name):
                 os.kill(training_process.pid, signal.SIGINT)
 
             try:
-                training_process.wait(timeout=10)
+                training_process.wait(timeout=120)
                 print("[TRAINING] Early Stopping completed.")
                 return ""
 

@@ -277,13 +277,13 @@ if microarchitecture_capability_checker():
     # Ampere-Microarchitecture and higher viable:
     initial_optimizer = "AdamW BF16"
     initial_optimizer_choices = ["AdamW BF16", "AdamW", "RAdam", "AdamSPD", "Ranger21", "DiffGrad", "Prodigy"]
-    architecture_choices = ["RVC", "Fork/Applio", "Fork"]
+    architecture_choices = ["RVC", "Fork/Applio", "Fork", "v3"]
     fp16_check = True
 else:
     # Below Ampere-Microarchitecture viable:
     initial_optimizer = "AdamW"
     initial_optimizer_choices = ["AdamW", "RAdam", "AdamSPD", "Ranger21", "DiffGrad", "Prodigy"]
-    architecture_choices = ["RVC", "Fork/Applio"]
+    architecture_choices = ["RVC", "Fork/Applio", "v3"]
     fp16_check = True
 
 # FP16 checker
@@ -326,7 +326,7 @@ def train_tab():
                 )
                 architecture = gr.Radio(
                     label="Architecture",
-                    info="Choose the model architecture:\n- **RVC (V2):ㅤDefault/OG-Architecture - Compatible with all clients.**\n- **Fork/Applio:ㅤOG-Arch's discs + RefineGAN** - Only for this Fork or Applio **( Experimental. )** \n- **Fork:ㅤCodename-selected custom archs** - Only for this Fork **( Exclusive. )**",
+                    info="Choose the model architecture:\n- **RVC (V2):ㅤDefault/OG-Architecture - Compatible with all clients.**\n- **Fork/Applio:ㅤOG-Arch's discs + RefineGAN** - Only for this Fork or Applio **( Experimental. )** \n- **Fork:ㅤCodename-selected custom archs** - Only for this Fork **( Exclusive. )**\n- **v3:ㅤConvNeXt Posterior Encoder + ConvNeXt+CAM Flow** - Replaces WaveNet backbone. ~2-3x faster, ~15-25% better quality. **( Requires v3 pretrains! )**",
                     choices=architecture_choices,
                     value="RVC",
                     interactive=True,
@@ -1120,8 +1120,8 @@ def train_tab():
                         },
                         vocoder_arch_value,
                     )
-                elif architecture == "Fork":
-                    selected_vocoder = vocoder if vocoder in FORK_VOCODER_CHOICES else "RingFormer_v2"
+                elif architecture in ("Fork", "v3"):
+                    selected_vocoder = vocoder if vocoder in FORK_VOCODER_CHOICES else "FireflyGAN"
                     vocoder_arch_value = {
                         "RingFormer_v1": "ringformer_v1",
                         "RingFormer_v2": "ringformer_v2",
@@ -1159,7 +1159,7 @@ def train_tab():
                         vocoder_arch_value,
                     )
             def fork_vocoder_handler(architecture, vocoder_arch, vocoder):
-                if architecture == "Fork" and vocoder == "RingFormer_v1":
+                if architecture in ("Fork", "v3") and vocoder == "RingFormer_v1":
                     vocoder_arch_value = "ringformer_v1"
                     return (
                         {
@@ -1169,7 +1169,7 @@ def train_tab():
                         },
                         vocoder_arch_value,
                     )
-                elif architecture == "Fork" and vocoder == "RingFormer_v2":
+                elif architecture in ("Fork", "v3") and vocoder == "RingFormer_v2":
                     vocoder_arch_value = "ringformer_v2"
                     return (
                         {
@@ -1179,7 +1179,7 @@ def train_tab():
                         },
                         vocoder_arch_value,
                     )
-                elif architecture == "Fork" and vocoder == "PCPH-GAN":
+                elif architecture in ("Fork", "v3") and vocoder == "PCPH-GAN":
                     vocoder_arch_value = "pcph_gan"
                     return (
                         {
@@ -1189,7 +1189,7 @@ def train_tab():
                         },
                         vocoder_arch_value,
                     )
-                elif architecture == "Fork" and vocoder == "FireflyGAN":
+                elif architecture in ("Fork", "v3") and vocoder == "FireflyGAN":
                     vocoder_arch_value = "firefly_gan"
                     return (
                         {

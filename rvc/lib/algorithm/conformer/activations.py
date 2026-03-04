@@ -116,7 +116,10 @@ class SnakeBeta(nn.Module):
         Forward pass of the function.
         Applies the function to the input elementwise.
         SnakeBeta ∶= x + 1/b * sin^2 (xa)
+        Computed in FP32 for numerical stability; output is cast back to the
+        input dtype so the module is dtype-transparent.
         """
+        orig_dtype = x.dtype
         x = x.float()
         alpha = self.alpha.unsqueeze(0).unsqueeze(-1)  # Line up with x to [B, C, T]
         beta = self.beta.unsqueeze(0).unsqueeze(-1)
@@ -124,9 +127,9 @@ class SnakeBeta(nn.Module):
             alpha = torch.exp(alpha)
             beta = torch.exp(beta)
 
-        alpha = alpha.to(x.dtype)
-        beta = beta.to(x.dtype)
-        
+        alpha = alpha.float()
+        beta = beta.float()
+
         x = x + (1.0 / (beta + self.no_div_by_zero)) * pow(sin(x * alpha), 2)
 
-        return x
+        return x.to(orig_dtype)

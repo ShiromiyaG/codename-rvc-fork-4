@@ -1,24 +1,28 @@
 """
-FireflyGAN-NSF Generator for RVC.
+FireflyGAN-PCPH Generator for RVC.
 
-A ConvNeXt-backbone + HiFiGAN-head vocoder with Neural Source Filter (NSF)
-for pitch-conditioned waveform synthesis. Adapted from the fish-vocoder
-FireflyGAN architecture with NSF source-filter injection at each upsampling
-stage, following the same interface as other RVC generators.
+A ConvNeXt-backbone + HiFiGAN-head vocoder with Pseudo-Constant-Power Harmonic
+(PCPH) source injection for pitch-conditioned waveform synthesis. Adapted from
+the fish-vocoder FireflyGAN architecture. The NSF source (single sine at f0)
+has been replaced by the PCPH band-limited harmonic source — which sums all
+harmonics up to Nyquist by construction, eliminating the aliasing (spectral
+mirrors / frequency-line artefacts) produced by NSF's unconstrained approach.
 """
 
 import math
 from typing import Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.amp import autocast
 from torch.nn.utils.parametrizations import weight_norm
 from torch.nn.utils.parametrize import remove_parametrizations
 from torch.utils.checkpoint import checkpoint
 
 from rvc.lib.algorithm.residuals import LRELU_SLOPE, ResBlock
+from rvc.lib.algorithm.conformer.activations import SnakeBeta
+from rvc.lib.algorithm.generators.pcph_gan import SourceModulePCPH
 
 
 # ---------------------------------------------------------------------------
@@ -59,13 +63,19 @@ class ConvNeXtLayerNorm(nn.Module):
 
     def forward(self, x):
         if self.data_format == "channels_last":
+            # F.layer_norm upcasts to FP32 internally — safe for BF16/FP16.
             return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
         elif self.data_format == "channels_first":
+            # Manual implementation: upcast to FP32 for numerical stability
+            # when running in BF16 (BF16 has only 7 mantissa bits; variance
+            # computed in BF16 loses precision and destabilises training).
+            orig_dtype = x.dtype
+            x = x.float()
             u = x.mean(1, keepdim=True)
             s = (x - u).pow(2).mean(1, keepdim=True)
             x = (x - u) / torch.sqrt(s + self.eps)
-            x = self.weight[:, None] * x + self.bias[:, None]
-            return x
+            x = self.weight[:, None].float() * x + self.bias[:, None].float()
+            return x.to(orig_dtype)
 
 
 class ConvNeXtBlock(nn.Module):
@@ -184,95 +194,7 @@ class ConvNeXtEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# NSF Source Module (same as used in HiFiGAN-NSF)
-# ---------------------------------------------------------------------------
-
-class SineGenerator(nn.Module):
-    """Generates sine waves at f0 and its harmonics for source-filter synthesis."""
-
-    def __init__(self, sampling_rate: int, num_harmonics: int = 0,
-                 sine_amplitude: float = 0.1, noise_stddev: float = 0.003,
-                 voiced_threshold: float = 0.0):
-        super().__init__()
-        self.sampling_rate = sampling_rate
-        self.num_harmonics = num_harmonics
-        self.sine_amplitude = sine_amplitude
-        self.noise_stddev = noise_stddev
-        self.voiced_threshold = voiced_threshold
-        self.waveform_dim = self.num_harmonics + 1
-
-    def _compute_voiced_unvoiced(self, f0: torch.Tensor):
-        return (f0 > self.voiced_threshold).float()
-
-    def _generate_sine_wave(self, f0: torch.Tensor, upsampling_factor: int):
-        batch_size, length, _ = f0.shape
-
-        upsampling_grid = torch.arange(
-            1, upsampling_factor + 1, dtype=f0.dtype, device=f0.device
-        )
-        phase_increments = (f0 / self.sampling_rate) * upsampling_grid
-        phase_remainder = torch.fmod(phase_increments[:, :-1, -1:] + 0.5, 1.0) - 0.5
-        cumulative_phase = phase_remainder.cumsum(dim=1).fmod(1.0).to(f0.dtype)
-        phase_increments += F.pad(cumulative_phase, (0, 0, 1, 0), mode="constant")
-        phase_increments = phase_increments.reshape(batch_size, -1, 1)
-
-        harmonic_scale = torch.arange(
-            1, self.waveform_dim + 1, dtype=f0.dtype, device=f0.device
-        ).reshape(1, 1, -1)
-        phase_increments = phase_increments * harmonic_scale
-
-        random_phase = torch.rand(1, 1, self.waveform_dim, device=f0.device)
-        random_phase[..., 0] = 0
-        phase_increments = phase_increments + random_phase
-
-        sine_waves = torch.sin(2 * np.pi * phase_increments)
-        return sine_waves
-
-    def forward(self, f0: torch.Tensor, upsampling_factor: int):
-        with torch.no_grad():
-            f0 = f0.unsqueeze(-1)
-            sine_waves = self._generate_sine_wave(f0, upsampling_factor) * self.sine_amplitude
-
-            voiced_mask = self._compute_voiced_unvoiced(f0)
-            voiced_mask = F.interpolate(
-                voiced_mask.transpose(2, 1),
-                scale_factor=float(upsampling_factor),
-                mode="nearest",
-            ).transpose(2, 1)
-
-            noise_amplitude = voiced_mask * self.noise_stddev + (1 - voiced_mask) * (
-                self.sine_amplitude / 3
-            )
-            noise = noise_amplitude * torch.randn_like(sine_waves)
-            sine_waveforms = sine_waves * voiced_mask + noise
-
-        return sine_waveforms, voiced_mask, noise
-
-
-class SourceModuleHnNSF(nn.Module):
-    """Harmonic-plus-Noise Source Module for NSF-based synthesis."""
-
-    def __init__(self, sample_rate: int, harmonic_num: int = 0,
-                 sine_amp: float = 0.1, add_noise_std: float = 0.003,
-                 voiced_threshold: float = 0):
-        super().__init__()
-        self.sine_amp = sine_amp
-        self.noise_std = add_noise_std
-        self.l_sin_gen = SineGenerator(
-            sample_rate, harmonic_num, sine_amp, add_noise_std, voiced_threshold
-        )
-        self.l_linear = nn.Linear(harmonic_num + 1, 1)
-        self.l_tanh = nn.Tanh()
-
-    def forward(self, x: torch.Tensor, upsample_factor: int = 1):
-        sine_wavs, uv, _ = self.l_sin_gen(x, upsample_factor)
-        sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
-        sine_merge = self.l_tanh(self.l_linear(sine_wavs))
-        return sine_merge, None, None
-
-
-# ---------------------------------------------------------------------------
-# HiFiGAN-NSF Head (processes ConvNeXt backbone output with NSF injection)
+# HiFiGAN-PCPH Head (processes ConvNeXt backbone output with PCPH injection)
 # ---------------------------------------------------------------------------
 
 def get_padding(kernel_size, dilation=1):
@@ -285,10 +207,55 @@ def init_weights(m, mean=0.0, std=0.01):
         m.weight.data.normal_(mean, std)
 
 
+def _make_sinc_lowpass(channels: int, kernel_size: int, cutoff: float) -> nn.Conv1d:
+    """
+    Create a depthwise Conv1d initialized as a Hamming-windowed sinc low-pass filter.
+
+    Args:
+        channels:    number of input/output channels (depthwise: groups=channels)
+        kernel_size: filter length (odd recommended; 5 gives better rolloff than 3)
+        cutoff:      normalized cutoff frequency in (0, 0.5], where 0.5 = Nyquist.
+                     For an upsampling stage with rate u, pass cutoff = 0.5 / u.
+    """
+    conv = nn.Conv1d(channels, channels, kernel_size=kernel_size,
+                     padding=kernel_size // 2, groups=channels, bias=False)
+
+    k = kernel_size
+    center = (k - 1) / 2.0
+    n = torch.arange(k, dtype=torch.float64) - center  # [-c, ..., 0, ..., c]
+
+    # Sinc kernel: h[n] = 2*fc * sinc(2*pi*fc*n)
+    eps = 1e-8
+    h = torch.where(
+        n.abs() < eps,
+        torch.full_like(n, 2.0 * cutoff),
+        torch.sin(2.0 * math.pi * cutoff * n) / (math.pi * n + eps)
+    )
+
+    # Hamming window: better sidelobe attenuation than Hann for short kernels
+    hamming = 0.54 - 0.46 * torch.cos(2.0 * math.pi * torch.arange(k, dtype=torch.float64) / (k - 1))
+    h = h * hamming
+    h = h / h.sum()  # unity DC gain
+
+    # Broadcast to all channels (depthwise: out_ch=in_ch, each with kernel [1, k])
+    h_init = h.float().view(1, 1, k).expand(channels, 1, k).contiguous()
+
+    with torch.no_grad():
+        conv.weight.copy_(h_init)
+
+    return conv
+
+
 class HiFiGANNSFHead(nn.Module):
     """
-    HiFiGAN generator head with NSF source injection.
+    HiFiGAN generator head with NSF source injection and SnakeBeta activations.
     Takes backbone features + f0 and generates audio waveform.
+
+    SnakeBeta replaces LeakyReLU in both the upsample loop and the residual
+    blocks. The periodic nature of Snake (x + 1/β · sin²(αx)) is fundamentally
+    better at modelling audio sinusoidal components than a piecewise-linear
+    activation; this is the core architectural improvement from BigVGAN.
+    Cost is negligible: two trainable scalars (α, β) per channel per layer.
     """
 
     def __init__(
@@ -312,7 +279,16 @@ class HiFiGANNSFHead(nn.Module):
         self.lrelu_slope = LRELU_SLOPE
 
         self.upp = math.prod(upsample_rates)
-        self.m_source = SourceModuleHnNSF(sample_rate=sr, harmonic_num=0)
+        # PCPH source: sums all harmonics up to Nyquist — band-limited by construction,
+        # no aliasing vs the old single-sine NSF source.
+        self.m_source = SourceModulePCPH(
+            sample_rate=sr,
+            hop_length=self.upp,
+            random_init_phase=True,
+            power_factor=0.1,
+            add_noise_std=0.003,
+            use_pchip=True,
+        )
 
         # Pre-conv to map backbone output channels to upsample_initial_channel
         self.conv_pre = weight_norm(nn.Conv1d(
@@ -320,6 +296,10 @@ class HiFiGANNSFHead(nn.Module):
             pre_conv_kernel_size, 1,
             padding=get_padding(pre_conv_kernel_size),
         ))
+
+        # SnakeBeta activations before each upsample stage.
+        # One per stage, each with its own learnable α/β per channel.
+        self.pre_snake = nn.ModuleList()
 
         # Upsampling layers
         self.ups = nn.ModuleList()
@@ -339,6 +319,12 @@ class HiFiGANNSFHead(nn.Module):
         ]
 
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
+            # SnakeBeta activation for this upsample stage's input channels
+            self.pre_snake.append(
+                SnakeBeta(upsample_initial_channel // (2 ** i),
+                          alpha_trainable=True, alpha_logscale=True)
+            )
+
             if u % 2 == 0:
                 padding = (k - u) // 2
             else:
@@ -354,14 +340,16 @@ class HiFiGANNSFHead(nn.Module):
                 ))
             )
 
-            # Depthwise conv anti-aliasing filter (groups=channels => near-zero parameter cost)
-            self.anti_alias_convs.append(
-                weight_norm(nn.Conv1d(
-                    channels[i], channels[i],
-                    kernel_size=3, stride=1, padding=1,
-                    groups=channels[i],
-                ))
-            )
+            # Depthwise sinc low-pass filter to suppress aliasing from ConvTranspose1d.
+            # Initialized as a Hamming-windowed sinc with cutoff = 0.5/u so it
+            # attenuates the aliased spectral copies introduced by upsampling rate u.
+            # Initialized BEFORE weight_norm so the parametrization starts from the
+            # correct low-pass direction (prevents early convergence to spurious
+            # frequencies such as sr/4 = 8 kHz at 32 kHz training).
+            aa_kernel = 5  # 5-tap gives ~40 dB rolloff vs ~20 dB for 3-tap
+            aa_cutoff = 0.5 / u   # ideal LP cutoff for this upsample stage
+            aa_conv = _make_sinc_lowpass(channels[i], aa_kernel, aa_cutoff)
+            self.anti_alias_convs.append(weight_norm(aa_conv))
 
             # NSF source injection convs
             stride = stride_f0s[i]
@@ -371,12 +359,20 @@ class HiFiGANNSFHead(nn.Module):
                 nn.Conv1d(1, channels[i], kernel_size=kernel, stride=stride, padding=pad)
             )
 
-        # Residual blocks
+        # Residual blocks with SnakeBeta activations (BigVGAN-style).
+        # ResBlock_SnakeBeta uses per-layer learnable periodic activations
+        # instead of LeakyReLU, capturing harmonic structure much better.
+        from rvc.lib.algorithm.residuals import ResBlock_SnakeBeta
         self.resblocks = nn.ModuleList([
-            ResBlock(channels[i], k, d)
+            ResBlock_SnakeBeta(channels[i], k, d)
             for i in range(len(self.ups))
             for k, d in zip(resblock_kernel_sizes, resblock_dilation_sizes)
         ])
+
+        # Final SnakeBeta before conv_post
+        self.post_snake = SnakeBeta(
+            channels[-1], alpha_trainable=True, alpha_logscale=True
+        )
 
         # Post-conv
         self.conv_post = weight_norm(nn.Conv1d(
@@ -386,7 +382,7 @@ class HiFiGANNSFHead(nn.Module):
         ))
 
         self.ups.apply(init_weights)
-        self.anti_alias_convs.apply(init_weights)
+        # anti_alias_convs are already initialized as sinc; no random re-init.
         self.conv_post.apply(init_weights)
 
         # Speaker conditioning
@@ -407,7 +403,7 @@ class HiFiGANNSFHead(nn.Module):
             x = x + self.cond(g)
 
         for i, (ups, noise_convs) in enumerate(zip(self.ups, self.noise_convs)):
-            x = F.leaky_relu(x, self.lrelu_slope)
+            x = self.pre_snake[i](x)
 
             if self.training and self.checkpointing:
                 x = checkpoint(ups, x, use_reentrant=False)
@@ -429,7 +425,7 @@ class HiFiGANNSFHead(nn.Module):
                 ])
             x = xs / self.num_kernels
 
-        x = F.leaky_relu(x, self.lrelu_slope)
+        x = self.post_snake(x)
         x = self.conv_post(x)
         x = torch.tanh(x)
         return x
@@ -451,14 +447,16 @@ class HiFiGANNSFHead(nn.Module):
 
 class FireflyGANNSFGenerator(nn.Module):
     """
-    FireflyGAN with Neural Source Filter (NSF).
+    FireflyGAN with PCPH (Pseudo-Constant-Power Harmonic) source.
 
     Architecture:
       1. ConvNeXt backbone encodes VITS latent features into a deep representation
-      2. HiFiGAN head with NSF harmonic injection synthesizes the audio waveform
-      3. f0 (pitch) drives a sine-wave source that is injected at each upsampling stage
+      2. HiFiGAN head with PCPH harmonic injection synthesizes the audio waveform
+      3. f0 (pitch) drives a band-limited Dirichlet harmonic source (all harmonics
+         up to Nyquist) injected at each upsampling stage \u2014 eliminating aliasing
+         by construction, unlike the old NSF single-sine approach.
 
-    Interface: forward(x, f0, g=None) — same as HiFiGANNSFGenerator for RVC compatibility.
+    Interface: forward(x, f0, g=None) \u2014 same as HiFiGANNSFGenerator for RVC compatibility.
     """
 
     def __init__(
@@ -506,9 +504,9 @@ class FireflyGANNSFGenerator(nn.Module):
             checkpointing=checkpointing,
         )
 
-        # Store for NSF source generation
+        # Store total upsampling factor and share source module reference
         self.upp = math.prod(upsample_rates)
-        self.m_source = self.head.m_source  # share source module reference
+        self.m_source = self.head.m_source
 
     def forward(
         self, x: torch.Tensor, f0: torch.Tensor, g: Optional[torch.Tensor] = None
@@ -522,9 +520,10 @@ class FireflyGANNSFGenerator(nn.Module):
         Returns:
             Audio waveform [B, 1, T_audio]
         """
-        # Generate harmonic source from f0
-        har_source, _, _ = self.m_source(f0, self.upp)
-        har_source = har_source.transpose(1, 2)  # [B, 1, T_audio]
+        # Generate band-limited PCPH harmonic source from f0.
+        # SourceModulePCPH returns [B, 1, T_audio] directly (no transpose needed),
+        # unlike the old NSF source which returned [B, T_audio, 1].
+        har_source = self.m_source(f0, self.upp)  # [B, 1, T_audio]
 
         # Encode through ConvNeXt backbone
         x = self.backbone(x)

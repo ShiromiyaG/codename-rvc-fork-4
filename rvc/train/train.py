@@ -13,6 +13,21 @@ import sys
 pid_data = {"process_pids": []}
 os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
 os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
+# Suppress _POSIX_C_SOURCE redefinition noise emitted by GCC when Triton
+# JIT-compiles its C stubs. Conda's pyconfig.h and the system's features.h
+# both define the macro to different values; -w silences all GCC warnings
+# for that translation unit without affecting PyTorch/CUDA compilation.
+# Use append (not setdefault) so that conda's existing CFLAGS are preserved.
+os.environ["CFLAGS"] = os.environ.get("CFLAGS", "") + " -w"
+os.environ["CXXFLAGS"] = os.environ.get("CXXFLAGS", "") + " -w"
+import warnings
+# torch.inductor falls back to eager for complex-valued ops (STFT in MRD).
+# This is expected for our training setup; suppress the per-step noise.
+warnings.filterwarnings(
+    "ignore",
+    message=".*Torchinductor does not support code generation for complex operators.*",
+    category=UserWarning,
+)
 from typing import Tuple, Optional
 from collections import deque
 from distutils.util import strtobool
@@ -145,6 +160,9 @@ assert not use_custom_lr or (custom_lr_g and custom_lr_d), "Invalid custom LR va
 # Parse command line arguments end region ===========================
 
 current_dir = os.getcwd()
+
+# Derive v3_mode from architecture string
+v3_mode = architecture == "v3"
 experiment_dir = os.path.join(current_dir, "logs", model_name)
 config_save_path = os.path.join(experiment_dir, "config.json")
 dataset_path = os.path.join(experiment_dir, "sliced_audios")
@@ -169,6 +187,10 @@ torch.backends.cuda.matmul.allow_tf32 = use_tf32
 torch.backends.cudnn.allow_tf32 = use_tf32
 torch.backends.cudnn.benchmark = use_benchmark
 torch.backends.cudnn.deterministic = use_deterministic
+# Enable TF32 Tensor Cores for torch.matmul() (nn.Linear, ConvNeXt pointwise layers).
+# 'high' = TF32 precision (10-bit mantissa, ~2x faster on Ampere+).
+# 'highest' = full FP32 (default PyTorch behaviour when not using this).
+torch.set_float32_matmul_precision('high' if use_tf32 else 'highest')
 
 # Globals ( Do not alter these )
 global_step = 0
@@ -191,6 +213,18 @@ new_pretrain_lr = 5e-5 # If you changed it, it needs to be re-adjusted to the mo
 
 # EXPERIMENTAL
 use_trajectory = False
+
+# torch.compile — Ampere+ (RTX 3090 / A100 / H100) with PyTorch 2.x
+# 'default'  — inductor kernel fusion + op optimization, no CUDA Graphs.
+#              Best balance of speed and compatibility for GAN training
+#              (variable-length batches from bucket sampler, complex STFT in MRD).
+# 'max-autotune' — profiles kernels at startup (~5 min), best for >12 h runs.
+#              Also avoids CUDA Graphs (uses inductor's autotuned triton kernels).
+# NOTE: 'reduce-overhead' enables CUDA Graphs which are incompatible with
+#       this setup (variable shapes, multi-model steps, complex ops → stalls,
+#       empty-graph warnings, and tensor aliasing crashes).
+use_compile = True
+compile_mode = "default"  # 'default' | 'max-autotune'
 
 use_sid_swap = False
 custom_sid = 1
@@ -327,11 +361,13 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing, randomized):
         checkpointing = use_checkpointing,
         randomized = randomized,
         vits2_mode = vits2_mode,
+        v3_mode = v3_mode,
     )
 
 def get_d_model(config, vocoder, use_checkpointing):
     default_mrd = {
-        "resolutions": [[1024, 120, 600], [2048, 240, 1200], [512, 50, 240]]
+        "periods": [2, 3, 5, 7, 11, 13],
+        "resolutions": [[256, 25, 120], [512, 50, 240], [1024, 120, 600], [2048, 240, 1200], [4096, 480, 2400]]
     }
     mrd_config = dict(config.mrd) if hasattr(config, "mrd") else default_mrd
 
@@ -355,16 +391,23 @@ def get_d_model(config, vocoder, use_checkpointing):
         if firefly_fast:
             fast_mrd_config = dict(mrd_config)
             all_resolutions = fast_mrd_config.get("resolutions", default_mrd["resolutions"])
-            # Pick low-frequency [0] + high-frequency [2] for better spectral coverage
-            # instead of [:2] which took two low-freq resolvers and was blind to highs
-            fast_mrd_config["resolutions"] = [all_resolutions[0], all_resolutions[-1]]
+            # Pick low [0] + mid + high [-1] for broad spectral coverage
+            # with fewer MRD channels (d_mult=0.5).  3×0.5 = 1.5 effective
+            # resolution-channel units vs normal 5×1.0 = 5.0 (70 % less),
+            # while still covering fine, mid, and coarse spectral structure.
+            # Total: 3 MRD + 3 MPD + 1 MSD = 7 sub-discs.
+            mid_idx = len(all_resolutions) // 2
+            fast_mrd_config["resolutions"] = [all_resolutions[0], all_resolutions[mid_idx], all_resolutions[-1]]
             fast_mrd_config["periods"] = [2, 3, 5]
-            fast_mrd_config["mrd_d_mult"] = 0.75  # −25% MRD params for less VRAM
+            fast_mrd_config["mrd_d_mult"] = 0.5  # -50% MRD channels for speed + VRAM
             return MPD_MSD_MRD_Combined(
                 config.model.use_spectral_norm,
                 use_checkpointing=use_checkpointing,
                 **fast_mrd_config
             )
+        # Normal FireflyGAN:  Use d_mult=0.75 for a lighter MRD while
+        # keeping all 5 resolutions for full spectral coverage.
+        mrd_config.setdefault("mrd_d_mult", 0.75)
         return MPD_MSD_MRD_Combined(
             config.model.use_spectral_norm,
             use_checkpointing=use_checkpointing,
@@ -604,7 +647,20 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             checkpoint = torch.load(pretrainD, map_location="cpu", weights_only=True)
             state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
 
-            net_d.load_state_dict(state_dict, strict=True)
+            # Use strict=False for D pretrain loading.
+            # This allows loading a "normal" (full) discriminator pretrain into
+            # "fast" mode which has fewer sub-discriminators. Keys that match in
+            # name AND shape are loaded (MSD + shared MPD periods); keys that
+            # don't match (extra MPD periods, MRD with different d_mult or count)
+            # are skipped and start from scratch. The discriminator re-adapts
+            # within a few hundred steps, so this is safe.
+            missing, unexpected = net_d.load_state_dict(state_dict, strict=False)
+            if rank == 0:
+                if missing or unexpected:
+                    print(f"[D PRETRAIN] Partial load: {len(unexpected)} pretrain keys skipped, "
+                          f"{len(missing)} model keys initialized fresh.")
+                else:
+                    print(f"[D PRETRAIN] Full load: all keys matched.")
 
         # Load the models and optionally wrap with DDP
         net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus)
@@ -770,8 +826,24 @@ def main():
             subproc.start()
             pid_data["process_pids"].append(subproc.pid)
 
-        for i in range(n_gpus):
-            children[i].join()
+        try:
+            for i in range(n_gpus):
+                children[i].join()
+        except KeyboardInterrupt:
+            # Main process received SIGINT (Early Stop from GUI).
+            # Workers spawn separately and don't inherit the signal, so
+            # we forward SIGINT to each worker so their EarlyStopSignalHandler
+            # triggers the save-and-exit path.
+            print("[TRAINING] Forwarding Early Stop signal to workers...")
+            for child in children:
+                if child.is_alive():
+                    os.kill(child.pid, signal.SIGINT)
+            # Wait for workers to finish saving (generous timeout)
+            for child in children:
+                child.join(timeout=180)
+                if child.is_alive():
+                    print(f"[TRAINING] Worker {child.pid} did not exit in time, terminating.")
+                    child.terminate()
 
     if cleanup:
         old_session_cleanup(now_dir, model_name)
@@ -952,63 +1024,104 @@ def run(
 
     training_loop.encoders_frozen = False
 
+    # torch.compile opt-in (requires PyTorch >= 2.0 and CUDA Ampere+)
+    if use_compile and device.type == "cuda" and torch.cuda.is_available():
+        try:
+            if rank == 0:
+                print(f"    ██████  torch.compile: mode='{compile_mode}' — compiling G and D...")
+            _compile_opts = dict(mode=compile_mode, fullgraph=False, dynamic=True)
+            if isinstance(net_g, torch.nn.parallel.DistributedDataParallel):
+                net_g.module = torch.compile(net_g.module, **_compile_opts)
+            else:
+                net_g = torch.compile(net_g, **_compile_opts)
+            if isinstance(net_d, torch.nn.parallel.DistributedDataParallel):
+                net_d.module = torch.compile(net_d.module, **_compile_opts)
+            else:
+                net_d = torch.compile(net_d, **_compile_opts)
+            if rank == 0:
+                print("    ██████  torch.compile: done. First step will be slower (tracing).")
+        except Exception as e:
+            if rank == 0:
+                print(f"    ██████  torch.compile: failed ({e}), continuing without it.")
+
     # Reference sample for live-infer
     reference = get_reference_sample(train_loader, device, config)
 
     # Cache for training with " cache " enabled
     cache = []
 
-    for epoch in range(epoch_str, total_epoch_count + 1):
-        should_stop = training_loop(
-            rank,
-            epoch,
-            config,
-            [net_g, net_d],
-            [optim_g, optim_d],
-            [scheduler_g, scheduler_d],
-            train_loader,
-            val_loader if use_validation else None,
-            [writer_eval],
-            cache,
-            total_epoch_count,
-            epoch_save_frequency,
-            save_weight_models,
-            save_only_latest_net_models,
-            device,
-            device_id,
-            reference,
-            fn_spectral_loss,
-            n_gpus,
-            gradscaler,
-            fn_hinge_loss,
-            hann_window,
-            stopper=stopper,
-            trajectory_tracker=trajectory_tracker
-        )
+    def _shutdown_loader(loader):
+        """Force DataLoader worker shutdown to avoid semaphore leaks on exit."""
+        if loader is None:
+            return
+        try:
+            it = getattr(loader, "_iterator", None)
+            if it is not None:
+                it._shutdown_workers()
+                loader._iterator = None
+        except Exception:
+            pass
 
-        if use_warmup and epoch <= warmup_duration:
-            if warmup_scheduler_g:
-                warmup_scheduler_g.step()
-            if warmup_scheduler_d:
-                warmup_scheduler_d.step()
+    try:
+        for epoch in range(epoch_str, total_epoch_count + 1):
+            should_stop = training_loop(
+                rank,
+                epoch,
+                config,
+                [net_g, net_d],
+                [optim_g, optim_d],
+                [scheduler_g, scheduler_d],
+                train_loader,
+                val_loader if use_validation else None,
+                [writer_eval],
+                cache,
+                total_epoch_count,
+                epoch_save_frequency,
+                save_weight_models,
+                save_only_latest_net_models,
+                device,
+                device_id,
+                reference,
+                fn_spectral_loss,
+                n_gpus,
+                gradscaler,
+                fn_hinge_loss,
+                hann_window,
+                stopper=stopper,
+                trajectory_tracker=trajectory_tracker
+            )
 
-            # Logging of finished warmup
-            if epoch == warmup_duration:
-                warmup_completed = True
-                print(f"    ██████  Warmup completed at epochs: {warmup_duration}")
-                print(f"    ██████  LR G: {optim_g.param_groups[0]['lr']}")
-                print(f"    ██████  LR D: {optim_d.param_groups[0]['lr']}")
-                # scheduler:
-                if lr_scheduler == "exp decay epoch":
-                    print(f"    ██████  Starting the per-epoch exponential lr decay with gamma of {exp_decay_gamma}")
-                elif lr_scheduler == "cosine annealing epoch":
-                    print("    ██████  Starting per-epoch cosine annealing scheduler " )
+            if use_warmup and epoch <= warmup_duration:
+                if warmup_scheduler_g:
+                    warmup_scheduler_g.step()
+                if warmup_scheduler_d:
+                    warmup_scheduler_d.step()
 
-        if use_lr_scheduler and (not use_warmup or warmup_completed):
-            # Once the warmup phase is completed, uses exponential lr decay
-            if lr_scheduler in ["exp decay epoch", "cosine annealing epoch"]:
-                scheduler_g.step()
-                scheduler_d.step()
+                # Logging of finished warmup
+                if epoch == warmup_duration:
+                    warmup_completed = True
+                    print(f"    ██████  Warmup completed at epochs: {warmup_duration}")
+                    print(f"    ██████  LR G: {optim_g.param_groups[0]['lr']}")
+                    print(f"    ██████  LR D: {optim_d.param_groups[0]['lr']}")
+                    # scheduler:
+                    if lr_scheduler == "exp decay epoch":
+                        print(f"    ██████  Starting the per-epoch exponential lr decay with gamma of {exp_decay_gamma}")
+                    elif lr_scheduler == "cosine annealing epoch":
+                        print("    ██████  Starting per-epoch cosine annealing scheduler " )
+
+            if use_lr_scheduler and (not use_warmup or warmup_completed):
+                # Once the warmup phase is completed, uses exponential lr decay
+                if lr_scheduler in ["exp decay epoch", "cosine annealing epoch"]:
+                    scheduler_g.step()
+                    scheduler_d.step()
+    finally:
+        # Explicitly shut down DataLoader worker processes so their semaphores,
+        # file descriptors and shared-memory segments are released before the
+        # spawned subprocess exits. Without this, Python's resource_tracker
+        # reports N leaked semaphores at shutdown (persistent_workers=True +
+        # mp.Process is the common trigger).
+        _shutdown_loader(train_loader)
+        _shutdown_loader(val_loader)
 
 def training_loop(
     rank,
@@ -1186,16 +1299,26 @@ def training_loop(
                 gradscaler.scale(loss_disc).backward() # Scale and backward of the loss
                 gradscaler.unscale_(optim_d) # Unscale
                 scale = gradscaler.get_scale() # To retrieve current gradscaler's scaling
-                grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=float("inf")) # Grad clipping
+                grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=150.0) # Grad clipping
                 gradscaler.step(optim_d) # Optim step
             else:
                 loss_disc.backward() # Loss backward
-                grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=float("inf")) # Grad clipping
+                grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=150.0) # Grad clipping
                 optim_d.step() # Optim step
 
-            # Run discriminator on generated output
+            # ── Freeze D during G step ────────────────────────────────
+            # D's own update is done.  For the G step the discriminator
+            # only provides adversarial + feature-matching signal; its
+            # parameter gradients are never used.  Freezing prevents
+            # PyTorch from allocating ~D-params of gradient memory
+            # during G backward, and bypassing DDP avoids an unnecessary
+            # allreduce.  Quality is unaffected.
+            d_for_g = net_d.module if hasattr(net_d, 'module') else net_d
+            d_for_g.requires_grad_(False)
+
+            # Run discriminator on generated output (through raw module)
             with autocast(device_type="cuda", enabled=use_amp, dtype=train_dtype):
-                _, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+                _, y_d_hat_g, fmap_r, fmap_g = d_for_g(y, y_hat)
 
             # Compute generator losses:
             with autocast(device_type="cuda", enabled=False):
@@ -1237,7 +1360,7 @@ def training_loop(
 
                 # Total generator loss + kl ( encoders )
                 if not training_loop.encoders_frozen: # For when encoders aren't frozen yet
-                    loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl # KL ( Kullback–Leibler divergence ) loss
+                    loss_kl = kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl # KL ( Kullback–Leibler divergence ) loss
                     if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
                         loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta + loss_sd
                     else:
@@ -1263,6 +1386,9 @@ def training_loop(
                 grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=float("inf")) # Grad clipping
                 optim_g.step() # Optim step
                 skip_lr_sched = False
+
+            # Unfreeze D for the next iteration's D step
+            d_for_g.requires_grad_(True)
 
             # Per step exp lr decay for generator
             if not skip_lr_sched: # We skip lr scheduler step if there were nans / infs due to gradscaler's scaling.
@@ -1350,7 +1476,8 @@ def training_loop(
                 stopper, rank, global_step, epoch, architecture, 
                 [net_g, net_d], [optim_g, optim_d], config, 
                 experiment_dir, gradscaler, save_weight_models,
-                model_name, vocoder, vits2_mode, n_gpus
+                model_name, vocoder, vits2_mode, n_gpus,
+                v3_mode=v3_mode,
             ):
                 return True
 
@@ -1569,6 +1696,7 @@ def training_loop(
                         vocoder=vocoder,
                         architecture=architecture,
                         vits2_mode=vits2_mode,
+                        v3_mode=v3_mode,
                     )
         if done:
             # Clean-up process IDs from memory
