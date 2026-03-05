@@ -722,13 +722,6 @@ def train_tab():
                         interactive=True,
                         key='use_checkpointing'
                     )
-                    firefly_fast = gr.Checkbox(
-                        label="Firefly Fast",
-                        info="When using FireflyGAN, uses a lighter discriminator setup for faster training steps (small quality tradeoff).",
-                        value=False,
-                        interactive=True,
-                        key='firefly_fast'
-                    )
                     use_validation = gr.Checkbox(
                         label="Enable hold-out validation",
                         info="**Requires carefully handled dataset!**",
@@ -977,7 +970,6 @@ def train_tab():
                     optimizer,
                     adversarial_loss,
                     use_checkpointing,
-                    firefly_fast,
                     use_tf32,
                     use_benchmark,
                     use_deterministic,
@@ -1221,7 +1213,7 @@ def train_tab():
                 # Training
                 batch_size, epoch_save_frequency, total_epoch_count,
                 save_only_latest_net_models, save_weight_models, pretrained,
-                cleanup, use_checkpointing, firefly_fast,
+                cleanup, use_checkpointing,
                 use_tf32, use_benchmark, use_deterministic, spectral_loss,
                 lr_scheduler, exp_decay_gamma, use_validation,
                 custom_pretrained, g_pretrained_path,

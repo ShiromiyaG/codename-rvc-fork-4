@@ -50,7 +50,18 @@ class MPD_MSD_MRD_Combined(torch.nn.Module):
         if use_highband:
             self.discriminators.append(DiscriminatorHB())
 
-    def forward(self, y, y_hat):
+    def forward(self, y, y_hat, compute_fmaps: bool = True):
+        """Forward pass through all sub-discriminators.
+
+        Args:
+            y: real waveform
+            y_hat: generated waveform
+            compute_fmaps: If False, returns empty lists for fmap_rs/fmap_gs.
+                Use False during the D training step (fmaps are not needed
+                for the discriminator loss, only for generator feature-
+                matching loss).  Skipping fmap references lets PyTorch
+                free intermediate activations sooner, reducing peak VRAM.
+        """
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
         for d in self.discriminators:
             if self.training and self.use_checkpointing:
@@ -61,8 +72,9 @@ class MPD_MSD_MRD_Combined(torch.nn.Module):
                 y_d_g, fmap_g = d(y_hat)
             y_d_rs.append(y_d_r)
             y_d_gs.append(y_d_g)
-            fmap_rs.append(fmap_r)
-            fmap_gs.append(fmap_g)
+            if compute_fmaps:
+                fmap_rs.append(fmap_r)
+                fmap_gs.append(fmap_g)
 
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 

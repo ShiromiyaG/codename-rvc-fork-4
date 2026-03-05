@@ -123,38 +123,20 @@ architecture = sys.argv[15]
 optimizer_choice = sys.argv[16]
 adversarial_loss = sys.argv[17]
 use_checkpointing = strtobool(sys.argv[18])
-if len(sys.argv) >= 35:
-    firefly_fast = bool(strtobool(sys.argv[19]))
-    use_tf32 = bool(strtobool(sys.argv[20]))
-    use_benchmark = bool(strtobool(sys.argv[21]))
-    use_deterministic = bool(strtobool(sys.argv[22]))
-    spectral_loss = sys.argv[23]
-    lr_scheduler = sys.argv[24]
-    exp_decay_gamma = float(sys.argv[25])
-    use_validation = strtobool(sys.argv[26])
-    use_kl_annealing = strtobool(sys.argv[27])
-    kl_annealing_cycle_duration = int(sys.argv[28])
-    vits2_mode = strtobool(sys.argv[29])
-    rolling_loss_steps = int(sys.argv[30])
-    use_tstp = bool(strtobool(sys.argv[31]))
-    use_custom_lr = strtobool(sys.argv[32])
-    custom_lr_g, custom_lr_d = (float(sys.argv[33]), float(sys.argv[34])) if use_custom_lr else (None, None)
-else:
-    firefly_fast = False
-    use_tf32 = bool(strtobool(sys.argv[19]))
-    use_benchmark = bool(strtobool(sys.argv[20]))
-    use_deterministic = bool(strtobool(sys.argv[21]))
-    spectral_loss = sys.argv[22]
-    lr_scheduler = sys.argv[23]
-    exp_decay_gamma = float(sys.argv[24])
-    use_validation = strtobool(sys.argv[25])
-    use_kl_annealing = strtobool(sys.argv[26])
-    kl_annealing_cycle_duration = int(sys.argv[27])
-    vits2_mode = strtobool(sys.argv[28])
-    rolling_loss_steps = int(sys.argv[29])
-    use_tstp = bool(strtobool(sys.argv[30]))
-    use_custom_lr = strtobool(sys.argv[31])
-    custom_lr_g, custom_lr_d = (float(sys.argv[32]), float(sys.argv[33])) if use_custom_lr else (None, None)
+use_tf32 = bool(strtobool(sys.argv[19]))
+use_benchmark = bool(strtobool(sys.argv[20]))
+use_deterministic = bool(strtobool(sys.argv[21]))
+spectral_loss = sys.argv[22]
+lr_scheduler = sys.argv[23]
+exp_decay_gamma = float(sys.argv[24])
+use_validation = strtobool(sys.argv[25])
+use_kl_annealing = strtobool(sys.argv[26])
+kl_annealing_cycle_duration = int(sys.argv[27])
+vits2_mode = strtobool(sys.argv[28])
+rolling_loss_steps = int(sys.argv[29])
+use_tstp = bool(strtobool(sys.argv[30]))
+use_custom_lr = strtobool(sys.argv[31])
+custom_lr_g, custom_lr_d = (float(sys.argv[32]), float(sys.argv[33])) if use_custom_lr else (None, None)
 assert not use_custom_lr or (custom_lr_g and custom_lr_d), "Invalid custom LR values."
 
 # Parse command line arguments end region ===========================
@@ -220,11 +202,14 @@ use_trajectory = False
 #              (variable-length batches from bucket sampler, complex STFT in MRD).
 # 'max-autotune' — profiles kernels at startup (~5 min), best for >12 h runs.
 #              Also avoids CUDA Graphs (uses inductor's autotuned triton kernels).
-# NOTE: 'reduce-overhead' enables CUDA Graphs which are incompatible with
-#       this setup (variable shapes, multi-model steps, complex ops → stalls,
-#       empty-graph warnings, and tensor aliasing crashes).
+# NOTE: 'reduce-overhead' / 'max-autotune' enable CUDA Graphs which are
+#       incompatible with this setup (variable shapes, multi-model steps,
+#       complex ops → stalls, empty-graph warnings, tensor aliasing crashes).
+#       'max-autotune-no-cudagraphs' runs Triton autotuning for best kernel
+#       tile sizes without requiring fixed shapes.  First step is slow (~2-5
+#       min while autotuning), steady-state is faster than 'default'.
 use_compile = True
-compile_mode = "default"  # 'default' | 'max-autotune'
+compile_mode = "max-autotune-no-cudagraphs"  # 'default' | 'max-autotune-no-cudagraphs'
 
 use_sid_swap = False
 custom_sid = 1
@@ -366,8 +351,8 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing, randomized):
 
 def get_d_model(config, vocoder, use_checkpointing):
     default_mrd = {
-        "periods": [2, 3, 5, 7, 11, 13],
-        "resolutions": [[256, 25, 120], [512, 50, 240], [1024, 120, 600], [2048, 240, 1200], [4096, 480, 2400]]
+        "periods": [2, 3, 5, 7, 11],
+        "resolutions": [[256, 25, 120], [512, 50, 240], [1024, 120, 600]]
     }
     mrd_config = dict(config.mrd) if hasattr(config, "mrd") else default_mrd
 
@@ -388,25 +373,6 @@ def get_d_model(config, vocoder, use_checkpointing):
         )
     elif vocoder == "FireflyGAN":
         from rvc.lib.algorithm.discriminators.multi import MPD_MSD_MRD_Combined
-        if firefly_fast:
-            fast_mrd_config = dict(mrd_config)
-            all_resolutions = fast_mrd_config.get("resolutions", default_mrd["resolutions"])
-            # Pick low [0] + mid + high [-1] for broad spectral coverage
-            # with fewer MRD channels (d_mult=0.5).  3×0.5 = 1.5 effective
-            # resolution-channel units vs normal 5×1.0 = 5.0 (70 % less),
-            # while still covering fine, mid, and coarse spectral structure.
-            # Total: 3 MRD + 3 MPD + 1 MSD = 7 sub-discs.
-            mid_idx = len(all_resolutions) // 2
-            fast_mrd_config["resolutions"] = [all_resolutions[0], all_resolutions[mid_idx], all_resolutions[-1]]
-            fast_mrd_config["periods"] = [2, 3, 5]
-            fast_mrd_config["mrd_d_mult"] = 0.5  # -50% MRD channels for speed + VRAM
-            return MPD_MSD_MRD_Combined(
-                config.model.use_spectral_norm,
-                use_checkpointing=use_checkpointing,
-                **fast_mrd_config
-            )
-        # Normal FireflyGAN:  Use d_mult=0.75 for a lighter MRD while
-        # keeping all 5 resolutions for full spectral coverage.
         mrd_config.setdefault("mrd_d_mult", 0.75)
         mrd_config["use_highband"] = True  # High-Band disc for 8-16 kHz
         return MPD_MSD_MRD_Combined(
@@ -1286,9 +1252,9 @@ def training_loop(
                 y_hat_stft = torch.stft(reshaped_y_hat, n_fft=config.model.gen_istft_n_fft, hop_length=config.model.gen_istft_hop_size, win_length=config.model.gen_istft_n_fft, window=hann_window, return_complex=True)
                 target_magnitude = torch.abs(y_stft)  # shape: [B, F, T]
 
-            # Discriminator forward pass:
+            # Discriminator forward pass (no fmaps — saves memory):
             with autocast(device_type="cuda", enabled=use_amp, dtype=train_dtype):
-                y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+                y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach(), compute_fmaps=False)
 
             with autocast(device_type="cuda", enabled=False):
                 # Compute discriminator loss:
@@ -1312,6 +1278,10 @@ def training_loop(
                 loss_disc.backward() # Loss backward
                 grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=150.0) # Grad clipping
                 optim_d.step() # Optim step
+
+            # Free D-step computation graph before G step to reduce peak VRAM
+            loss_disc_val = loss_disc.detach()
+            del y_d_hat_r, y_d_hat_g, loss_disc
 
             # ── Freeze D during G step ────────────────────────────────
             # D's own update is done.  For the G step the discriminator
@@ -1384,13 +1354,13 @@ def training_loop(
             if train_dtype == torch.float16:
                 gradscaler.scale(loss_gen_total).backward() # Scale and backward of the loss
                 gradscaler.unscale_(optim_g) # Unscale
-                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=float("inf")) # Grad clipping
+                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=200.0) # Grad clipping
                 gradscaler.step(optim_g) # Optim step
                 gradscaler.update() # Scaler update, to prepare the scaling for the next iteration
                 skip_lr_sched = (scale > gradscaler.get_scale())
             else:
                 loss_gen_total.backward() # Loss backward
-                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=float("inf")) # Grad clipping
+                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=200.0) # Grad clipping
                 optim_g.step() # Optim step
                 skip_lr_sched = False
 
@@ -1405,7 +1375,7 @@ def training_loop(
 
             if not from_scratch:
                 # Loss accumulation for epoch-avg
-                epoch_loss_tensor[0].add_(loss_disc.detach())
+                epoch_loss_tensor[0].add_(loss_disc_val)
                 epoch_loss_tensor[1].add_(loss_adv.detach())
                 epoch_loss_tensor[2].add_(loss_gen_total.detach())
                 epoch_loss_tensor[3].add_(loss_fm.detach())
@@ -1428,7 +1398,7 @@ def training_loop(
                 writer.add_scalar("Grad_Norm/G_Skipped", 1, global_step)
 
             # Losses:
-            avg_rolling_cache["loss_disc"].append(loss_disc.detach())
+            avg_rolling_cache["loss_disc"].append(loss_disc_val)
             avg_rolling_cache["loss_adv"].append(loss_adv.detach()) 
             avg_rolling_cache["loss_gen_total"].append(loss_gen_total.detach())
             avg_rolling_cache["loss_fm"].append(loss_fm.detach())

@@ -28,7 +28,6 @@
     "pretrained": false,
     "cleanup": false,
     "use_checkpointing": false,
-    "firefly_fast": true,
     "use_tf32": true,
     "use_benchmark": true,
     "use_deterministic": false,

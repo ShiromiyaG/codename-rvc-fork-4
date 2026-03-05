@@ -530,7 +530,6 @@ def run_train_script(
     optimizer: str = "AdamW",
     adversarial_loss: str = "lsgan",
     use_checkpointing: bool = False,
-    firefly_fast: bool = False,
     use_tf32: bool = False,
     use_benchmark: bool = True,
     use_deterministic: bool = False,
@@ -591,7 +590,6 @@ def run_train_script(
                 optimizer,
                 adversarial_loss,
                 use_checkpointing,
-                firefly_fast,
                 use_tf32,
                 use_benchmark,
                 use_deterministic,
@@ -2034,13 +2032,6 @@ def parse_arguments():
         default=False,
     )
     train_parser.add_argument(
-        "--firefly_fast",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Use lighter discriminator setup for faster FireflyGAN training.",
-        default=False,
-    )
-    train_parser.add_argument(
         "--custom_lr_g",
         type=float,
         help="Custom learning rate for generator.",
@@ -2561,7 +2552,6 @@ def main():
                 optimizer=args.optimizer,
                 adversarial_loss=args.adversarial_loss,
                 use_checkpointing=args.use_checkpointing,
-                firefly_fast=args.firefly_fast,
                 use_tf32=args.use_tf32,
                 use_benchmark=args.use_benchmark,
                 use_deterministic=args.use_deterministic,
