@@ -208,7 +208,7 @@ use_trajectory = False
 #       'max-autotune-no-cudagraphs' runs Triton autotuning for best kernel
 #       tile sizes without requiring fixed shapes.  First step is slow (~2-5
 #       min while autotuning), steady-state is faster than 'default'.
-use_compile = True
+use_compile = False
 compile_mode = "max-autotune-no-cudagraphs"  # 'default' | 'max-autotune-no-cudagraphs'
 
 use_sid_swap = False
