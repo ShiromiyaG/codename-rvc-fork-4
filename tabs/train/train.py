@@ -39,7 +39,7 @@ VOCODER_INFO = {
     "RVC": "**HiFi-GAN:** \n- **Arch overview:ㅤHiFi-GAN + Hn-NSF for f0 handling. ( RVC's og vocoder )** \n- **COMPATIBILITY:ㅤAll clients incl. Mainline RVC / W-okada etc.**",
     "Fork/Applio": "**RefineGAN:** \n- **Arch overview:ㅤHiFi-Gan + Hn-NSF + ParallelResBlock + AdaIN** \n- **COMPATIBILITY:ㅤThis Fork or Applio ( As for rt-vc, vonovox beta supports it. )**",
     "Fork": "**RingFormer:** \n- **Arch overview:ㅤA hybrid Conformer-Based Vocoder + Snake-Beta act. + RingAttention + Hn-NSF** \n- **COMPATIBILITY:ㅤThis Fork ( As for rt-vc, 'Vonovox' supports it. )** \n\n**PCPH-GAN:** \n- **Arch overview:ㅤHiFi-GAN + PCPH prior + SnakeBeta & Silu** \n- **COMPATIBILITY:ㅤThis Fork ( No rt-vc clients support it atm. )** \n\n **NOTES:** \n **( RingFormer Requires min. RTX 30xx [ At least Ampere microarchitecture ] )** \n **( Each Vocoder and it's supported sample rates require appropriate pretrained models. )**",
-    "v3": "**ChouwaGAN:** \n- **Arch overview:ㅤConvNeXt backbone + HiFi-GAN vocoder head + Snake act.** \n- **COMPATIBILITY:ㅤThis Fork only ( No rt-vc clients support it atm. )** \n\n **NOTES:** \n **( Requires v3 pretrains! )**",
+    "v3": "**ChouwaGAN:** \n- **Arch overview:ㅤConvNeXt backbone + HiFi-GAN vocoder head + Snake act.** \n- **COMPATIBILITY:ㅤThis Fork only ( No rt-vc clients support it atm. )**",
 }
 
 
@@ -336,7 +336,7 @@ def train_tab():
                 )
                 architecture = gr.Radio(
                     label="Architecture",
-                    info="Choose the model architecture:\n- **RVC (V2):ㅤDefault/OG-Architecture - Compatible with all clients.**\n- **Fork/Applio:ㅤOG-Arch's discs + RefineGAN** - Only for this Fork or Applio **( Experimental. )** \n- **Fork:ㅤCodename-selected custom archs** - Only for this Fork **( Exclusive. )**\n- **v3:ㅤConvNeXt Posterior Encoder + ConvNeXt+CAM Flow** - Replaces WaveNet backbone. ~2-3x faster, ~15-25% better quality. **( Requires v3 pretrains! )**",
+                    info="Choose the model architecture:\n- **RVC (V2):ㅤDefault/OG-Architecture - Compatible with all clients.**\n- **Fork/Applio:ㅤOG-Arch's discs + RefineGAN** - Only for this Fork or Applio **( Experimental. )** \n- **Fork:ㅤCodename-selected custom archs** - Only for this Fork **( Exclusive. )**\n- **v3:ㅤConvNeXt Posterior Encoder + ConvNeXt+CAM Flow** - Replaces WaveNet backbone. ~2-3x faster, ~15-25% better quality.",
                     choices=architecture_choices,
                     value="RVC",
                     interactive=True,
