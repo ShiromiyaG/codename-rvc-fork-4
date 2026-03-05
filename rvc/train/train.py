@@ -371,14 +371,16 @@ def get_d_model(config, vocoder, use_checkpointing):
             use_checkpointing=use_checkpointing,
             **mrd_config
         )
-    elif vocoder == "FireflyGAN":
-        from rvc.lib.algorithm.discriminators.multi import MPD_MSD_MRD_Combined
-        mrd_config.setdefault("mrd_d_mult", 0.75)
-        mrd_config["use_highband"] = True  # High-Band disc for 8-16 kHz
-        return MPD_MSD_MRD_Combined(
+    elif vocoder == "ChouwaGAN":
+        from rvc.lib.algorithm.discriminators.multi import FastMPD_MSD_CQT_Combined
+        # FastMPD + MSD + MS-SB-CQT (optimized: ~40-50% lighter, better harmonic accuracy)
+        chouwa_cfg = dict(config.mrd) if hasattr(config, "mrd") else default_mrd
+        sample_rate = config.data.sample_rate if hasattr(config.data, "sample_rate") else 40000
+        return FastMPD_MSD_CQT_Combined(
             config.model.use_spectral_norm,
             use_checkpointing=use_checkpointing,
-            **mrd_config
+            sample_rate=sample_rate,
+            **chouwa_cfg
         )
     elif vocoder == "RefineGAN":
         from rvc.lib.algorithm.discriminators.multi import MPD_MSD_MRD_Combined_RefineGan

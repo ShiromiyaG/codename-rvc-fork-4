@@ -25,10 +25,10 @@ arch_config_paths = {
         os.path.join("pcph_gan", "40000.json"),
         os.path.join("pcph_gan", "32000.json"),
     ],
-    "firefly_gan": [
-        os.path.join("firefly_gan", "48000.json"),
-        os.path.join("firefly_gan", "40000.json"),
-        os.path.join("firefly_gan", "32000.json"),
+    "chouwa_gan": [
+        os.path.join("chouwa_gan", "48000.json"),
+        os.path.join("chouwa_gan", "40000.json"),
+        os.path.join("chouwa_gan", "32000.json"),
     ],
 }
 
@@ -130,7 +130,7 @@ class Config:
             except FileNotFoundError:
                 print(f"File not found: {full_config_path}")
 
-        for config_path in arch_config_paths["firefly_gan"]:
+        for config_path in arch_config_paths["chouwa_gan"]:
             full_config_path = os.path.join("rvc", "configs", config_path)
             try:
                 with open(full_config_path, "r") as f:

@@ -121,9 +121,9 @@ class Synthesizer(torch.nn.Module):
                     use_inplace=True,
                 )
                 print("    ██████  Vocoder: PCPH-GAN")
-            elif vocoder == "FireflyGAN":
-                from rvc.lib.algorithm.generators import FireflyGANNSFGenerator
-                self.dec = FireflyGANNSFGenerator(
+            elif vocoder == "ChouwaGAN":
+                from rvc.lib.algorithm.generators import ChouwaGANGenerator
+                self.dec = ChouwaGANGenerator(
                     inter_channels,
                     resblock_kernel_sizes,
                     resblock_dilation_sizes,
@@ -134,7 +134,7 @@ class Synthesizer(torch.nn.Module):
                     sr=sr,
                     checkpointing=checkpointing,
                 )
-                print("    ██████  Vocoder: FireflyGAN-PCPH")
+                print("    ██████  Vocoder: ChouwaGAN-PCPH")
             else:  # vocoder == "HiFi-GAN"
                 from rvc.lib.algorithm.generators import HiFiGANNSFGenerator
                 self.dec = HiFiGANNSFGenerator(

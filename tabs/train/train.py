@@ -29,8 +29,18 @@ supported_audio_ext = { "wav", "mp3", "flac", "ogg", "opus", "m4a", "mp4", "aac"
 
 saved_components = [] # List of components that should have their states saved ~ For presets
 
-FORK_VOCODER_CHOICES = ["RingFormer_v1", "RingFormer_v2", "PCPH-GAN", "FireflyGAN"]
-ALL_VOCODER_CHOICES = ["HiFi-GAN", "RefineGAN", *FORK_VOCODER_CHOICES]
+RVC_VOCODER_CHOICES = ["HiFi-GAN"]
+APPLIO_VOCODER_CHOICES = ["RefineGAN"]
+FORK_VOCODER_CHOICES = ["RingFormer_v1", "RingFormer_v2"]
+V3_VOCODER_CHOICES = ["ChouwaGAN"]
+ALL_VOCODER_CHOICES = [*RVC_VOCODER_CHOICES, *APPLIO_VOCODER_CHOICES, *FORK_VOCODER_CHOICES, *V3_VOCODER_CHOICES]
+
+VOCODER_INFO = {
+    "RVC": "**HiFi-GAN:** \n- **Arch overview:ㅤHiFi-GAN + Hn-NSF for f0 handling. ( RVC's og vocoder )** \n- **COMPATIBILITY:ㅤAll clients incl. Mainline RVC / W-okada etc.**",
+    "Fork/Applio": "**RefineGAN:** \n- **Arch overview:ㅤHiFi-Gan + Hn-NSF + ParallelResBlock + AdaIN** \n- **COMPATIBILITY:ㅤThis Fork or Applio ( As for rt-vc, vonovox beta supports it. )**",
+    "Fork": "**RingFormer:** \n- **Arch overview:ㅤA hybrid Conformer-Based Vocoder + Snake-Beta act. + RingAttention + Hn-NSF** \n- **COMPATIBILITY:ㅤThis Fork ( As for rt-vc, 'Vonovox' supports it. )** \n\n **NOTES:** \n **( RingFormer Requires min. RTX 30xx [ At least Ampere microarchitecture ] )** \n **( Each Vocoder and it's supported sample rates require appropriate pretrained models. )**",
+    "v3": "**ChouwaGAN:** \n- **Arch overview:ㅤConvNeXt backbone + HiFi-GAN vocoder head + Snake act.** \n- **COMPATIBILITY:ㅤThis Fork only ( No rt-vc clients support it atm. )** \n\n **NOTES:** \n **( Requires v3 pretrains! )**",
+}
 
 
 # Custom Pretraineds
@@ -369,8 +379,8 @@ def train_tab():
                 )
                 vocoder = gr.Radio(
                     label="Vocoder",
-                    info="**Vocoder for audio synthesis:** \n \n **HiFi-GAN:** \n- **Arch overview:ㅤHiFi-GAN + Hn-NSF for f0 handling. ( RVC's og vocoder )** \n- **COMPATIBILITY:ㅤAll clients incl. Mainline RVC / W-okada etc.** \n\n**RefineGAN:** \n - **Arch overview:ㅤHiFi-Gan + Hn-NSF + ParallelResBlock + AdaIN** \n- **COMPATIBILITY:ㅤThis Fork or Applio ( As for rt-vc, vonovox beta supports it. )** \n\n**RingFormer:** \n- **Arch overview:ㅤA hybrid Conformer-Based Vocoder + Snake-Beta act. + RingAttention + Hn-NSF** \n- **COMPATIBILITY:ㅤThis Fork ( As for rt-vc, 'Vonovox' supports it. )**  \n\n**PCPH-GAN:** \n- **Arch overview: HiFi-Gan + PCPH prior + SnakeBeta & Silu** \n- **COMPATIBILITY:ㅤThis Fork ( No rt-vc clients support it atm. )** \n\n **NOTES:** \n **( RingFormer Requires min. RTX 30xx [ At least Ampere microarchitecture ] )** \n **( Each Vocoder and it's supported sample rates require appropriate pretrained models. )**",
-                    choices=ALL_VOCODER_CHOICES,
+                    info=VOCODER_INFO["RVC"],
+                    choices=RVC_VOCODER_CHOICES,
                     value="HiFi-GAN",
                     interactive=False,
                     visible=True,
@@ -1105,20 +1115,19 @@ def train_tab():
                             "__type__": "update",
                         },
                         {
-                            "choices": ["RefineGAN"],
+                            "choices": APPLIO_VOCODER_CHOICES,
                             "__type__": "update",
-                            "interactive": True,
+                            "interactive": False,
                             "value": "RefineGAN",
+                            "info": VOCODER_INFO["Fork/Applio"],
                         },
                         vocoder_arch_value,
                     )
-                elif architecture in ("Fork", "v3"):
-                    selected_vocoder = vocoder if vocoder in FORK_VOCODER_CHOICES else "FireflyGAN"
+                elif architecture == "Fork":
+                    selected_vocoder = vocoder if vocoder in FORK_VOCODER_CHOICES else "RingFormer_v2"
                     vocoder_arch_value = {
                         "RingFormer_v1": "ringformer_v1",
                         "RingFormer_v2": "ringformer_v2",
-                        "PCPH-GAN": "pcph_gan",
-                        "FireflyGAN": "firefly_gan",
                     }[selected_vocoder]
                     return (
                         {
@@ -1131,6 +1140,24 @@ def train_tab():
                             "__type__": "update",
                             "interactive": True,
                             "value": selected_vocoder,
+                            "info": VOCODER_INFO["Fork"],
+                        },
+                        vocoder_arch_value,
+                    )
+                elif architecture == "v3":
+                    vocoder_arch_value = "chouwa_gan"
+                    return (
+                        {
+                            "choices": ["32000", "40000", "48000"],
+                            "__type__": "update",
+                            "value": "32000",
+                        },
+                        {
+                            "choices": V3_VOCODER_CHOICES,
+                            "__type__": "update",
+                            "interactive": False,
+                            "value": "ChouwaGAN",
+                            "info": VOCODER_INFO["v3"],
                         },
                         vocoder_arch_value,
                     )
@@ -1143,53 +1170,32 @@ def train_tab():
                             "value": "48000",
                         },
                         {
-                            "choices": ["HiFi-GAN"],
+                            "choices": RVC_VOCODER_CHOICES,
                             "__type__": "update",
                             "value": "HiFi-GAN",
                             "interactive": False,
+                            "info": VOCODER_INFO["RVC"],
                         },
                         vocoder_arch_value,
                     )
             def fork_vocoder_handler(architecture, vocoder_arch, vocoder):
-                if architecture in ("Fork", "v3") and vocoder == "RingFormer_v1":
-                    vocoder_arch_value = "ringformer_v1"
+                if architecture == "Fork" and vocoder == "RingFormer_v1":
                     return (
                         {
                             "choices": ["24000", "32000", "40000", "48000"],
                             "__type__": "update",
                             "value": "48000",
                         },
-                        vocoder_arch_value,
+                        "ringformer_v1",
                     )
-                elif architecture in ("Fork", "v3") and vocoder == "RingFormer_v2":
-                    vocoder_arch_value = "ringformer_v2"
+                elif architecture == "Fork" and vocoder == "RingFormer_v2":
                     return (
                         {
                             "choices": ["24000", "32000", "40000", "48000"],
                             "__type__": "update",
                             "value": "48000",
                         },
-                        vocoder_arch_value,
-                    )
-                elif architecture in ("Fork", "v3") and vocoder == "PCPH-GAN":
-                    vocoder_arch_value = "pcph_gan"
-                    return (
-                        {
-                            "choices": ["24000", "32000", "40000", "48000"],
-                            "__type__": "update",
-                            "value": "48000",
-                        },
-                        vocoder_arch_value,
-                    )
-                elif architecture in ("Fork", "v3") and vocoder == "FireflyGAN":
-                    vocoder_arch_value = "firefly_gan"
-                    return (
-                        {
-                            "choices": ["32000", "40000", "48000"],
-                            "__type__": "update",
-                            "value": "48000",
-                        },
-                        vocoder_arch_value,
+                        "ringformer_v2",
                     )
                 else:
                     return gr.skip()
@@ -1258,6 +1264,8 @@ def train_tab():
                         settings["vocoder_v2"] = "RingFormer_v2"
                 elif architecture_value == "Fork/Applio":
                     settings["vocoder_v2"] = "RefineGAN"
+                elif architecture_value == "v3":
+                    settings["vocoder_v2"] = "ChouwaGAN"
                 else:
                     settings["vocoder_v2"] = "HiFi-GAN"
 

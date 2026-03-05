@@ -185,6 +185,7 @@ class ResBlock(torch.nn.Module):
             remove_weight_norm(conv)
 
 
+@torch._dynamo.disable
 def pcph_generator_v2(
     f0: torch.Tensor,
     hop_length: int,
@@ -199,6 +200,11 @@ def pcph_generator_v2(
     """
     An optimized O(1) generator for Pseudo-Constant-Power Harmonic waveforms.
     Now using a fused Triton kernel for the Dirichlet summation.
+
+    Note: decorated with @torch._dynamo.disable to prevent torch.compile from
+    fusing torch.rand + cumsum into a Triton kernel that fails on older GPUs
+    (pre-Ampere) with 'operation not supported on global/shared address space'.
+    The function already runs inside torch.no_grad() so eager mode is fine.
     """
     batch, _, frames = f0.size()
     device = f0.device

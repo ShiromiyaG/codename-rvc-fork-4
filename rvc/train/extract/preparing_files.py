@@ -12,7 +12,7 @@ def generate_config(sample_rate: int, model_path: str, vocoder_arch: str):
     config_path = os.path.join("rvc", "configs", vocoder_arch, f"{sample_rate}.json")
     config_save_path = os.path.join(model_path, "config.json")
 
-    # Always regenerate if vocoder architecture changed (e.g. hifi_refine → firefly_gan)
+    # Always regenerate if the config content differs from the target template
     needs_update = True
     if os.path.exists(config_save_path):
         try:
@@ -20,12 +20,7 @@ def generate_config(sample_rate: int, model_path: str, vocoder_arch: str):
                 existing = json.load(f)
             with open(config_path, "r") as f:
                 target = json.load(f)
-            # Check if the config structure matches (mrd section, segment_size, etc.)
-            needs_update = (
-                existing.get("train", {}).get("segment_size") != target.get("train", {}).get("segment_size")
-                or ("mrd" in target and "mrd" not in existing)
-                or ("mrd" not in target and "mrd" in existing)
-            )
+            needs_update = existing != target
         except (json.JSONDecodeError, OSError):
             needs_update = True
 

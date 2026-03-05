@@ -12,7 +12,6 @@ soundfile==0.12.1
 sox==1.5.0
 soxr==0.5.0
 noisereduce
-pedalboard
 stftpitchshift
 flatten-dict==0.4.2
 torch-dct==0.1.6
@@ -28,6 +27,7 @@ torchaudio==2.7.1
 torchvision==0.22.1
 torchcrepe==0.0.23
 torch-optimizer
+torch-optimi
 einop
 transformers==4.44.2
 nnaudio==0.3.3

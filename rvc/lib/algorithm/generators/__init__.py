@@ -3,4 +3,4 @@ from .hifigan_nsf import HiFiGANNSFGenerator
 from .pcph_gan import PCPH_GAN_Generator
 from .hifigan import HiFiGANGenerator
 from .refinegan import RefineGANGenerator
-from .firefly_gan_nsf import FireflyGANNSFGenerator
+from .chouwa_gan import ChouwaGANGenerator
