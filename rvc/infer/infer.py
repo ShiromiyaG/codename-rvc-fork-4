@@ -12,19 +12,6 @@ import noisereduce as nr
 import faiss
 import zstandard as zstd
 import io
-from pedalboard import (
-    Pedalboard,
-    Chorus,
-    Distortion,
-    Reverb,
-    PitchShift,
-    Limiter,
-    Gain,
-    Bitcrush,
-    Clipping,
-    Compressor,
-    Delay,
-)
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
@@ -130,70 +117,6 @@ class VoiceConverter:
         except Exception as error:
             print(f"An error occurred converting the audio format: {error}")
 
-    @staticmethod
-    def post_process_audio(
-        audio_input,
-        sample_rate,
-        **kwargs,
-    ):
-        board = Pedalboard()
-        if kwargs.get("reverb", False):
-            reverb = Reverb(
-                room_size=kwargs.get("reverb_room_size", 0.5),
-                damping=kwargs.get("reverb_damping", 0.5),
-                wet_level=kwargs.get("reverb_wet_level", 0.33),
-                dry_level=kwargs.get("reverb_dry_level", 0.4),
-                width=kwargs.get("reverb_width", 1.0),
-                freeze_mode=kwargs.get("reverb_freeze_mode", 0),
-            )
-            board.append(reverb)
-        if kwargs.get("pitch_shift", False):
-            pitch_shift = PitchShift(semitones=kwargs.get("pitch_shift_semitones", 0))
-            board.append(pitch_shift)
-        if kwargs.get("limiter", False):
-            limiter = Limiter(
-                threshold_db=kwargs.get("limiter_threshold", -6),
-                release_ms=kwargs.get("limiter_release", 0.05),
-            )
-            board.append(limiter)
-        if kwargs.get("gain", False):
-            gain = Gain(gain_db=kwargs.get("gain_db", 0))
-            board.append(gain)
-        if kwargs.get("distortion", False):
-            distortion = Distortion(drive_db=kwargs.get("distortion_gain", 25))
-            board.append(distortion)
-        if kwargs.get("chorus", False):
-            chorus = Chorus(
-                rate_hz=kwargs.get("chorus_rate", 1.0),
-                depth=kwargs.get("chorus_depth", 0.25),
-                centre_delay_ms=kwargs.get("chorus_delay", 7),
-                feedback=kwargs.get("chorus_feedback", 0.0),
-                mix=kwargs.get("chorus_mix", 0.5),
-            )
-            board.append(chorus)
-        if kwargs.get("bitcrush", False):
-            bitcrush = Bitcrush(bit_depth=kwargs.get("bitcrush_bit_depth", 8))
-            board.append(bitcrush)
-        if kwargs.get("clipping", False):
-            clipping = Clipping(threshold_db=kwargs.get("clipping_threshold", 0))
-            board.append(clipping)
-        if kwargs.get("compressor", False):
-            compressor = Compressor(
-                threshold_db=kwargs.get("compressor_threshold", 0),
-                ratio=kwargs.get("compressor_ratio", 1),
-                attack_ms=kwargs.get("compressor_attack", 1.0),
-                release_ms=kwargs.get("compressor_release", 100),
-            )
-            board.append(compressor)
-        if kwargs.get("delay", False):
-            delay = Delay(
-                delay_seconds=kwargs.get("delay_seconds", 0.5),
-                feedback=kwargs.get("delay_feedback", 0.0),
-                mix=kwargs.get("delay_mix", 0.5),
-            )
-            board.append(delay)
-        return board(audio_input, sample_rate)
-
     def convert_audio(
         self,
         audio_input_path: str,
@@ -215,7 +138,6 @@ class VoiceConverter:
         clean_audio: bool = False,
         clean_strength: float = 0.5,
         export_format: str = "WAV",
-        post_process: bool = False,
         resample_sr: int = 0,
         sid: int = 0,
         seed: int = 0,
@@ -333,13 +255,6 @@ class VoiceConverter:
                 )
                 if cleaned_audio is not None:
                     audio_opt = cleaned_audio
-
-            if post_process:
-                audio_opt = self.post_process_audio(
-                    audio_input=audio_opt,
-                    sample_rate=self.tgt_sr,
-                    **kwargs,
-                )
 
             sf.write(audio_output_path, audio_opt, self.tgt_sr, format="WAV")
             output_path_format = audio_output_path.replace(
@@ -538,6 +453,12 @@ class VoiceConverter:
         Sets up the network configuration based on the loaded checkpoint.
         """
         if self.active_cpt is not None:
+            # Strip _orig_mod. prefix from compiled model checkpoints
+            if any(k.startswith("_orig_mod.") for k in self.active_cpt.get("weight", {})):
+                self.active_cpt["weight"] = {
+                    k.replace("_orig_mod.", ""): v
+                    for k, v in self.active_cpt["weight"].items()
+                }
             self.tgt_sr = self.active_cpt["config"][-1]
             self.active_cpt["config"][-3] = self.active_cpt["weight"]["emb_g.weight"].shape[0]
             self.use_f0 = self.active_cpt.get("f0", 1)
@@ -546,6 +467,7 @@ class VoiceConverter:
             self.text_enc_hidden_dim = 768 if self.version == "v2" else 256
             self.vocoder = self.active_cpt.get("vocoder", "HiFi-GAN")
             self.vits2_mode = self.active_cpt.get("vits2_mode", False)
+            self.v3_mode = self.active_cpt.get("v3_mode", False)
 
             if self.vocoder in ["RingFormer_v1", "RingFormer_v2"]:
                 ringformer_istft = self.active_cpt.get("ringformer_istft", [None, None])
@@ -559,6 +481,7 @@ class VoiceConverter:
                     text_enc_hidden_dim=self.text_enc_hidden_dim,
                     vocoder=self.vocoder,
                     vits2_mode=self.vits2_mode,
+                    v3_mode=self.v3_mode,
                 )
             else:
                 self.net_g = Synthesizer(
@@ -567,6 +490,7 @@ class VoiceConverter:
                     text_enc_hidden_dim=self.text_enc_hidden_dim,
                     vocoder=self.vocoder,
                     vits2_mode=self.vits2_mode,
+                    v3_mode=self.v3_mode,
                 )
 
             del self.net_g.enc_q

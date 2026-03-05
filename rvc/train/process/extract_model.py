@@ -37,6 +37,7 @@ def extract_model(
     pitch_guidance=True,
     version="v2",
     vits2_mode=False,
+    v3_mode=False,
 ):
     try:
         model_dir = os.path.dirname(model_path)
@@ -58,7 +59,8 @@ def extract_model(
 
         opt = OrderedDict(
             weight={
-                key: value.half() for key, value in ckpt.items() if "enc_q" not in key
+                key.replace("_orig_mod.", ""): value.half()
+                for key, value in ckpt.items() if "enc_q" not in key
             }
         )
 
@@ -105,6 +107,7 @@ def extract_model(
         opt["vocoder"] = vocoder
         opt["vocoder_architecture"] = vocoder_architecture
         opt["vits2_mode"] = vits2_mode
+        opt["v3_mode"] = v3_mode
 
         if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
             opt["ringformer_istft"] = [

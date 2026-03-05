@@ -1,23 +1,48 @@
 @echo off
-:: get hostname of your computer and save it to variable host.
-FOR /F "usebackq" %%i IN (`hostname`) DO SET host=%%i
+title TensorBoard Launcher
+color 0A
 
-:: use port 25565 as the tensorboard port.
-set port=25565
+:: Define port
+set PORT=25565
+set ADDRESS=http://localhost:%PORT%
 
-:: the link to the local tensorboard webpage is as follows
-set address="http://%host%:%port%"
+echo ===================================================
+echo             TensorBoard Launcher
+echo ===================================================
+echo.
+echo Please enter the path to your model's log directory.
+echo (e.g. Logs^(Path^), C:\models\my_model)
+echo.
 
-:: display the address in the command prompt
-echo %address%
+:: Get user input
+set /p UserInputPath="Model Directory: "
 
-:: ask user to key in the saved model directory, example "C:\tmp\mnist_model"
-set /p UserInputPath=Key in model saved directory:
+:: Remove outer quotes if the user dragged and dropped a folder
+set UserInputPath=%UserInputPath:"=%
 
-::start tensorboard
-start "" tensorboard --logdir="%UserInputPath%" --host="%host%" --port=25565 
+:: Check if path is empty or does not exist
+if "%UserInputPath%"=="" (
+    echo Error: Path cannot be empty.
+    pause
+    exit /b
+)
+if not exist "%UserInputPath%\" (
+    echo Error: Directory "%UserInputPath%" does not exist.
+    pause
+    exit /b
+)
 
-TIMEOUT /T 3 /NOBREAK >nul
+echo.
+echo Starting TensorBoard at %ADDRESS%
+echo Reading logs from: "%UserInputPath%"
+echo.
+echo Press Ctrl + C to stop the server...
+echo.
 
-:: use default browser to open tensorboard webpage
-explorer %address%
+:: Open browser
+explorer %ADDRESS%
+
+:: Start TensorBoard
+tensorboard --logdir="%UserInputPath%" --port=%PORT% --bind_all
+
+pause

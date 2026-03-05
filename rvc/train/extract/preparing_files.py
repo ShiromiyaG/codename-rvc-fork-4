@@ -11,11 +11,24 @@ current_directory = os.getcwd()
 def generate_config(sample_rate: int, model_path: str, vocoder_arch: str):
     config_path = os.path.join("rvc", "configs", vocoder_arch, f"{sample_rate}.json")
     config_save_path = os.path.join(model_path, "config.json")
-    if not os.path.exists(config_save_path):
+
+    # Always regenerate if the config content differs from the target template
+    needs_update = True
+    if os.path.exists(config_save_path):
+        try:
+            with open(config_save_path, "r") as f:
+                existing = json.load(f)
+            with open(config_path, "r") as f:
+                target = json.load(f)
+            needs_update = existing != target
+        except (json.JSONDecodeError, OSError):
+            needs_update = True
+
+    if needs_update:
         shutil.copyfile(config_path, config_save_path)
         print(f"Config saved at {config_save_path}")
     else:
-        print(f"Config file already exists at {config_save_path}")
+        print(f"Config file already up-to-date at {config_save_path}")
 
 def generate_filelist(
     model_path: str, sample_rate: int, include_mutes: int = 2, embedder_model: str = "contentvec", vocoder_arch: str = "hifi_refine"

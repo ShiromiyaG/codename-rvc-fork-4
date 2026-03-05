@@ -13,6 +13,21 @@ import sys
 pid_data = {"process_pids": []}
 os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
 os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
+# Suppress _POSIX_C_SOURCE redefinition noise emitted by GCC when Triton
+# JIT-compiles its C stubs. Conda's pyconfig.h and the system's features.h
+# both define the macro to different values; -w silences all GCC warnings
+# for that translation unit without affecting PyTorch/CUDA compilation.
+# Use append (not setdefault) so that conda's existing CFLAGS are preserved.
+os.environ["CFLAGS"] = os.environ.get("CFLAGS", "") + " -w"
+os.environ["CXXFLAGS"] = os.environ.get("CXXFLAGS", "") + " -w"
+import warnings
+# torch.inductor falls back to eager for complex-valued ops (STFT in MRD).
+# This is expected for our training setup; suppress the per-step noise.
+warnings.filterwarnings(
+    "ignore",
+    message=".*Torchinductor does not support code generation for complex operators.*",
+    category=UserWarning,
+)
 from typing import Tuple, Optional
 from collections import deque
 from distutils.util import strtobool
@@ -127,6 +142,9 @@ assert not use_custom_lr or (custom_lr_g and custom_lr_d), "Invalid custom LR va
 # Parse command line arguments end region ===========================
 
 current_dir = os.getcwd()
+
+# Derive v3_mode from architecture string
+v3_mode = architecture == "v3"
 experiment_dir = os.path.join(current_dir, "logs", model_name)
 config_save_path = os.path.join(experiment_dir, "config.json")
 dataset_path = os.path.join(experiment_dir, "sliced_audios")
@@ -151,6 +169,10 @@ torch.backends.cuda.matmul.allow_tf32 = use_tf32
 torch.backends.cudnn.allow_tf32 = use_tf32
 torch.backends.cudnn.benchmark = use_benchmark
 torch.backends.cudnn.deterministic = use_deterministic
+# Enable TF32 Tensor Cores for torch.matmul() (nn.Linear, ConvNeXt pointwise layers).
+# 'high' = TF32 precision (10-bit mantissa, ~2x faster on Ampere+).
+# 'highest' = full FP32 (default PyTorch behaviour when not using this).
+torch.set_float32_matmul_precision('high' if use_tf32 else 'highest')
 
 # Globals ( Do not alter these )
 global_step = 0
@@ -173,6 +195,21 @@ new_pretrain_lr = 5e-5 # If you changed it, it needs to be re-adjusted to the mo
 
 # EXPERIMENTAL
 use_trajectory = False
+
+# torch.compile — Ampere+ (RTX 3090 / A100 / H100) with PyTorch 2.x
+# 'default'  — inductor kernel fusion + op optimization, no CUDA Graphs.
+#              Best balance of speed and compatibility for GAN training
+#              (variable-length batches from bucket sampler, complex STFT in MRD).
+# 'max-autotune' — profiles kernels at startup (~5 min), best for >12 h runs.
+#              Also avoids CUDA Graphs (uses inductor's autotuned triton kernels).
+# NOTE: 'reduce-overhead' / 'max-autotune' enable CUDA Graphs which are
+#       incompatible with this setup (variable shapes, multi-model steps,
+#       complex ops → stalls, empty-graph warnings, tensor aliasing crashes).
+#       'max-autotune-no-cudagraphs' runs Triton autotuning for best kernel
+#       tile sizes without requiring fixed shapes.  First step is slow (~2-5
+#       min while autotuning), steady-state is faster than 'default'.
+use_compile = True
+compile_mode = "max-autotune-no-cudagraphs"  # 'default' | 'max-autotune-no-cudagraphs'
 
 use_sid_swap = False
 custom_sid = 1
@@ -309,23 +346,41 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing, randomized):
         checkpointing = use_checkpointing,
         randomized = randomized,
         vits2_mode = vits2_mode,
+        v3_mode = v3_mode,
     )
 
 def get_d_model(config, vocoder, use_checkpointing):
+    default_mrd = {
+        "periods": [2, 3, 5, 7, 11],
+        "resolutions": [[256, 25, 120], [512, 50, 240], [1024, 120, 600]]
+    }
+    mrd_config = dict(config.mrd) if hasattr(config, "mrd") else default_mrd
+
     if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
         from rvc.lib.algorithm.discriminators.multi import MPD_MSD_MRD_Combined
         # MPD + MSD + MRD ( unified ) - RingFormer architecture v1 and v2
         return MPD_MSD_MRD_Combined(
             config.model.use_spectral_norm,
             use_checkpointing=use_checkpointing,
-            **dict(config.mrd)
+            **mrd_config
         )
     elif vocoder == "PCPH-GAN":
         from rvc.lib.algorithm.discriminators.multi import MPD_MSD_MRD_Combined
         return MPD_MSD_MRD_Combined(
             config.model.use_spectral_norm,
             use_checkpointing=use_checkpointing,
-            **dict(config.mrd)
+            **mrd_config
+        )
+    elif vocoder == "ChouwaGAN":
+        from rvc.lib.algorithm.discriminators.multi import FastMPD_MSD_CQT_Combined
+        # FastMPD + MSD + MS-SB-CQT (optimized: ~40-50% lighter, better harmonic accuracy)
+        chouwa_cfg = dict(config.mrd) if hasattr(config, "mrd") else default_mrd
+        sample_rate = config.data.sample_rate if hasattr(config.data, "sample_rate") else 40000
+        return FastMPD_MSD_CQT_Combined(
+            config.model.use_spectral_norm,
+            use_checkpointing=use_checkpointing,
+            sample_rate=sample_rate,
+            **chouwa_cfg
         )
     elif vocoder == "RefineGAN":
         from rvc.lib.algorithm.discriminators.multi import MPD_MSD_MRD_Combined_RefineGan
@@ -501,7 +556,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
 
             # Load the model and optim states
             _, _, _, epoch_str, gradscaler_dict = load_checkpoint(g_checkpoint_path, net_g, optim_g)
-            _, _, _, epoch_str, _ = load_checkpoint(d_checkpoint_path, net_d, optim_d)
+            _, _, _, epoch_str, _ = load_checkpoint(d_checkpoint_path, net_d, optim_d, strict=False)
 
             if override_pretrain_lr:
                 new_lr_for_pretrain = new_pretrain_lr
@@ -561,7 +616,26 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             checkpoint = torch.load(pretrainD, map_location="cpu", weights_only=True)
             state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
 
-            net_d.load_state_dict(state_dict, strict=True)
+            # Use strict=False for D pretrain loading, but also filter out
+            # shape mismatches manually — PyTorch's strict=False only handles
+            # missing/extra keys, NOT shape conflicts (which still raise).
+            # This handles normal→fast and any arch change safely.
+            current_state = (net_d.module if hasattr(net_d, "module") else net_d).state_dict()
+            filtered = {
+                k: v for k, v in state_dict.items()
+                if k in current_state and current_state[k].shape == v.shape
+            }
+            skipped_shape = [k for k in state_dict if k in current_state and current_state[k].shape != state_dict[k].shape]
+            missing, unexpected = (net_d.module if hasattr(net_d, "module") else net_d).load_state_dict(filtered, strict=False)
+            if rank == 0:
+                n_loaded = len(filtered)
+                n_shape  = len(skipped_shape)
+                n_miss   = len(missing)
+                if n_shape or n_miss:
+                    print(f"[D PRETRAIN] Partial load: {n_loaded} keys matched, "
+                          f"{n_shape} skipped (shape mismatch), {n_miss} initialized fresh.")
+                else:
+                    print(f"[D PRETRAIN] Full load: all {n_loaded} keys matched.")
 
         # Load the models and optionally wrap with DDP
         net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus)
@@ -727,8 +801,24 @@ def main():
             subproc.start()
             pid_data["process_pids"].append(subproc.pid)
 
-        for i in range(n_gpus):
-            children[i].join()
+        try:
+            for i in range(n_gpus):
+                children[i].join()
+        except KeyboardInterrupt:
+            # Main process received SIGINT (Early Stop from GUI).
+            # Workers spawn separately and don't inherit the signal, so
+            # we forward SIGINT to each worker so their EarlyStopSignalHandler
+            # triggers the save-and-exit path.
+            print("[TRAINING] Forwarding Early Stop signal to workers...")
+            for child in children:
+                if child.is_alive():
+                    os.kill(child.pid, signal.SIGINT)
+            # Wait for workers to finish saving (generous timeout)
+            for child in children:
+                child.join(timeout=180)
+                if child.is_alive():
+                    print(f"[TRAINING] Worker {child.pid} did not exit in time, terminating.")
+                    child.terminate()
 
     if cleanup:
         old_session_cleanup(now_dir, model_name)
@@ -857,6 +947,19 @@ def run(
         rank
     )
 
+    # Number of sub-discriminators — used to normalize losses for ChouwaGAN
+    # (prevents gradient scale explosion when more sub-discs are active).
+    # Other vocoders use n_disc=1 (no change in behaviour).
+    if vocoder == "ChouwaGAN":
+        _actual_d = net_d.module if hasattr(net_d, 'module') else net_d
+        n_disc = len(_actual_d.discriminators) if hasattr(_actual_d, 'discriminators') else 9
+    else:
+        n_disc = 1
+
+    # Gradient clip ceiling for G — raised for ChouwaGAN so the adversarial
+    # signal isn't overwhelmed after per-disc normalization.
+    grad_clip_g = 500.0 if vocoder == "ChouwaGAN" else 200.0
+
     # Tensorboard handling
     if rank == 0:
         writer_eval = SummaryWriter(
@@ -909,63 +1012,106 @@ def run(
 
     training_loop.encoders_frozen = False
 
+    # torch.compile opt-in (requires PyTorch >= 2.0 and CUDA Ampere+)
+    if use_compile and device.type == "cuda" and torch.cuda.is_available():
+        try:
+            if rank == 0:
+                print(f"    ██████  torch.compile: mode='{compile_mode}' — compiling G and D...")
+            _compile_opts = dict(mode=compile_mode, fullgraph=False, dynamic=True)
+            if isinstance(net_g, torch.nn.parallel.DistributedDataParallel):
+                net_g.module = torch.compile(net_g.module, **_compile_opts)
+            else:
+                net_g = torch.compile(net_g, **_compile_opts)
+            if isinstance(net_d, torch.nn.parallel.DistributedDataParallel):
+                net_d.module = torch.compile(net_d.module, **_compile_opts)
+            else:
+                net_d = torch.compile(net_d, **_compile_opts)
+            if rank == 0:
+                print("    ██████  torch.compile: done. First step will be slower (tracing).")
+        except Exception as e:
+            if rank == 0:
+                print(f"    ██████  torch.compile: failed ({e}), continuing without it.")
+
     # Reference sample for live-infer
     reference = get_reference_sample(train_loader, device, config)
 
     # Cache for training with " cache " enabled
     cache = []
 
-    for epoch in range(epoch_str, total_epoch_count + 1):
-        should_stop = training_loop(
-            rank,
-            epoch,
-            config,
-            [net_g, net_d],
-            [optim_g, optim_d],
-            [scheduler_g, scheduler_d],
-            train_loader,
-            val_loader if use_validation else None,
-            [writer_eval],
-            cache,
-            total_epoch_count,
-            epoch_save_frequency,
-            save_weight_models,
-            save_only_latest_net_models,
-            device,
-            device_id,
-            reference,
-            fn_spectral_loss,
-            n_gpus,
-            gradscaler,
-            fn_hinge_loss,
-            hann_window,
-            stopper=stopper,
-            trajectory_tracker=trajectory_tracker
-        )
+    def _shutdown_loader(loader):
+        """Force DataLoader worker shutdown to avoid semaphore leaks on exit."""
+        if loader is None:
+            return
+        try:
+            it = getattr(loader, "_iterator", None)
+            if it is not None:
+                it._shutdown_workers()
+                loader._iterator = None
+        except Exception:
+            pass
 
-        if use_warmup and epoch <= warmup_duration:
-            if warmup_scheduler_g:
-                warmup_scheduler_g.step()
-            if warmup_scheduler_d:
-                warmup_scheduler_d.step()
+    try:
+        for epoch in range(epoch_str, total_epoch_count + 1):
+            should_stop = training_loop(
+                rank,
+                epoch,
+                config,
+                [net_g, net_d],
+                [optim_g, optim_d],
+                [scheduler_g, scheduler_d],
+                train_loader,
+                val_loader if use_validation else None,
+                [writer_eval],
+                cache,
+                total_epoch_count,
+                epoch_save_frequency,
+                save_weight_models,
+                save_only_latest_net_models,
+                device,
+                device_id,
+                reference,
+                fn_spectral_loss,
+                n_gpus,
+                gradscaler,
+                fn_hinge_loss,
+                hann_window,
+                stopper=stopper,
+                trajectory_tracker=trajectory_tracker,
+                n_disc=n_disc,
+                grad_clip_g=grad_clip_g,
+            )
 
-            # Logging of finished warmup
-            if epoch == warmup_duration:
-                warmup_completed = True
-                print(f"    ██████  Warmup completed at epochs: {warmup_duration}")
-                print(f"    ██████  LR G: {optim_g.param_groups[0]['lr']}")
-                print(f"    ██████  LR D: {optim_d.param_groups[0]['lr']}")
-                # scheduler:
-                if lr_scheduler == "exp decay epoch":
-                    print(f"    ██████  Starting the per-epoch exponential lr decay with gamma of {exp_decay_gamma}")
-                elif lr_scheduler == "cosine annealing epoch":
-                    print("    ██████  Starting per-epoch cosine annealing scheduler " )
+            if use_warmup and epoch <= warmup_duration:
+                if warmup_scheduler_g:
+                    warmup_scheduler_g.step()
+                if warmup_scheduler_d:
+                    warmup_scheduler_d.step()
 
-        if use_lr_scheduler and (not use_warmup or warmup_completed):
-            # Once the warmup phase is completed, uses exponential lr decay
-            if lr_scheduler in ["exp decay epoch", "cosine annealing epoch"]:
-                scheduler_g.step()
-                scheduler_d.step()
+                # Logging of finished warmup
+                if epoch == warmup_duration:
+                    warmup_completed = True
+                    print(f"    ██████  Warmup completed at epochs: {warmup_duration}")
+                    print(f"    ██████  LR G: {optim_g.param_groups[0]['lr']}")
+                    print(f"    ██████  LR D: {optim_d.param_groups[0]['lr']}")
+                    # scheduler:
+                    if lr_scheduler == "exp decay epoch":
+                        print(f"    ██████  Starting the per-epoch exponential lr decay with gamma of {exp_decay_gamma}")
+                    elif lr_scheduler == "cosine annealing epoch":
+                        print("    ██████  Starting per-epoch cosine annealing scheduler " )
+
+            if use_lr_scheduler and (not use_warmup or warmup_completed):
+                # Once the warmup phase is completed, uses exponential lr decay
+                if lr_scheduler in ["exp decay epoch", "cosine annealing epoch"]:
+                    scheduler_g.step()
+                    scheduler_d.step()
+    finally:
+        # Explicitly shut down DataLoader worker processes so their semaphores,
+        # file descriptors and shared-memory segments are released before the
+        # spawned subprocess exits. Without this, Python's resource_tracker
+        # reports N leaked semaphores at shutdown (persistent_workers=True +
+        # mp.Process is the common trigger).
+        _shutdown_loader(train_loader)
+        _shutdown_loader(val_loader)
 
 def training_loop(
     rank,
@@ -991,7 +1137,9 @@ def training_loop(
     fn_hinge_loss=None,
     hann_window=None,
     stopper=None,
-    trajectory_tracker=None
+    trajectory_tracker=None,
+    n_disc=1,
+    grad_clip_g=200.0,
 ):
     """
     Trains and evaluates the model for one epoch.
@@ -1123,9 +1271,9 @@ def training_loop(
                 y_hat_stft = torch.stft(reshaped_y_hat, n_fft=config.model.gen_istft_n_fft, hop_length=config.model.gen_istft_hop_size, win_length=config.model.gen_istft_n_fft, window=hann_window, return_complex=True)
                 target_magnitude = torch.abs(y_stft)  # shape: [B, F, T]
 
-            # Discriminator forward pass:
+            # Discriminator forward pass (no fmaps — saves memory):
             with autocast(device_type="cuda", enabled=use_amp, dtype=train_dtype):
-                y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+                y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach(), compute_fmaps=False)
 
             with autocast(device_type="cuda", enabled=False):
                 # Compute discriminator loss:
@@ -1136,6 +1284,9 @@ def training_loop(
                 elif adversarial_loss == "hinge":
                     loss_fake, loss_real = fn_hinge_loss(y_d_hat_g, y_d_hat_r)
                     loss_disc = loss_fake + loss_real
+                # Normalize by sub-discriminator count so gradient scale
+                # stays independent of how many discriminators are composed.
+                loss_disc = loss_disc / n_disc
 
             # Discriminator backward and update:
             optim_d.zero_grad(set_to_none=True)
@@ -1143,16 +1294,30 @@ def training_loop(
                 gradscaler.scale(loss_disc).backward() # Scale and backward of the loss
                 gradscaler.unscale_(optim_d) # Unscale
                 scale = gradscaler.get_scale() # To retrieve current gradscaler's scaling
-                grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=float("inf")) # Grad clipping
+                grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=150.0) # Grad clipping
                 gradscaler.step(optim_d) # Optim step
             else:
                 loss_disc.backward() # Loss backward
-                grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=float("inf")) # Grad clipping
+                grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=150.0) # Grad clipping
                 optim_d.step() # Optim step
 
-            # Run discriminator on generated output
+            # Free D-step computation graph before G step to reduce peak VRAM
+            loss_disc_val = loss_disc.detach()
+            del y_d_hat_r, y_d_hat_g, loss_disc
+
+            # ── Freeze D during G step ────────────────────────────────
+            # D's own update is done.  For the G step the discriminator
+            # only provides adversarial + feature-matching signal; its
+            # parameter gradients are never used.  Freezing prevents
+            # PyTorch from allocating ~D-params of gradient memory
+            # during G backward, and bypassing DDP avoids an unnecessary
+            # allreduce.  Quality is unaffected.
+            d_for_g = net_d.module if hasattr(net_d, 'module') else net_d
+            d_for_g.requires_grad_(False)
+
+            # Run discriminator on generated output (through raw module)
             with autocast(device_type="cuda", enabled=use_amp, dtype=train_dtype):
-                _, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+                _, y_d_hat_g, fmap_r, fmap_g = d_for_g(y, y_hat)
 
             # Compute generator losses:
             with autocast(device_type="cuda", enabled=False):
@@ -1167,17 +1332,17 @@ def training_loop(
                 elif spectral_loss == "Multi-Res STFT Loss":
                     loss_mel = fn_spectral_loss(y_hat.float(), y.float()) * c_stft
 
-                # Feature Matching loss
-                loss_fm = feature_loss(fmap_r, fmap_g)
-     
-                # Generator loss
+                # Feature Matching loss (normalized per sub-discriminator)
+                loss_fm = feature_loss(fmap_r, fmap_g) / n_disc
+
+                # Generator loss (normalized per sub-discriminator)
                 if adversarial_loss == "lsgan":
-                    loss_adv = generator_loss(y_d_hat_g)
+                    loss_adv = generator_loss(y_d_hat_g) / n_disc
                 elif adversarial_loss == "tprls":
                     y_d_hat_r_detached = [i.detach() for i in y_d_hat_r]
-                    loss_adv = generator_loss_v2(y_d_hat_g, y_d_hat_r_detached)
+                    loss_adv = generator_loss_v2(y_d_hat_g, y_d_hat_r_detached) / n_disc
                 elif adversarial_loss == "hinge":
-                    loss_adv = fn_hinge_loss(y_d_hat_g)
+                    loss_adv = fn_hinge_loss(y_d_hat_g) / n_disc
 
                 # Kl annealing handler
                 if use_kl_annealing:
@@ -1194,7 +1359,7 @@ def training_loop(
 
                 # Total generator loss + kl ( encoders )
                 if not training_loop.encoders_frozen: # For when encoders aren't frozen yet
-                    loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl # KL ( Kullback–Leibler divergence ) loss
+                    loss_kl = kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl # KL ( Kullback–Leibler divergence ) loss
                     if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
                         loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta + loss_sd
                     else:
@@ -1211,15 +1376,18 @@ def training_loop(
             if train_dtype == torch.float16:
                 gradscaler.scale(loss_gen_total).backward() # Scale and backward of the loss
                 gradscaler.unscale_(optim_g) # Unscale
-                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=float("inf")) # Grad clipping
+                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=grad_clip_g) # Grad clipping
                 gradscaler.step(optim_g) # Optim step
                 gradscaler.update() # Scaler update, to prepare the scaling for the next iteration
                 skip_lr_sched = (scale > gradscaler.get_scale())
             else:
                 loss_gen_total.backward() # Loss backward
-                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=float("inf")) # Grad clipping
+                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=grad_clip_g) # Grad clipping
                 optim_g.step() # Optim step
                 skip_lr_sched = False
+
+            # Unfreeze D for the next iteration's D step
+            d_for_g.requires_grad_(True)
 
             # Per step exp lr decay for generator
             if not skip_lr_sched: # We skip lr scheduler step if there were nans / infs due to gradscaler's scaling.
@@ -1229,7 +1397,7 @@ def training_loop(
 
             if not from_scratch:
                 # Loss accumulation for epoch-avg
-                epoch_loss_tensor[0].add_(loss_disc.detach())
+                epoch_loss_tensor[0].add_(loss_disc_val)
                 epoch_loss_tensor[1].add_(loss_adv.detach())
                 epoch_loss_tensor[2].add_(loss_gen_total.detach())
                 epoch_loss_tensor[3].add_(loss_fm.detach())
@@ -1252,7 +1420,7 @@ def training_loop(
                 writer.add_scalar("Grad_Norm/G_Skipped", 1, global_step)
 
             # Losses:
-            avg_rolling_cache["loss_disc"].append(loss_disc.detach())
+            avg_rolling_cache["loss_disc"].append(loss_disc_val)
             avg_rolling_cache["loss_adv"].append(loss_adv.detach()) 
             avg_rolling_cache["loss_gen_total"].append(loss_gen_total.detach())
             avg_rolling_cache["loss_fm"].append(loss_fm.detach())
@@ -1307,7 +1475,8 @@ def training_loop(
                 stopper, rank, global_step, epoch, architecture, 
                 [net_g, net_d], [optim_g, optim_d], config, 
                 experiment_dir, gradscaler, save_weight_models,
-                model_name, vocoder, vits2_mode, n_gpus
+                model_name, vocoder, vits2_mode, n_gpus,
+                v3_mode=v3_mode,
             ):
                 return True
 
@@ -1526,6 +1695,7 @@ def training_loop(
                         vocoder=vocoder,
                         architecture=architecture,
                         vits2_mode=vits2_mode,
+                        v3_mode=v3_mode,
                     )
         if done:
             # Clean-up process IDs from memory

@@ -25,6 +25,11 @@ arch_config_paths = {
         os.path.join("pcph_gan", "40000.json"),
         os.path.join("pcph_gan", "32000.json"),
     ],
+    "chouwa_gan": [
+        os.path.join("chouwa_gan", "48000.json"),
+        os.path.join("chouwa_gan", "40000.json"),
+        os.path.join("chouwa_gan", "32000.json"),
+    ],
 }
 
 def singleton(cls):
@@ -114,6 +119,18 @@ class Config:
                 print(f"File not found: {full_config_path}")
 
         for config_path in arch_config_paths["pcph_gan"]:
+            full_config_path = os.path.join("rvc", "configs", config_path)
+            try:
+                with open(full_config_path, "r") as f:
+                    config = json.load(f)
+                config["train"]["fp16_run"] = fp16_run_value
+                config["train"]["bf16_run"] = bf16_run_value
+                with open(full_config_path, "w") as f:
+                    json.dump(config, f, indent=4)
+            except FileNotFoundError:
+                print(f"File not found: {full_config_path}")
+
+        for config_path in arch_config_paths["chouwa_gan"]:
             full_config_path = os.path.join("rvc", "configs", config_path)
             try:
                 with open(full_config_path, "r") as f:

@@ -49,18 +49,53 @@ def replace_keys_in_dict(d, old_key_part, new_key_part):
     return updated_dict
 
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
+def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1, strict=True):
     assert os.path.isfile(checkpoint_path), f"Checkpoint not found: {checkpoint_path}"
     checkpoint_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
 
     model_state = model.module if hasattr(model, "module") else model
-    model_state.load_state_dict(checkpoint_dict["model"], strict=True)
+
+    # torch.compile wraps the model and prefixes all state_dict keys with
+    # "_orig_mod.".  Checkpoints saved while compiled cannot be loaded into
+    # an uncompiled model (compile runs AFTER checkpoint loading).
+    # Strip the prefix so the checkpoint is always portable.
+    saved_state = checkpoint_dict["model"]
+    if any(k.startswith("_orig_mod.") for k in saved_state):
+        saved_state = {k.replace("_orig_mod.", "", 1): v for k, v in saved_state.items()}
+
+    if strict:
+        missing, unexpected = model_state.load_state_dict(saved_state, strict=True)
+    else:
+        # strict=False: also skip shape mismatches (PyTorch strict=False only
+        # handles missing/extra keys, NOT shape conflicts which still raise).
+        current_state = model_state.state_dict()
+        filtered = {
+            k: v for k, v in saved_state.items()
+            if k in current_state and current_state[k].shape == v.shape
+        }
+        n_shape = sum(1 for k in saved_state if k in current_state and current_state[k].shape != saved_state[k].shape)
+        missing, unexpected = model_state.load_state_dict(filtered, strict=False)
+        if n_shape:
+            print(f"[CKPT] {n_shape} keys skipped (shape mismatch), {len(missing)} initialized fresh.")
+
+    if strict and (missing or unexpected):
+        raise RuntimeError(
+            f"Checkpoint mismatch (strict=True): {len(missing)} missing, {len(unexpected)} unexpected keys. "
+            f"Missing: {missing[:5]}{'...' if len(missing)>5 else ''}"
+        )
+    elif missing or unexpected:
+        print(f"[CKPT] Partial load: {len(missing)} new keys (init fresh), {len(unexpected)} old keys skipped.")
 
     if optimizer and load_opt == 1:
         opt_state = checkpoint_dict.get("optimizer")
         if opt_state:
-            optimizer.load_state_dict(opt_state)
-            print("Loaded optimizer state.")
+            try:
+                optimizer.load_state_dict(opt_state)
+                print("Loaded optimizer state.")
+            except (ValueError, KeyError):
+                # Param count changed (e.g. new sub-discriminator added);
+                # optimizer restarts with fresh momentum / variance.
+                print("[WARN] Optimizer state mismatch — reinitialising optimizer.")
 
     print(f"Loaded checkpoint '{checkpoint_path}' (iteration {checkpoint_dict['iteration']})")
     return (
@@ -73,6 +108,11 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
 
 def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path, gradscaler=None):
     state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+
+    # Strip torch.compile's "_orig_mod." prefix so checkpoints are always
+    # portable (loadable whether or not torch.compile is enabled on resume).
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
 
     checkpoint_data = {
         "model": state_dict,
@@ -264,6 +304,10 @@ def flush_writer_grad(writer, rank, global_step):
 
 
 def block_tensorboard_flush_on_exit(writer):
+    # Only handle SIGTERM (OS-level termination) here.
+    # SIGINT is handled exclusively by EarlyStopSignalHandler so that early-stop
+    # saves checkpoints before exiting.  Overriding SIGINT here with os._exit(1)
+    # would kill the worker immediately and bypass the checkpoint save.
     def handler(signum, frame):
         print("[Warning] Training interrupted. Skipping flush to avoid partial logs.")
         try:
@@ -272,7 +316,6 @@ def block_tensorboard_flush_on_exit(writer):
             pass
         os._exit(1)
 
-    signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGTERM, handler)
 
 
@@ -489,7 +532,8 @@ def early_stopper(
     model_name,
     vocoder,
     vits2_mode,
-    n_gpus
+    n_gpus,
+    v3_mode=False,
 ):
     if stopper is not None and stopper.stop_triggered:
         net_g, net_d = nets
@@ -522,7 +566,8 @@ def early_stopper(
                     hps=config, 
                     vocoder=vocoder, 
                     architecture=architecture, 
-                    vits2_mode=vits2_mode
+                    vits2_mode=vits2_mode,
+                    v3_mode=v3_mode,
                 )
                 print(f"[TRAINING] All finished .. You can ignore anything past this msg.")
         if n_gpus > 1:

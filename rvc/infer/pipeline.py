@@ -363,9 +363,39 @@ class Pipeline:
 
     def _retrieve_speaker_embeddings(self, feats, index, big_npy, index_rate):
         npy = feats[0].cpu().numpy()
-        score, ix = index.search(npy, k=8)
-        weight = np.square(1 / score)
-        weight /= weight.sum(axis=1, keepdims=True)
+
+        # Normalize query for cosine search in both index types.
+        npy_norm = npy / (np.linalg.norm(npy, axis=1, keepdims=True) + 1e-8)
+
+        # Detect whether this is a cosine/IP index (new) or legacy L2 index (old).
+        is_ip_index = (
+            hasattr(index, "metric_type")
+            and index.metric_type == faiss.METRIC_INNER_PRODUCT
+        )
+
+        score, ix = index.search(npy_norm, k=8)
+
+        if is_ip_index:
+            # IP index on unit vectors: score == cosine similarity directly (range 0-1).
+            cosine_sim = np.clip(score, 0.0, 1.0)
+        else:
+            # Legacy L2 index: convert L2² on normalized vectors to cosine similarity.
+            # cosine = 1 - L2²/2  (valid since both query and DB are unit-normed).
+            cosine_sim = np.clip(1.0 - score / 2.0, 0.0, 1.0)
+
+        # Adaptive threshold: discard neighbors whose cosine similarity is below
+        # 60% of the best neighbor's similarity for that frame. This prevents
+        # low-quality / semantically distant retrievals from polluting the average.
+        best_sim = cosine_sim[:, :1]  # [T, 1]
+        valid_mask = cosine_sim >= (best_sim * 0.60)
+        cosine_sim = np.where(valid_mask, cosine_sim, 0.0)
+
+        # Softmax-temperature weighting (τ=0.1) over cosine similarities gives a
+        # sharper, more confident assignment than inverse-square distance weighting.
+        tau = 0.1
+        exp_sim = np.exp(cosine_sim / tau) * valid_mask
+        weight = exp_sim / (exp_sim.sum(axis=1, keepdims=True) + 1e-8)
+
         npy = np.sum(big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
         feats = (
             torch.from_numpy(npy).unsqueeze(0).to(self.device) * index_rate

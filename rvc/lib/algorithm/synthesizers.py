@@ -7,6 +7,7 @@ from rvc.lib.algorithm.normalizing_flows import ResidualCouplingBlock, ResidualC
 from rvc.lib.algorithm.encoders import PosteriorEncoder # Posterior encoder, shared between Vits1 and Vits2
 from rvc.lib.algorithm.encoders_vits2 import TextEncoder_VITS2
 from rvc.lib.algorithm.encoders import TextEncoder as TextEncoder_VITS1
+from rvc.lib.algorithm.modules_v3 import PosteriorEncoder_v3, ResidualCouplingBlock_v3
 
 
 debug_shapes = False
@@ -39,6 +40,7 @@ class Synthesizer(torch.nn.Module):
         checkpointing: bool = False,
         randomized: bool = True,
         vits2_mode: bool = False,
+        v3_mode: bool = False,
         gen_istft_n_fft: int = 120,
         gen_istft_hop_size: int = 30,
         **kwargs,
@@ -49,6 +51,7 @@ class Synthesizer(torch.nn.Module):
         self.vocoder = vocoder
         self.randomized = randomized
         self.vits2_mode = vits2_mode
+        self.v3_mode = v3_mode
 
         if vits2_mode:
             self.enc_p = TextEncoder_VITS2(
@@ -118,6 +121,20 @@ class Synthesizer(torch.nn.Module):
                     use_inplace=True,
                 )
                 print("    ██████  Vocoder: PCPH-GAN")
+            elif vocoder == "ChouwaGAN":
+                from rvc.lib.algorithm.generators import ChouwaGANGenerator
+                self.dec = ChouwaGANGenerator(
+                    inter_channels,
+                    resblock_kernel_sizes,
+                    resblock_dilation_sizes,
+                    upsample_rates,
+                    upsample_initial_channel,
+                    upsample_kernel_sizes,
+                    gin_channels=gin_channels,
+                    sr=sr,
+                    checkpointing=checkpointing,
+                )
+                print("    ██████  Vocoder: ChouwaGAN-PCPH")
             else:  # vocoder == "HiFi-GAN"
                 from rvc.lib.algorithm.generators import HiFiGANNSFGenerator
                 self.dec = HiFiGANNSFGenerator(
@@ -148,33 +165,58 @@ class Synthesizer(torch.nn.Module):
                     gin_channels=gin_channels,
                     checkpointing=checkpointing,
                 )
-        self.enc_q = PosteriorEncoder(
-            spec_channels,
-            inter_channels,
-            hidden_channels,
-            5,
-            1,
-            16,
-            gin_channels=gin_channels,
-        )
-        if vits2_mode:
-            self.flow = ResidualCouplingTransformersBlock(
+        if v3_mode:
+            # v3: ConvNeXt-based posterior encoder + flow
+            self.enc_q = PosteriorEncoder_v3(
+                spec_channels,
                 inter_channels,
                 hidden_channels,
-                5,
-                1,
-                3,
+                kernel_size=7,
+                n_layers=8,
                 gin_channels=gin_channels,
+                mlp_ratio=4.0,
+                checkpointing=checkpointing,
             )
+            self.flow = ResidualCouplingBlock_v3(
+                inter_channels,
+                hidden_channels,
+                kernel_size=7,
+                n_layers=4,
+                n_flows=4,
+                gin_channels=gin_channels,
+                cam_kernel_size=31,
+                mlp_ratio=4.0,
+                checkpointing=checkpointing,
+            )
+            print("    ██████  v3 mode: ConvNeXt Posterior Encoder + ConvNeXt+CAM Flow")
         else:
-            self.flow = ResidualCouplingBlock(
+            self.enc_q = PosteriorEncoder(
+                spec_channels,
                 inter_channels,
                 hidden_channels,
                 5,
                 1,
-                3,
+                16,
                 gin_channels=gin_channels,
             )
+            if vits2_mode:
+                self.flow = ResidualCouplingTransformersBlock(
+                    inter_channels,
+                    hidden_channels,
+                    5,
+                    1,
+                    3,
+                    gin_channels=gin_channels,
+                )
+            else:
+                self.flow = ResidualCouplingBlock(
+                    inter_channels,
+                    hidden_channels,
+                    5,
+                    1,
+                    3,
+                    gin_channels=gin_channels,
+                )
 
         self.emb_g = torch.nn.Embedding(spk_embed_dim, gin_channels)
 
