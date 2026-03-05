@@ -947,6 +947,19 @@ def run(
         rank
     )
 
+    # Number of sub-discriminators — used to normalize losses for ChouwaGAN
+    # (prevents gradient scale explosion when more sub-discs are active).
+    # Other vocoders use n_disc=1 (no change in behaviour).
+    if vocoder == "ChouwaGAN":
+        _actual_d = net_d.module if hasattr(net_d, 'module') else net_d
+        n_disc = len(_actual_d.discriminators) if hasattr(_actual_d, 'discriminators') else 9
+    else:
+        n_disc = 1
+
+    # Gradient clip ceiling for G — raised for ChouwaGAN so the adversarial
+    # signal isn't overwhelmed after per-disc normalization.
+    grad_clip_g = 500.0 if vocoder == "ChouwaGAN" else 200.0
+
     # Tensorboard handling
     if rank == 0:
         writer_eval = SummaryWriter(
@@ -1063,7 +1076,9 @@ def run(
                 fn_hinge_loss,
                 hann_window,
                 stopper=stopper,
-                trajectory_tracker=trajectory_tracker
+                trajectory_tracker=trajectory_tracker,
+                n_disc=n_disc,
+                grad_clip_g=grad_clip_g,
             )
 
             if use_warmup and epoch <= warmup_duration:
@@ -1122,7 +1137,9 @@ def training_loop(
     fn_hinge_loss=None,
     hann_window=None,
     stopper=None,
-    trajectory_tracker=None
+    trajectory_tracker=None,
+    n_disc=1,
+    grad_clip_g=200.0,
 ):
     """
     Trains and evaluates the model for one epoch.
@@ -1267,6 +1284,9 @@ def training_loop(
                 elif adversarial_loss == "hinge":
                     loss_fake, loss_real = fn_hinge_loss(y_d_hat_g, y_d_hat_r)
                     loss_disc = loss_fake + loss_real
+                # Normalize by sub-discriminator count so gradient scale
+                # stays independent of how many discriminators are composed.
+                loss_disc = loss_disc / n_disc
 
             # Discriminator backward and update:
             optim_d.zero_grad(set_to_none=True)
@@ -1312,17 +1332,17 @@ def training_loop(
                 elif spectral_loss == "Multi-Res STFT Loss":
                     loss_mel = fn_spectral_loss(y_hat.float(), y.float()) * c_stft
 
-                # Feature Matching loss
-                loss_fm = feature_loss(fmap_r, fmap_g)
-     
-                # Generator loss
+                # Feature Matching loss (normalized per sub-discriminator)
+                loss_fm = feature_loss(fmap_r, fmap_g) / n_disc
+
+                # Generator loss (normalized per sub-discriminator)
                 if adversarial_loss == "lsgan":
-                    loss_adv = generator_loss(y_d_hat_g)
+                    loss_adv = generator_loss(y_d_hat_g) / n_disc
                 elif adversarial_loss == "tprls":
                     y_d_hat_r_detached = [i.detach() for i in y_d_hat_r]
-                    loss_adv = generator_loss_v2(y_d_hat_g, y_d_hat_r_detached)
+                    loss_adv = generator_loss_v2(y_d_hat_g, y_d_hat_r_detached) / n_disc
                 elif adversarial_loss == "hinge":
-                    loss_adv = fn_hinge_loss(y_d_hat_g)
+                    loss_adv = fn_hinge_loss(y_d_hat_g) / n_disc
 
                 # Kl annealing handler
                 if use_kl_annealing:
@@ -1356,13 +1376,13 @@ def training_loop(
             if train_dtype == torch.float16:
                 gradscaler.scale(loss_gen_total).backward() # Scale and backward of the loss
                 gradscaler.unscale_(optim_g) # Unscale
-                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=200.0) # Grad clipping
+                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=grad_clip_g) # Grad clipping
                 gradscaler.step(optim_g) # Optim step
                 gradscaler.update() # Scaler update, to prepare the scaling for the next iteration
                 skip_lr_sched = (scale > gradscaler.get_scale())
             else:
                 loss_gen_total.backward() # Loss backward
-                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=200.0) # Grad clipping
+                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=grad_clip_g) # Grad clipping
                 optim_g.step() # Optim step
                 skip_lr_sched = False
 
