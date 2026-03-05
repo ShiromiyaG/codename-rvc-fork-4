@@ -76,6 +76,7 @@ def generator_loss(disc_outputs):
 def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
     """
     Compute the Kullback-Leibler divergence loss.
+    Always computed in FP32 for numerical stability (same reason as kl_loss_clamped).
 
     Args:
         z_p (torch.Tensor): Sampled latent variable transformed by the flow [b, h, t_t].
@@ -84,6 +85,12 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
         logs_p (torch.Tensor): Log variance of the prior distribution p [b, h, t_t].
         z_mask (torch.Tensor): Mask for the latent variables [b, h, t_t].
     """
+    z_p    = z_p.float()
+    logs_q = logs_q.float()
+    m_p    = m_p.float()
+    logs_p = logs_p.float()
+    z_mask = z_mask.float()
+
     kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
     kl = (kl * z_mask).sum()
     loss = kl / z_mask.sum()
@@ -94,6 +101,8 @@ def kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask):
     """
     Compute the Kullback-Leibler divergence loss.
     Variant with non-negativity clamp.
+    Always computed in FP32: the exp(-2*logs_p) term is sensitive to BF16/FP16
+    quantization (~3 decimal digits), which can cause the KL to go negative.
 
     Args:
         z_p (torch.Tensor): Sampled latent variable transformed by the flow [b, h, t_t].
@@ -102,6 +111,12 @@ def kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask):
         logs_p (torch.Tensor): Log variance of the prior distribution p [b, h, t_t].
         z_mask (torch.Tensor): Mask for the latent variables [b, h, t_t].
     """
+    z_p    = z_p.float()
+    logs_q = logs_q.float()
+    m_p    = m_p.float()
+    logs_p = logs_p.float()
+    z_mask = z_mask.float()
+
     kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
     kl = (kl * z_mask).sum()
     loss = kl / z_mask.sum()
