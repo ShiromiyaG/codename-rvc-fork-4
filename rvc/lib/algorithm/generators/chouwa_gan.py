@@ -50,6 +50,27 @@ class DropPath(nn.Module):
         return drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
 
 
+class GlobalResponseNorm(nn.Module):
+    """Global Response Normalization (ConvNeXt V2) in channels-last format (B, T, C).
+
+    Normalises each channel's response relative to the global aggregate,
+    encouraging feature diversity. Initialised as identity (gamma=beta=0)
+    so it is safe to add to any pretrained model and has no effect until
+    trained.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1, 1, channels))
+        self.beta  = nn.Parameter(torch.zeros(1, 1, channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C) from ConvNeXtBlock's permuted representation
+        gx = torch.norm(x, p=2, dim=1, keepdim=True)          # (B, 1, C)
+        nx = gx / (gx.mean(dim=2, keepdim=True) + 1e-6)       # (B, 1, C)
+        return self.gamma * (x * nx) + self.beta + x
+
+
 class ConvNeXtLayerNorm(nn.Module):
     """LayerNorm supporting channels_first and channels_last data formats."""
 
@@ -95,6 +116,7 @@ class ConvNeXtBlock(nn.Module):
         self.norm = ConvNeXtLayerNorm(dim, eps=1e-6)
         self.pwconv1 = nn.Linear(dim, int(mlp_ratio * dim))
         self.act = nn.GELU()
+        self.grn = GlobalResponseNorm(int(mlp_ratio * dim))  # ConvNeXt V2 GRN
         self.pwconv2 = nn.Linear(int(mlp_ratio * dim), dim)
         self.gamma = (
             nn.Parameter(layer_scale_init_value * torch.ones(dim), requires_grad=True)
@@ -109,6 +131,7 @@ class ConvNeXtBlock(nn.Module):
         x = self.norm(x)
         x = self.pwconv1(x)
         x = self.act(x)
+        x = self.grn(x)           # GRN: feature diversity
         x = self.pwconv2(x)
         if self.gamma is not None:
             x = self.gamma * x
@@ -347,7 +370,14 @@ class HiFiGANNSFHead(nn.Module):
             # correct low-pass direction (prevents early convergence to spurious
             # frequencies such as sr/4 = 8 kHz at 32 kHz training).
             aa_kernel = 5  # 5-tap gives ~40 dB rolloff vs ~20 dB for 3-tap
-            aa_cutoff = 0.5 / u   # ideal LP cutoff for this upsample stage
+            
+            # For small upsample rates (2×), the aliased images are well-separated
+            # and a gentler cutoff preserves HF content (15-16 kHz).
+            if u <= 2:
+                aa_cutoff = 0.45 / u  # For u=2: 0.225 → cuts at ~21.6 kHz @ 48 kHz
+            else:
+                aa_cutoff = 0.5 / u   # Higher rates need tighter filtering
+                
             aa_conv = _make_sinc_lowpass(channels[i], aa_kernel, aa_cutoff)
             self.anti_alias_convs.append(weight_norm(aa_conv))
 
@@ -362,9 +392,12 @@ class HiFiGANNSFHead(nn.Module):
         # Residual blocks with SnakeBeta activations (BigVGAN-style).
         # ResBlock_SnakeBeta uses per-layer learnable periodic activations
         # instead of LeakyReLU, capturing harmonic structure much better.
+        # post_act=False: removes the optional 3rd BigVGAN-v2 post-residual
+        # SnakeBeta per dilation step (36 extra ops across 12 resblocks × 3
+        # dilations).  The core 2-activation-per-step structure is preserved.
         from rvc.lib.algorithm.residuals import ResBlock_SnakeBeta
         self.resblocks = nn.ModuleList([
-            ResBlock_SnakeBeta(channels[i], k, d)
+            ResBlock_SnakeBeta(channels[i], k, d, post_act=False)
             for i in range(len(self.ups))
             for k, d in zip(resblock_kernel_sizes, resblock_dilation_sizes)
         ])
@@ -471,8 +504,8 @@ class ChouwaGANGenerator(nn.Module):
         sr: int,
         checkpointing: bool = False,
         # ConvNeXt backbone config
-        backbone_depths: list = [3, 3, 9, 3],
-        backbone_dims: list = [128, 256, 384, 512],
+        backbone_depths: list = [3, 3, 4, 3],
+        backbone_dims: list = [96, 192, 256, 320],
         backbone_drop_path_rate: float = 0.2,
         backbone_kernel_size: int = 7,
     ):

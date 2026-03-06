@@ -120,6 +120,7 @@ class ResBlock_SnakeBeta(torch.nn.Module):
         channels: int,
         kernel_size: int = 3,
         dilations: Tuple[int] = (1, 3, 5),
+        post_act: bool = False,
     ):
         super().__init__()
         self.convs1 = self._create_convs(channels, kernel_size, dilations)
@@ -134,6 +135,15 @@ class ResBlock_SnakeBeta(torch.nn.Module):
             SnakeBeta(channels, alpha_trainable=True, alpha_logscale=True)
             for _ in dilations
         ])
+        # Post-residual activation (BigVGAN v2 style) — adds a SnakeBeta
+        # activation after each dilation-step residual sum to inject
+        # non-linearity into the shortcut path.
+        self.post_act = post_act
+        if post_act:
+            self.snake_acts_post = torch.nn.ModuleList([
+                SnakeBeta(channels, alpha_trainable=True, alpha_logscale=True)
+                for _ in dilations
+            ])
 
     @staticmethod
     def _create_convs(channels: int, kernel_size: int, dilations: Tuple[int]):
@@ -143,7 +153,10 @@ class ResBlock_SnakeBeta(torch.nn.Module):
         return layers
 
     def forward(self, x: torch.Tensor, x_mask: torch.Tensor = None):
-        for conv1, conv2, act1, act2 in zip(self.convs1, self.convs2, self.snake_acts1, self.snake_acts2):
+        post_iter = self.snake_acts_post if self.post_act else [None] * len(self.convs1)
+        for conv1, conv2, act1, act2, act_post in zip(
+            self.convs1, self.convs2, self.snake_acts1, self.snake_acts2, post_iter
+        ):
             x_residual = x
 
             xt = act1(x)  # SnakeBeta activation 1
@@ -155,6 +168,8 @@ class ResBlock_SnakeBeta(torch.nn.Module):
             xt = conv2(xt)
 
             x = xt + x_residual
+            if act_post is not None:
+                x = act_post(x)  # post-residual activation (BigVGAN v2)
             x = apply_mask(x, x_mask)
 
         return x

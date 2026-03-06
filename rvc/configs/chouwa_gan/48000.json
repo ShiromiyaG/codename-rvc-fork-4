@@ -62,7 +62,7 @@
             2,
             2
         ],
-        "upsample_initial_channel": 512,
+        "upsample_initial_channel": 384,
         "upsample_kernel_sizes": [
             24,
             20,
@@ -74,19 +74,38 @@
         "spk_embed_dim": 109
     },
     "mrd": {
-        "periods": [2, 3, 5, 7, 11],
-        "fast_mpd_init_channel": 8,
-        "fast_mpd_strides": [4, 4, 4],
-        "fast_mpd_kernel_size": 11,
-        "cqtd_filters": 32,
-        "cqtd_max_filters": 1024,
-        "cqtd_filters_scale": 1,
-        "cqtd_dilations": [1, 2, 4],
-        "cqtd_in_channels": 1,
-        "cqtd_out_channels": 1,
-        "cqtd_normalize_volume": false,
-        "cqtd_hop_lengths": [512, 256, 256],
-        "cqtd_n_octaves": [9, 9, 9],
-        "cqtd_bins_per_octaves": [24, 36, 48]
+        "stft_configs": [
+            {
+                "n_fft": 2048,
+                "hop_length": 512,
+                "win_length": 2048
+            },
+            {
+                "n_fft": 1024,
+                "hop_length": 256,
+                "win_length": 1024
+            },
+            {
+                "n_fft": 512,
+                "hop_length": 128,
+                "win_length": 512
+            }
+        ],
+        "stft_channels": 32,
+        "stft_n_layers": 3,
+        "mrd_resolutions": [
+            [
+                1024,
+                120,
+                600
+            ],
+            [
+                2048,
+                240,
+                1200
+            ]
+        ],
+        "mrd_channels": 32,
+        "hf_disc_channels": 32
     }
 }

@@ -37,19 +37,20 @@ def feature_loss(fmap_r, fmap_g):
     )
 
 
-def discriminator_loss(disc_real_outputs, disc_generated_outputs):
+def discriminator_loss(disc_real_outputs, disc_generated_outputs, real_label: float = 1.0):
     """
     Compute the discriminator loss for real and generated outputs.
 
     Args:
         disc_real_outputs (list of torch.Tensor): List of discriminator outputs for real samples.
         disc_generated_outputs (list of torch.Tensor): List of discriminator outputs for generated samples.
+        real_label (float): Target value for real samples. Use <1.0 for label smoothing (e.g. 0.9).
     """
     loss = 0
     # r_losses = []
     # g_losses = []
     for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
-        r_loss = torch.mean((1 - dr.float()) ** 2)
+        r_loss = torch.mean((real_label - dr.float()) ** 2)
         g_loss = torch.mean(dg.float() ** 2)
 
         # r_losses.append(r_loss.item())
@@ -184,7 +185,7 @@ def generator_TPRLS_loss(disc_real_outputs, disc_generated_outputs):
 
     return loss
 
-def discriminator_loss_v2(disc_real_outputs, disc_generated_outputs):
+def discriminator_loss_v2(disc_real_outputs, disc_generated_outputs, real_label: float = 1.0):
     """
     Compute the discriminator loss for real and generated outputs.
     """
@@ -192,7 +193,7 @@ def discriminator_loss_v2(disc_real_outputs, disc_generated_outputs):
 
     # LSGAN Loss
     for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
-        r_loss = torch.mean((1 - dr.float()) ** 2)
+        r_loss = torch.mean((real_label - dr.float()) ** 2)
         g_loss = torch.mean(dg.float() ** 2)
         loss += r_loss + g_loss
 

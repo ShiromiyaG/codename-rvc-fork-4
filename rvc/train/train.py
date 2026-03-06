@@ -13,6 +13,9 @@ import sys
 pid_data = {"process_pids": []}
 os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
 os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
+# Reduce CUDA allocator fragmentation — critical on small VRAM GPUs (<= 8 GB)
+# when R1 penalty or other ops cause irregular allocation patterns.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 # Suppress _POSIX_C_SOURCE redefinition noise emitted by GCC when Triton
 # JIT-compiles its C stubs. Conda's pyconfig.h and the system's features.h
 # both define the macro to different values; -w silences all GCC warnings
@@ -208,7 +211,7 @@ use_trajectory = False
 #       'max-autotune-no-cudagraphs' runs Triton autotuning for best kernel
 #       tile sizes without requiring fixed shapes.  First step is slow (~2-5
 #       min while autotuning), steady-state is faster than 'default'.
-use_compile = False
+use_compile = True
 compile_mode = "max-autotune-no-cudagraphs"  # 'default' | 'max-autotune-no-cudagraphs'
 
 use_sid_swap = False
@@ -230,6 +233,7 @@ class EarlyStopSignalHandler:
     def _handler(self, signum, frame):
         self.stop_triggered = True
         print(f"\n[TRAINING] Early Stopping signal received! Finishing current step and saving...")
+
 
 
 def eval_infer(net_g, reference):
@@ -366,11 +370,11 @@ def get_d_model(config, vocoder, use_checkpointing):
             **mrd_config
         )
     elif vocoder == "ChouwaGAN":
-        from rvc.lib.algorithm.discriminators.multi import FastMPD_MSD_CQT_Combined
-        # FastMPD + MSD + MS-SB-CQT (optimized: ~40-50% lighter, better harmonic accuracy)
-        chouwa_cfg = dict(config.mrd) if hasattr(config, "mrd") else default_mrd
+        from rvc.lib.algorithm.discriminators.multi import MSSTFT_MRD_Combined
+        # MS-STFT + MRD (frequency-domain only, lightweight, balanced)
+        chouwa_cfg = dict(config.mrd) if hasattr(config, "mrd") else {}
         sample_rate = config.data.sample_rate if hasattr(config.data, "sample_rate") else 40000
-        return FastMPD_MSD_CQT_Combined(
+        return MSSTFT_MRD_Combined(
             config.model.use_spectral_norm,
             use_checkpointing=use_checkpointing,
             sample_rate=sample_rate,
@@ -441,6 +445,13 @@ def get_optimizers(
         decoupled_weight_decay=True,
         foreach=True,
     )
+
+    d_lr_factor = 1.0  # ChouwaGAN uses TTUR: equal LR, R1 regulates D
+    if d_lr_factor != 1.0:
+        for d_args in (common_args_d, adamwspd_args_d, radam_args_d):
+            d_args["lr"] *= d_lr_factor
+        print(f"    ██████  D LR factor: {d_lr_factor:.2f}x  (lr_d = {common_args_d['lr']:.2e}  lr_g = {common_args_g['lr']:.2e})")
+
     # For exotic optimizers
     ranger_args = dict(
         num_epochs=total_epoch_count,
@@ -510,7 +521,7 @@ def get_optimizers(
         raise ValueError(f"Unknown optimizer choice: {optimizer_choice}")
     return optim_g, optim_d
 
-def setup_models_for_training(net_g, net_d, device, device_id, n_gpus):
+def setup_models_for_training(net_g, net_d, device, device_id, n_gpus, train_dtype=None):
     net_g = net_g.to(device_id) if device.type == "cuda" else net_g.to(device)
     net_d = net_d.to(device_id) if device.type == "cuda" else net_d.to(device)
 
@@ -546,7 +557,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             # Init the optimizers
             optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader)
             # Move the models to an appropriate device ( And optionally wrap with DDP for multi-gpu )
-            net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus)
+            net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus, train_dtype)
 
             # Load the model and optim states
             _, _, _, epoch_str, gradscaler_dict = load_checkpoint(g_checkpoint_path, net_g, optim_g)
@@ -613,7 +624,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             net_d.load_state_dict(state_dict, strict=True)
 
         # Load the models and optionally wrap with DDP
-        net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus)
+        net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus, train_dtype)
 
         # Init the optimizers
         optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader)
@@ -831,6 +842,14 @@ def run(
     """
     global global_step, warmup_completed, optimizer_choice, from_scratch
 
+    # Set expandable CUDA memory segments before the first cudaMalloc.
+    # Must be here (in the spawned subprocess, before any CUDA op) — the
+    # module-level os.environ.setdefault() fires before CUDA is initialized,
+    # but mp.Process(spawn) may already have allocated CUDA state by the time
+    # user code runs.  The programmatic API call after dist init is the
+    # authoritative fallback.
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
     stopper = EarlyStopSignalHandler()
 
     if 'warmup_completed' not in globals():
@@ -862,6 +881,15 @@ def run(
         device_id,
         config
     )
+
+    # Programmatic API call to ensure expandable_segments is active after
+    # dist.init_process_group (which performs the first real cudaMalloc).
+    # The env-var set above is a hint; this call is authoritative.
+    if device.type == "cuda":
+        try:
+            torch.cuda.memory.set_allocator_settings("expandable_segments:True")
+        except Exception:
+            pass  # PyTorch < 2.2 — env-var fallback still applies
 
     # Dataloading and loaders preparation
     train_loader, val_loader = prepare_dataloaders(
@@ -927,9 +955,22 @@ def run(
     # Other vocoders use n_disc=1 (no change in behaviour).
     if vocoder == "ChouwaGAN":
         _actual_d = net_d.module if hasattr(net_d, 'module') else net_d
-        n_disc = len(_actual_d.discriminators) if hasattr(_actual_d, 'discriminators') else 9
+        n_disc = len(_actual_d.discriminators) if hasattr(_actual_d, 'discriminators') else 5
     else:
         n_disc = 1
+
+    # ChouwaGAN-exclusive: EMA + Adaptive Balancer + HF Recon Loss
+    g_ema = None
+    chouwa_balancer = None
+    hf_recon_loss = None
+    if vocoder == "ChouwaGAN":
+        from rvc.train.chouwa_gan_training import GeneratorEMA, AdaptiveBalancer, HighFrequencyReconstructionLoss
+        g_ema = GeneratorEMA(net_g, decay=0.999, device=device)
+        chouwa_balancer = AdaptiveBalancer(ema_decay=0.99, skip_threshold=5.0, resume_threshold=2.0)
+        hf_recon_loss = HighFrequencyReconstructionLoss(sr=config.data.sample_rate).to(device)
+        print("    ██████  ChouwaGAN: Generator EMA initialized (decay=0.999)")
+        print("    ██████  ChouwaGAN: Adaptive D/G balancer active")
+        print("    ██████  ChouwaGAN: HF Reconstruction Loss active")
 
     # Gradient clip ceiling for G — raised for ChouwaGAN so the adversarial
     # signal isn't overwhelmed after per-disc normalization.
@@ -1054,6 +1095,9 @@ def run(
                 trajectory_tracker=trajectory_tracker,
                 n_disc=n_disc,
                 grad_clip_g=grad_clip_g,
+                g_ema=g_ema,
+                chouwa_balancer=chouwa_balancer,
+                hf_recon_loss=hf_recon_loss,
             )
 
             if use_warmup and epoch <= warmup_duration:
@@ -1115,6 +1159,9 @@ def training_loop(
     trajectory_tracker=None,
     n_disc=1,
     grad_clip_g=200.0,
+    g_ema=None,
+    chouwa_balancer=None,
+    hf_recon_loss=None,
 ):
     """
     Trains and evaluates the model for one epoch.
@@ -1165,7 +1212,10 @@ def training_loop(
 
     if not from_scratch:
         # Tensors init for averaged losses:
-        if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
+        # Tensors init for averaged losses:
+        if vocoder == "ChouwaGAN":
+            tensor_count = 7
+        elif vocoder in ["RingFormer_v1", "RingFormer_v2"]:
             tensor_count = 7
         else:
             tensor_count = 6
@@ -1182,8 +1232,27 @@ def training_loop(
         "loss_mel": deque(maxlen=rolling_loss_steps),
         "loss_kl": deque(maxlen=rolling_loss_steps),
     }
-    if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
+    if vocoder == "ChouwaGAN":
+        avg_rolling_cache["loss_hf"] = deque(maxlen=rolling_loss_steps)
+    elif vocoder in ["RingFormer_v1", "RingFormer_v2"]:
         avg_rolling_cache["loss_sd"] = deque(maxlen=rolling_loss_steps)
+
+    # Constants computed once per epoch (not per batch)
+    if vocoder == "ChouwaGAN":
+        from rvc.train.chouwa_gan_training import get_chouwa_config
+        _cc = get_chouwa_config(from_scratch)
+        grad_clip_d, c_fm = _cc["grad_clip_d"], _cc["c_fm"]
+        c_hf = _cc["c_hf"]
+        r1_gamma, r1_interval = _cc["r1_gamma"], _cc["r1_interval"]
+        d_real_label = _cc["d_real_label"]
+        grad_accum_steps = _cc["grad_accum_steps"]
+    else:
+        grad_clip_d = 150.0
+        c_fm = 1.0
+        r1_gamma = 0.0
+        r1_interval = 16
+        d_real_label = 1.0
+        grad_accum_steps = 1
 
     use_amp = (config.train.bf16_run or config.train.fp16_run) and device.type == "cuda"
 
@@ -1221,6 +1290,10 @@ def training_loop(
                 sid,
             ) = info
 
+            # Keep the full-length waveform before slicing so extra G steps
+            # can re-slice with a fresh ids_slice from a new G forward.
+            y_full = y
+
             # Generator forward pass:
             with autocast(device_type="cuda", enabled=use_amp, dtype=train_dtype):
                 model_output = net_g(phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid)
@@ -1246,120 +1319,186 @@ def training_loop(
                 y_hat_stft = torch.stft(reshaped_y_hat, n_fft=config.model.gen_istft_n_fft, hop_length=config.model.gen_istft_hop_size, win_length=config.model.gen_istft_n_fft, window=hann_window, return_complex=True)
                 target_magnitude = torch.abs(y_stft)  # shape: [B, F, T]
 
-            # Discriminator forward pass (no fmaps — saves memory):
+            # ── Discriminator step ──────────────────────────────────────────
+            # No fmaps needed here — saves memory.
             with autocast(device_type="cuda", enabled=use_amp, dtype=train_dtype):
                 y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach(), compute_fmaps=False)
 
             with autocast(device_type="cuda", enabled=False):
                 # Compute discriminator loss:
-                if adversarial_loss == "lsgan":
-                    loss_disc = discriminator_loss(y_d_hat_r, y_d_hat_g)
+                d_real_mean, d_fake_mean = 0.0, 0.0
+                if adversarial_loss == "softplus":
+                    from rvc.train.chouwa_gan_training import softplus_d_loss
+                    loss_disc, d_real_mean, d_fake_mean = softplus_d_loss(y_d_hat_r, y_d_hat_g)
+                elif adversarial_loss == "lsgan":
+                    loss_disc = discriminator_loss(y_d_hat_r, y_d_hat_g, real_label=d_real_label)
                 elif adversarial_loss == "tprls":
-                    loss_disc = discriminator_loss_v2(y_d_hat_r, y_d_hat_g)
+                    loss_disc = discriminator_loss_v2(y_d_hat_r, y_d_hat_g, real_label=d_real_label)
                 elif adversarial_loss == "hinge":
                     loss_fake, loss_real = fn_hinge_loss(y_d_hat_g, y_d_hat_r)
                     loss_disc = loss_fake + loss_real
-                # Normalize by sub-discriminator count so gradient scale
-                # stays independent of how many discriminators are composed.
+                # Normalize by sub-discriminator count
                 loss_disc = loss_disc / n_disc
 
-            # Discriminator backward and update:
-            optim_d.zero_grad(set_to_none=True)
-            if train_dtype == torch.float16:
-                gradscaler.scale(loss_disc).backward() # Scale and backward of the loss
-                gradscaler.unscale_(optim_d) # Unscale
-                scale = gradscaler.get_scale() # To retrieve current gradscaler's scaling
-                grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=150.0) # Grad clipping
-                gradscaler.step(optim_d) # Optim step
-            else:
-                loss_disc.backward() # Loss backward
-                grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=150.0) # Grad clipping
-                optim_d.step() # Optim step
+                loss_disc_val = loss_disc.detach()
 
-            # Free D-step computation graph before G step to reduce peak VRAM
-            loss_disc_val = loss_disc.detach()
+                # Update adaptive balancer with D scores
+                if chouwa_balancer is not None:
+                    chouwa_balancer.update(d_real_mean, d_fake_mean, global_step)
+
+                # R1 lazy gradient penalty (ChouwaGAN only)
+                if r1_gamma > 0.0:
+                    from rvc.train.chouwa_gan_training import r1_penalty_eager
+                    loss_disc = r1_penalty_eager(
+                        net_d.module if hasattr(net_d, 'module') else net_d,
+                        y, y_hat, loss_disc,
+                        r1_gamma, r1_interval, global_step,
+                    )
+
+            # Discriminator backward and update (with gradient accumulation):
+            # Adaptive balancing: skip D optim step if D is too confident
+            skip_d = chouwa_balancer.should_skip_d(global_step) if chouwa_balancer else False
+            loss_disc_for_backward = loss_disc / grad_accum_steps
+            micro_step = ((global_step - 1) % grad_accum_steps) + 1
+            if micro_step == 1:
+                optim_d.zero_grad(set_to_none=True)
+            do_optim_step = (micro_step == grad_accum_steps) and not skip_d
+            if train_dtype == torch.float16:
+                gradscaler.scale(loss_disc_for_backward).backward()
+                if do_optim_step:
+                    gradscaler.unscale_(optim_d)
+                    scale = gradscaler.get_scale()
+                    grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=grad_clip_d)
+                    gradscaler.step(optim_d)
+                else:
+                    scale = gradscaler.get_scale()
+                    grad_norm_d = torch.tensor(0.0, device=device)
+            else:
+                loss_disc_for_backward.backward()
+                if do_optim_step:
+                    grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=grad_clip_d)
+                    optim_d.step()
+                else:
+                    grad_norm_d = torch.tensor(0.0, device=device)
+                scale = 1.0
+
+            # Free D-step computation graph before G steps to reduce peak VRAM
             del y_d_hat_r, y_d_hat_g, loss_disc
 
-            # ── Freeze D during G step ────────────────────────────────
-            # D's own update is done.  For the G step the discriminator
-            # only provides adversarial + feature-matching signal; its
-            # parameter gradients are never used.  Freezing prevents
-            # PyTorch from allocating ~D-params of gradient memory
-            # during G backward, and bypassing DDP avoids an unnecessary
-            # allreduce.  Quality is unaffected.
+            # ChouwaGAN: 6 sub-discs leave ~30-50 MB of reserved-but-unallocated
+            # fragments after the D backward. The G forward (SnakeBeta resblocks)
+            # then OOMs trying to allocate the next ~16 MB contiguous block even
+            # with 60-70 MB "free".  empty_cache() returns those fragments to CUDA
+            # before the G forward runs.  Cost: ~1-2 ms/step.
+            if vocoder == "ChouwaGAN":
+                torch.cuda.empty_cache()
+
+            # ── Generator step ──────────────────────────────────────────────
+            # D provides adversarial + feature-matching signal; its parameter
+            # gradients are never used inside the G step.  Freezing D prevents
+            # PyTorch from allocating gradient memory for D's params during G
+            # backward.  Unfreeze after for the next batch's D step.
             d_for_g = net_d.module if hasattr(net_d, 'module') else net_d
             d_for_g.requires_grad_(False)
 
-            # Run discriminator on generated output (through raw module)
-            with autocast(device_type="cuda", enabled=use_amp, dtype=train_dtype):
-                _, y_d_hat_g, fmap_r, fmap_g = d_for_g(y, y_hat)
+            for _g_step in range(1):
 
-            # Compute generator losses:
-            with autocast(device_type="cuda", enabled=False):
+                # Run discriminator on generated output (fmaps needed for G losses)
+                with autocast(device_type="cuda", enabled=use_amp, dtype=train_dtype):
+                    y_d_hat_r_g, y_d_hat_g, fmap_r, fmap_g = d_for_g(y, y_hat)
 
-                # Spectral loss ( In code kept referenced as "loss_mel" to avoid confusion in old logs / graphs):
-                if spectral_loss == "L1 Mel Loss":
-                    y_mel = wave_to_mel(config, y, half=train_dtype)
-                    y_hat_mel = wave_to_mel(config, y_hat, half=train_dtype)
-                    loss_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
-                elif spectral_loss == "Multi-Scale Mel Loss":
-                    loss_mel = fn_spectral_loss(y, y_hat) * config.train.c_mel / 3.0
-                elif spectral_loss == "Multi-Res STFT Loss":
-                    loss_mel = fn_spectral_loss(y_hat.float(), y.float()) * c_stft
+                # Compute generator losses:
+                with autocast(device_type="cuda", enabled=False):
 
-                # Feature Matching loss (normalized per sub-discriminator)
-                loss_fm = feature_loss(fmap_r, fmap_g) / n_disc
+                    # Spectral loss (referenced as "loss_mel" for log consistency):
+                    if spectral_loss == "L1 Mel Loss":
+                        y_mel = wave_to_mel(config, y, half=train_dtype)
+                        y_hat_mel = wave_to_mel(config, y_hat, half=train_dtype)
+                        loss_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
+                    elif spectral_loss == "Multi-Scale Mel Loss":
+                        loss_mel = fn_spectral_loss(y, y_hat) * config.train.c_mel / 3.0
+                    elif spectral_loss == "Multi-Res STFT Loss":
+                        loss_mel = fn_spectral_loss(y_hat.float(), y.float()) * c_stft
 
-                # Generator loss (normalized per sub-discriminator)
-                if adversarial_loss == "lsgan":
-                    loss_adv = generator_loss(y_d_hat_g) / n_disc
-                elif adversarial_loss == "tprls":
-                    y_d_hat_r_detached = [i.detach() for i in y_d_hat_r]
-                    loss_adv = generator_loss_v2(y_d_hat_g, y_d_hat_r_detached) / n_disc
-                elif adversarial_loss == "hinge":
-                    loss_adv = fn_hinge_loss(y_d_hat_g) / n_disc
+                    # Feature Matching loss (normalized per sub-disc, 2× for ChouwaGAN)
+                    loss_fm = feature_loss(fmap_r, fmap_g) / n_disc * c_fm
 
-                # Kl annealing handler
-                if use_kl_annealing:
-                    annealing_cycle_steps = len(train_loader) * kl_annealing_cycle_duration
-                    kl_beta = 0.5 * (1 - math.cos((global_step % annealing_cycle_steps) * (math.pi / annealing_cycle_steps)))
-                else:
-                    kl_beta = 1.0
+                    # Generator loss (normalized per sub-discriminator)
+                    if adversarial_loss == "softplus":
+                        from rvc.train.chouwa_gan_training import softplus_g_loss
+                        loss_adv = softplus_g_loss(y_d_hat_g, n_disc)
+                    elif adversarial_loss == "lsgan":
+                        loss_adv = generator_loss(y_d_hat_g) / n_disc
+                    elif adversarial_loss == "tprls":
+                        y_d_hat_r_detached = [i.detach() for i in y_d_hat_r_g]
+                        loss_adv = generator_loss_v2(y_d_hat_g, y_d_hat_r_detached) / n_disc
+                    elif adversarial_loss == "hinge":
+                        loss_adv = fn_hinge_loss(y_d_hat_g) / n_disc
 
-                # RingFormer related;  Phase, Magnitude and SD:
-                if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
-                    loss_magnitude = torch.nn.functional.l1_loss(mag, target_magnitude)
-                    loss_phase = phase_loss(y_stft, y_hat_stft)
-                    loss_sd = (loss_magnitude + loss_phase) * 0.7
+                    # Adaptive balancing: scale adv weight when D is too strong/weak
+                    if chouwa_balancer is not None:
+                        loss_adv = loss_adv * chouwa_balancer.adv_weight_scale()
 
-                # Total generator loss + kl ( encoders )
-                if not training_loop.encoders_frozen: # For when encoders aren't frozen yet
-                    loss_kl = kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl # KL ( Kullback–Leibler divergence ) loss
-                    if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
-                        loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta + loss_sd
+                    # Kl annealing handler
+                    if use_kl_annealing:
+                        annealing_cycle_steps = len(train_loader) * kl_annealing_cycle_duration
+                        kl_beta = 0.5 * (1 - math.cos((global_step % annealing_cycle_steps) * (math.pi / annealing_cycle_steps)))
                     else:
-                        loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta
-                else:
-                    loss_kl = torch.tensor(0.0, device=device) # KL loss dummy for logs
-                    if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
-                        loss_gen_total = loss_adv + loss_fm + loss_mel + loss_sd
-                    else:
-                        loss_gen_total = loss_adv + loss_fm + loss_mel
+                        kl_beta = 1.0
 
-            # Generator backward and update:
-            optim_g.zero_grad(set_to_none=True)
-            if train_dtype == torch.float16:
-                gradscaler.scale(loss_gen_total).backward() # Scale and backward of the loss
-                gradscaler.unscale_(optim_g) # Unscale
-                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=grad_clip_g) # Grad clipping
-                gradscaler.step(optim_g) # Optim step
-                gradscaler.update() # Scaler update, to prepare the scaling for the next iteration
-                skip_lr_sched = (scale > gradscaler.get_scale())
-            else:
-                loss_gen_total.backward() # Loss backward
-                grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=grad_clip_g) # Grad clipping
-                optim_g.step() # Optim step
-                skip_lr_sched = False
+                    # RingFormer related;  Phase, Magnitude and SD:
+                    if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
+                        loss_magnitude = torch.nn.functional.l1_loss(mag, target_magnitude)
+                        loss_phase = phase_loss(y_stft, y_hat_stft)
+                        loss_sd = (loss_magnitude + loss_phase) * 0.7
+
+                    # Total generator loss + kl ( encoders )
+                    if not training_loop.encoders_frozen: # For when encoders aren't frozen yet
+                        loss_kl = kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl # KL ( Kullback–Leibler divergence ) loss
+                        if vocoder == "ChouwaGAN":
+                            loss_hf = hf_recon_loss(y_hat, y) * c_hf
+                            loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta + loss_hf
+                        elif vocoder in ["RingFormer_v1", "RingFormer_v2"]:
+                            loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta + loss_sd
+                        else:
+                            loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta
+                    else:
+                        loss_kl = torch.tensor(0.0, device=device) # KL loss dummy for logs
+                        if vocoder == "ChouwaGAN":
+                            loss_hf = hf_recon_loss(y_hat, y) * c_hf
+                            loss_gen_total = loss_adv + loss_fm + loss_mel + loss_hf
+                        elif vocoder in ["RingFormer_v1", "RingFormer_v2"]:
+                            loss_gen_total = loss_adv + loss_fm + loss_mel + loss_sd
+                        else:
+                            loss_gen_total = loss_adv + loss_fm + loss_mel
+
+                # Generator backward and update (with gradient accumulation):
+                loss_gen_for_backward = loss_gen_total / grad_accum_steps
+                if micro_step == 1:
+                    optim_g.zero_grad(set_to_none=True)
+                if train_dtype == torch.float16:
+                    gradscaler.scale(loss_gen_for_backward).backward()
+                    if do_optim_step:
+                        gradscaler.unscale_(optim_g)
+                        grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=grad_clip_g)
+                        gradscaler.step(optim_g)
+                        gradscaler.update()
+                        skip_lr_sched = (scale > gradscaler.get_scale())
+                    else:
+                        grad_norm_g = torch.tensor(0.0, device=device)
+                        skip_lr_sched = False
+                else:
+                    loss_gen_for_backward.backward()
+                    if do_optim_step:
+                        grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=grad_clip_g)
+                        optim_g.step()
+                    else:
+                        grad_norm_g = torch.tensor(0.0, device=device)
+                    skip_lr_sched = False
+
+            # Update Generator EMA after G step
+            if g_ema is not None and do_optim_step:
+                g_ema.update(net_g)
 
             # Unfreeze D for the next iteration's D step
             d_for_g.requires_grad_(True)
@@ -1379,7 +1518,9 @@ def training_loop(
                 epoch_loss_tensor[4].add_(loss_mel.detach())
                 epoch_loss_tensor[5].add_(loss_kl.detach())
 
-                if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
+                if vocoder == "ChouwaGAN":
+                    epoch_loss_tensor[6].add_(loss_hf.detach())
+                elif vocoder in ["RingFormer_v1", "RingFormer_v2"]:
                     epoch_loss_tensor[6].add_(loss_sd.detach())
 
             # Loss accumulation for rolling-avg
@@ -1401,7 +1542,9 @@ def training_loop(
             avg_rolling_cache["loss_fm"].append(loss_fm.detach())
             avg_rolling_cache["loss_mel"].append(loss_mel.detach())
             avg_rolling_cache["loss_kl"].append(loss_kl.detach())
-            if "loss_sd" in avg_rolling_cache:
+            if "loss_hf" in avg_rolling_cache:
+                avg_rolling_cache["loss_hf"].append(loss_hf.detach())
+            elif "loss_sd" in avg_rolling_cache:
                 avg_rolling_cache["loss_sd"].append(loss_sd.detach())
             if "loss_env" in avg_rolling_cache:
                 avg_rolling_cache["loss_env"].append(loss_env.detach())
@@ -1420,13 +1563,14 @@ def training_loop(
                 # logging rolling averages
                 for key, queue in avg_rolling_cache.items():
                     if len(queue) > 0:
-                        # determine loss or grad category
                         category = "loss" if "loss" in key else "grad"
-                        # dynamic labeling
                         label = f"{category}_avg_{rolling_loss_steps}/{key}_{rolling_loss_steps}"
-                        # Calculate mean
                         val = torch.stack(list(queue)).mean().item() if torch.is_tensor(queue[0]) else sum(queue)/len(queue)
                         scalar_dict_rolling[label] = val
+
+                # ChouwaGAN: log D(real)/D(fake) monitoring
+                if chouwa_balancer is not None:
+                    scalar_dict_rolling.update(chouwa_balancer.get_log_dict())
 
                 summarize(writer=writer, global_step=global_step, scalars=scalar_dict_rolling)
                 flush_writer(writer, rank)

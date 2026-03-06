@@ -419,6 +419,8 @@ def print_init_setup(
             print("    ██████  Adversarial loss: HINGE")
         elif adversarial_loss == "lsgan":
             print("    ██████  Adversarial loss: LSGAN")
+        elif adversarial_loss == "softplus":
+            print("    ██████  Adversarial loss: SOFTPLUS (logistic)")
 
         # Vits maode checkup:
         if vits2_mode:

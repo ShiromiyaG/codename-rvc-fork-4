@@ -70,7 +70,14 @@ class SnakeBeta(nn.Module):
 
         alpha = alpha.to(x.dtype)
         beta = beta.to(x.dtype)
-        
-        x = x + (1.0 / (beta + self.no_div_by_zero)) * pow(sin(x * alpha), 2)
+
+        # In-place fused SnakeBeta — but do NOT modify x in-place.
+        # Instead reuse buffer t for intermediate ops and create new tensor with x = x + t.
+        t = x.mul(alpha)
+        t.sin_()
+        t.pow_(2)
+        t.div_(beta + self.no_div_by_zero)
+        x = x + t
+        del t
 
         return x

@@ -57,8 +57,15 @@ class Snake(nn.Module):
         alpha = self.alpha.unsqueeze(0).unsqueeze(-1)  # Line up with x to [B, C, T]
         if self.alpha_logscale:
             alpha = torch.exp(alpha)
-        x = x + (1.0 / (alpha + self.no_div_by_zero)) * pow(sin(x * alpha), 2)
-
+        # In-place fused Snake: x + sin²(x·α)/(α+ε)
+        # Original allocates 4 temp tensors (~16 MB each at typical batch sizes).
+        # We reuse one buffer (t) but do NOT modify x in-place — that breaks autograd.
+        t = x.mul(alpha)
+        t.sin_()
+        t.pow_(2)
+        t.div_(alpha + self.no_div_by_zero)
+        x = x + t
+        del t
         return x
 
 
@@ -130,6 +137,15 @@ class SnakeBeta(nn.Module):
         alpha = alpha.float()
         beta = beta.float()
 
-        x = x + (1.0 / (beta + self.no_div_by_zero)) * pow(sin(x * alpha), 2)
+        # In-place fused SnakeBeta: x + sin²(x·α)/(β+ε)
+        # Original allocates 4 temp FP32 tensors (~16 MB each at typical batch
+        # sizes). We reuse one buffer (t) but do NOT modify x in-place — that
+        # breaks autograd. Instead: x = x + t creates a new tensor safely.
+        t = x.mul(alpha)
+        t.sin_()
+        t.pow_(2)
+        t.div_(beta + self.no_div_by_zero)
+        x = x + t
+        del t
 
         return x.to(orig_dtype)
