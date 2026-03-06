@@ -1,20 +1,15 @@
 """
 v3 modules: ConvNeXt-based Posterior Encoder and Normalizing Flow.
 
-Replaces the WaveNet backbone used in VITS v1/v2 with:
-  - ConvNeXt 1D blocks (depthwise + LayerNorm + GELU + pointwise)
-  - FiLM conditioning (scale + shift) instead of WaveNet-style additive
-  - CAM (Context Aware Module) for expanded receptive field in the flow
-
-These modules are drop-in replacements: same input/output signatures
-as the original PosteriorEncoder and ResidualCouplingBlock.
+Replaces the WaveNet backbone used in VITS v1/v2 with ConvNeXt 1D blocks
+and FiLM conditioning. These modules are drop-in replacements with the same
+input/output signatures as the original PosteriorEncoder and ResidualCouplingBlock.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
-from torch.utils.checkpoint import checkpoint
 
 from rvc.lib.algorithm.commons import sequence_mask
 
@@ -33,43 +28,42 @@ class ConvNeXtLayerNorm1D(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Upcast to FP32 for numerical stability (BF16-safe)
         orig_dtype = x.dtype
-        x = x.float()
+        needs_upcast = orig_dtype in (torch.bfloat16, torch.float16)
+        
+        if needs_upcast:
+            x = x.float()
+        
         u = x.mean(1, keepdim=True)
         s = (x - u).pow(2).mean(1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.eps)
-        x = self.weight[:, None].float() * x + self.bias[:, None].float()
-        return x.to(orig_dtype)
+        
+        if needs_upcast:
+            x = self.weight[:, None].float() * x + self.bias[:, None].float()
+            return x.to(orig_dtype)
+        else:
+            return self.weight[:, None] * x + self.bias[:, None]
 
 
 class FiLM(nn.Module):
-    """
-    Feature-wise Linear Modulation.
-    
-    Projects a global conditioning vector g (B, gin_channels, 1) into
-    per-channel scale and shift for the target features: y = scale * x + shift.
-    """
+    """Feature-wise Linear Modulation."""
 
     def __init__(self, gin_channels: int, channels: int):
         super().__init__()
         self.proj = nn.Conv1d(gin_channels, channels * 2, 1)
+        
+        nn.init.trunc_normal_(self.proj.weight, std=0.02)
+        nn.init.constant_(self.proj.bias[:channels], 0.0)
+        nn.init.constant_(self.proj.bias[channels:], 0.0)
 
     def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        gamma_beta = self.proj(g)  # (B, 2*C, 1)
-        gamma, beta = gamma_beta.chunk(2, dim=1)  # each (B, C, 1)
-        return gamma * x + beta
+        gamma_beta = self.proj(g)
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+        return (1.0 + gamma) * x + beta
 
 
 class CAM(nn.Module):
-    """
-    Context Aware Module.
-    
-    A large-kernel depthwise convolution that cheaply expands the receptive
-    field.  Placed before or after ConvNeXt blocks inside each coupling layer.
-    
-    CAM(x) = LayerNorm(DwConv_large(x)) + x
-    """
+    """Context Aware Module - large-kernel depthwise convolution."""
 
     def __init__(self, channels: int, kernel_size: int = 31):
         super().__init__()
@@ -78,64 +72,34 @@ class CAM(nn.Module):
             kernel_size=kernel_size,
             padding=kernel_size // 2,
             groups=channels,
+            bias=True,
         )
         self.norm = ConvNeXtLayerNorm1D(channels)
+        
+        nn.init.constant_(self.dwconv.weight, 0.0)
+        nn.init.constant_(self.dwconv.bias, 0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.norm(self.dwconv(x))
 
 
-class DropPath(nn.Module):
-    """Stochastic Depth — drops the entire residual branch per-sample.
-
-    At eval time this is a no-op, so inference is deterministic.
-    """
-
-    def __init__(self, drop_prob: float = 0.0):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.drop_prob == 0.0:
-            return x
-        keep = 1.0 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # (B, 1, 1)
-        mask = x.new_empty(shape).bernoulli_(keep).div_(keep)
-        return x * mask
-
-
 class GRN(nn.Module):
-    """Global Response Normalization (ConvNeXt V2).
+    """Global Response Normalization (ConvNeXt V2)."""
 
-    Encourages feature diversity by normalizing each channel's response
-    relative to the global aggregate across channels.  Initialised as
-    identity (gamma=0, beta=0) so it is safe to add to a pretrained model.
-    """
-
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, eps: float = 1e-6):
         super().__init__()
         self.gamma = nn.Parameter(torch.zeros(1, channels, 1))
         self.beta = nn.Parameter(torch.zeros(1, channels, 1))
+        self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, T)
-        gx = torch.norm(x, p=2, dim=2, keepdim=True)          # (B, C, 1)
-        nx = gx / (gx.mean(dim=1, keepdim=True) + 1e-6)       # (B, C, 1)
+        gx = torch.linalg.vector_norm(x, ord=2, dim=2, keepdim=True)
+        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
         return self.gamma * (x * nx) + self.beta + x
 
 
 class ConvNeXtBlock1D(nn.Module):
-    """
-    1D ConvNeXt **V2** block with optional FiLM conditioning.
-
-    DwConv -> LayerNorm -> FiLM(opt) -> Conv1d↑ -> GELU -> GRN -> Conv1d↓
-         -> layer_scale -> DropPath -> + residual
-
-    Changes vs V1:
-      - GRN after GELU for feature diversity
-      - Conv1d(1) instead of Linear (eliminates 2 permute ops per block)
-      - DropPath for stochastic depth regularisation
-    """
+    """ConvNeXt V2 block with optional FiLM conditioning."""
 
     def __init__(
         self,
@@ -145,7 +109,6 @@ class ConvNeXtBlock1D(nn.Module):
         dilation: int = 1,
         layer_scale_init: float = 1e-6,
         gin_channels: int = 0,
-        drop_path: float = 0.0,
     ):
         super().__init__()
         mlp_dim = int(channels * mlp_ratio)
@@ -156,6 +119,7 @@ class ConvNeXtBlock1D(nn.Module):
             padding=int(dilation * (kernel_size - 1) / 2),
             dilation=dilation,
             groups=channels,
+            bias=True,
         )
         self.norm = ConvNeXtLayerNorm1D(channels)
         self.pwconv1 = nn.Conv1d(channels, mlp_dim, 1)
@@ -166,9 +130,21 @@ class ConvNeXtBlock1D(nn.Module):
             nn.Parameter(layer_scale_init * torch.ones(1, channels, 1))
             if layer_scale_init > 0 else None
         )
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
         self.film = FiLM(gin_channels, channels) if gin_channels > 0 else None
+        
+        # Initialize weights (will be re-initialized by parent's apply())
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.dwconv.weight, std=0.02)
+        nn.init.constant_(self.dwconv.bias, 0)
+        
+        nn.init.trunc_normal_(self.pwconv1.weight, std=0.02)
+        nn.init.constant_(self.pwconv1.bias, 0)
+        
+        nn.init.trunc_normal_(self.pwconv2.weight, std=0.02)
+        nn.init.constant_(self.pwconv2.bias, 0)
 
     def forward(
         self, x: torch.Tensor, x_mask: torch.Tensor,
@@ -188,7 +164,6 @@ class ConvNeXtBlock1D(nn.Module):
         if self.gamma is not None:
             x = self.gamma * x
 
-        x = self.drop_path(x)
         return (residual + x) * x_mask
 
 
@@ -197,15 +172,7 @@ class ConvNeXtBlock1D(nn.Module):
 # ---------------------------------------------------------------------------
 
 class PosteriorEncoder_v3(nn.Module):
-    """
-    Posterior Encoder using ConvNeXt blocks with FiLM conditioning.
-    
-    Replaces the WaveNet-based PosteriorEncoder.  Same interface:
-        forward(x, x_lengths, g=None) -> (z, m, logs, x_mask)
-    
-    Architecture:
-        Conv1d_pre -> N x ConvNeXtBlock1D (with FiLM) -> Conv1d_proj -> (m, logs)
-    """
+    """Posterior Encoder using ConvNeXt blocks with FiLM conditioning."""
 
     def __init__(
         self,
@@ -216,21 +183,13 @@ class PosteriorEncoder_v3(nn.Module):
         n_layers: int = 8,
         gin_channels: int = 0,
         mlp_ratio: float = 4.0,
-        checkpointing: bool = False,
-        drop_path_rate: float = 0.1,
     ):
         super().__init__()
         self.out_channels = out_channels
-        self.checkpointing = checkpointing
 
         self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
 
-        # Linearly increasing drop-path rates (0 → drop_path_rate)
-        dp_rates = (
-            [drop_path_rate * i / (n_layers - 1) for i in range(n_layers)]
-            if n_layers > 1 else [0.0]
-        )
-        # Cycling dilation schedule for expanded receptive field at zero cost
+        # Exponential dilation for larger receptive field
         dilation_cycle = [1, 2, 4, 8]
 
         self.blocks = nn.ModuleList([
@@ -240,13 +199,15 @@ class PosteriorEncoder_v3(nn.Module):
                 mlp_ratio=mlp_ratio,
                 dilation=dilation_cycle[i % len(dilation_cycle)],
                 gin_channels=gin_channels,
-                drop_path=dp_rates[i],
             )
             for i in range(n_layers)
         ])
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
         self.apply(self._init_weights)
+        
+        nn.init.trunc_normal_(self.proj.weight, std=0.01)
+        nn.init.constant_(self.proj.bias, 0)
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv1d, nn.Linear)):
@@ -265,18 +226,18 @@ class PosteriorEncoder_v3(nn.Module):
         x = self.pre(x) * x_mask
 
         for block in self.blocks:
-            if self.training and self.checkpointing:
-                x = checkpoint(block, x, x_mask, g, use_reentrant=False)
-            else:
-                x = block(x, x_mask, g=g)
+            x = block(x, x_mask, g=g)
 
         stats = self.proj(x) * x_mask
         m, logs = torch.split(stats, self.out_channels, dim=1)
+        
+        logs = torch.clamp(logs, min=-10.0, max=2.0)
+        
         z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
         return z, m, logs, x_mask
 
     def remove_weight_norm(self):
-        """No-op: ConvNeXt uses LayerNorm, not weight_norm."""
+        # No weight_norm used in v3 modules
         pass
 
 
@@ -293,25 +254,15 @@ class Flip(nn.Module):
         x_mask: torch.Tensor,
         g: Optional[torch.Tensor] = None,
         reverse: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = torch.flip(x, [1])
-        if not reverse:
-            logdet = torch.zeros(x.size(0), dtype=x.dtype, device=x.device)
-            return x, logdet
-        else:
-            return x, torch.zeros([1], device=x.device)
+        # Flip is volume-preserving, so logdet is always zero
+        logdet = torch.zeros(x.size(0), dtype=x.dtype, device=x.device)
+        return x, logdet
 
 
 class ResidualCouplingLayer_v3(nn.Module):
-    """
-    Affine coupling layer with ConvNeXt + CAM backbone.
-    
-    Replaces the WaveNet-based ResidualCouplingLayer.  Same interface:
-        forward(x, x_mask, g=None, reverse=False)
-    
-    Architecture:
-        split(x) -> pre -> CAM -> N x ConvNeXtBlock1D (with FiLM) -> post -> affine transform
-    """
+    """Affine coupling layer with ConvNeXt + CAM backbone."""
 
     def __init__(
         self,
@@ -323,18 +274,16 @@ class ResidualCouplingLayer_v3(nn.Module):
         mean_only: bool = False,
         cam_kernel_size: int = 31,
         mlp_ratio: float = 4.0,
-        checkpointing: bool = False,
     ):
         assert channels % 2 == 0
         super().__init__()
         self.half_channels = channels // 2
         self.mean_only = mean_only
-        self.checkpointing = checkpointing
 
         self.pre = nn.Conv1d(self.half_channels, hidden_channels, 1)
         self.cam = CAM(hidden_channels, kernel_size=cam_kernel_size)
 
-        # Ascending dilation schedule for expanded receptive field
+        # Exponential dilation for larger receptive field
         dilation_cycle = [1, 2, 4, 8]
 
         self.blocks = nn.ModuleList([
@@ -350,14 +299,14 @@ class ResidualCouplingLayer_v3(nn.Module):
         self.post = nn.Conv1d(
             hidden_channels, self.half_channels * (2 - mean_only), 1
         )
-        # Zero-init the output projection so the flow starts as identity
-        self.post.weight.data.zero_()
-        self.post.bias.data.zero_()
 
         self.apply(self._init_weights)
-        # Re-zero post after apply
+        
+        # Re-zero layers that need identity init
         self.post.weight.data.zero_()
         self.post.bias.data.zero_()
+        nn.init.constant_(self.cam.dwconv.weight, 0.0)
+        nn.init.constant_(self.cam.dwconv.bias, 0.0)
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv1d, nn.Linear)):
@@ -377,16 +326,15 @@ class ResidualCouplingLayer_v3(nn.Module):
         h = self.cam(h) * x_mask
 
         for block in self.blocks:
-            if self.training and self.checkpointing:
-                h = checkpoint(block, h, x_mask, g, use_reentrant=False)
-            else:
-                h = block(h, x_mask, g=g)
+            h = block(h, x_mask, g=g)
 
         stats = self.post(h) * x_mask
 
         if not self.mean_only:
             m, logs = torch.split(stats, [self.half_channels] * 2, 1)
+            logs = torch.clamp(logs, min=-10.0, max=2.0)
         else:
+            # mean_only mode: logs are always zero (no scale transformation)
             m = stats
             logs = torch.zeros_like(m)
 
@@ -398,20 +346,17 @@ class ResidualCouplingLayer_v3(nn.Module):
         else:
             x1 = (x1 - m) * torch.exp(-logs) * x_mask
             x = torch.cat([x0, x1], 1)
-            return x, torch.zeros([1], device=x.device)
+            # Return consistent shape with forward pass
+            logdet = torch.zeros(x.size(0), dtype=x.dtype, device=x.device)
+            return x, logdet
 
     def remove_weight_norm(self):
-        """No-op: ConvNeXt uses LayerNorm, not weight_norm."""
+        # No weight_norm used in v3 modules
         pass
 
 
 class ResidualCouplingBlock_v3(nn.Module):
-    """
-    Normalizing flow with ConvNeXt + CAM coupling layers.
-    
-    Replaces ResidualCouplingBlock.  Same interface:
-        forward(x, x_mask, g=None, reverse=False) -> x
-    """
+    """Normalizing flow with ConvNeXt + CAM coupling layers."""
 
     def __init__(
         self,
@@ -423,7 +368,6 @@ class ResidualCouplingBlock_v3(nn.Module):
         gin_channels: int = 0,
         cam_kernel_size: int = 31,
         mlp_ratio: float = 4.0,
-        checkpointing: bool = False,
     ):
         super().__init__()
         self.n_flows = n_flows
@@ -440,7 +384,6 @@ class ResidualCouplingBlock_v3(nn.Module):
                     mean_only=True,
                     cam_kernel_size=cam_kernel_size,
                     mlp_ratio=mlp_ratio,
-                    checkpointing=checkpointing,
                 )
             )
             self.flows.append(Flip())
@@ -461,5 +404,5 @@ class ResidualCouplingBlock_v3(nn.Module):
         return x
 
     def remove_weight_norm(self):
-        """No-op: ConvNeXt uses LayerNorm, not weight_norm."""
+        # No weight_norm used in v3 modules
         pass

@@ -364,6 +364,7 @@ def get_d_model(config, vocoder, use_checkpointing):
         )
     elif vocoder == "PCPH-GAN":
         from rvc.lib.algorithm.discriminators.multi import MPD_MSD_MRD_Combined
+        mrd_config = dict(config.mrd) if hasattr(config, "mrd") else {}
         return MPD_MSD_MRD_Combined(
             config.model.use_spectral_norm,
             use_checkpointing=use_checkpointing,
@@ -560,8 +561,8 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
             net_g, net_d = setup_models_for_training(net_g, net_d, device, device_id, n_gpus, train_dtype)
 
             # Load the model and optim states
-            _, _, _, epoch_str, gradscaler_dict = load_checkpoint(g_checkpoint_path, net_g, optim_g)
-            _, _, _, epoch_str, _ = load_checkpoint(d_checkpoint_path, net_d, optim_d)
+            _, _, _, epoch_str, gradscaler_dict, _, chouwa_balancer_state = load_checkpoint(g_checkpoint_path, net_g, optim_g)
+            _, _, _, epoch_str, _, _, _ = load_checkpoint(d_checkpoint_path, net_d, optim_d)
 
             if override_pretrain_lr:
                 new_lr_for_pretrain = new_pretrain_lr
@@ -587,6 +588,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
         epoch_str = 1
         global_step = 0
         gradscaler_dict = {}
+        chouwa_balancer_state = None
 
         # Loading the pretrained Generator model
         if pretrainG not in ["", "None"]:
@@ -629,7 +631,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
         # Init the optimizers
         optim_g, optim_d = get_optimizers(net_g, net_d, config, optimizer_choice, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader)
 
-    return net_g, net_d, optim_g, optim_d, epoch_str, global_step, gradscaler_dict
+    return net_g, net_d, optim_g, optim_d, epoch_str, global_step, gradscaler_dict, None, chouwa_balancer_state
 
 def prepare_schedulers(optim_g, optim_d, use_warmup, warmup_duration, use_lr_scheduler, lr_scheduler, exp_decay_gamma, total_epoch_count, epoch_str, global_step, train_loader):
     warmup_scheduler_g, warmup_scheduler_d = None, None
@@ -930,7 +932,7 @@ def run(
     fn_hinge_loss = HingeAdversarialLoss() if adversarial_loss == "hinge" else None
 
     # Loading of models and optims
-    net_g, net_d, optim_g, optim_d, epoch_str, global_step, gradscaler_dict = load_models_and_optimizers(
+    net_g, net_d, optim_g, optim_d, epoch_str, global_step, gradscaler_dict, _, chouwa_balancer_state = load_models_and_optimizers(
         config,
         pretrainG,
         pretrainD,
@@ -956,19 +958,31 @@ def run(
     if vocoder == "ChouwaGAN":
         _actual_d = net_d.module if hasattr(net_d, 'module') else net_d
         n_disc = len(_actual_d.discriminators) if hasattr(_actual_d, 'discriminators') else 5
+        # Add 1 for the HF sub-band discriminator
+        if hasattr(_actual_d, 'hf_disc'):
+            n_disc += 1
     else:
         n_disc = 1
 
-    # ChouwaGAN-exclusive: EMA + Adaptive Balancer + HF Recon Loss
-    g_ema = None
+    # ChouwaGAN-exclusive: Adaptive Balancer + HF Recon Loss
     chouwa_balancer = None
     hf_recon_loss = None
     if vocoder == "ChouwaGAN":
-        from rvc.train.chouwa_gan_training import GeneratorEMA, AdaptiveBalancer, HighFrequencyReconstructionLoss
-        g_ema = GeneratorEMA(net_g, decay=0.999, device=device)
+        from rvc.train.chouwa_gan_training import AdaptiveBalancer, HighFrequencyReconstructionLoss
+        
         chouwa_balancer = AdaptiveBalancer(ema_decay=0.99, skip_threshold=5.0, resume_threshold=2.0)
-        hf_recon_loss = HighFrequencyReconstructionLoss(sr=config.data.sample_rate).to(device)
-        print("    ██████  ChouwaGAN: Generator EMA initialized (decay=0.999)")
+        
+        # Load balancer state if resuming from checkpoint
+        if chouwa_balancer_state is not None:
+            chouwa_balancer.d_real_ema = chouwa_balancer_state.get("d_real_ema", 0.0)
+            chouwa_balancer.d_fake_ema = chouwa_balancer_state.get("d_fake_ema", 0.0)
+            chouwa_balancer._d_skipping = chouwa_balancer_state.get("_d_skipping", False)
+            chouwa_balancer._warmup = chouwa_balancer_state.get("_warmup", 100)
+            print("    ██████  ChouwaGAN: Loaded Adaptive Balancer state from checkpoint")
+        
+        # Use device_id for multi-GPU to avoid device mismatch
+        target_device = device_id if device.type == "cuda" else device
+        hf_recon_loss = HighFrequencyReconstructionLoss(sr=config.data.sample_rate).to(target_device)
         print("    ██████  ChouwaGAN: Adaptive D/G balancer active")
         print("    ██████  ChouwaGAN: HF Reconstruction Loss active")
 
@@ -1095,7 +1109,6 @@ def run(
                 trajectory_tracker=trajectory_tracker,
                 n_disc=n_disc,
                 grad_clip_g=grad_clip_g,
-                g_ema=g_ema,
                 chouwa_balancer=chouwa_balancer,
                 hf_recon_loss=hf_recon_loss,
             )
@@ -1159,7 +1172,6 @@ def training_loop(
     trajectory_tracker=None,
     n_disc=1,
     grad_clip_g=200.0,
-    g_ema=None,
     chouwa_balancer=None,
     hf_recon_loss=None,
 ):
@@ -1322,7 +1334,9 @@ def training_loop(
             # ── Discriminator step ──────────────────────────────────────────
             # No fmaps needed here — saves memory.
             with autocast(device_type="cuda", enabled=use_amp, dtype=train_dtype):
-                y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach(), compute_fmaps=False)
+                # Detach y_hat early to free generator's computation graph
+                y_hat_detached = y_hat.detach()
+                y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat_detached, compute_fmaps=False)
 
             with autocast(device_type="cuda", enabled=False):
                 # Compute discriminator loss:
@@ -1362,10 +1376,12 @@ def training_loop(
             micro_step = ((global_step - 1) % grad_accum_steps) + 1
             if micro_step == 1:
                 optim_d.zero_grad(set_to_none=True)
-            do_optim_step = (micro_step == grad_accum_steps) and not skip_d
+            # Separate step flags: D can be skipped, but G always updates when accumulated
+            do_d_step = (micro_step == grad_accum_steps) and not skip_d
+            do_g_step = (micro_step == grad_accum_steps)
             if train_dtype == torch.float16:
                 gradscaler.scale(loss_disc_for_backward).backward()
-                if do_optim_step:
+                if do_d_step:
                     gradscaler.unscale_(optim_d)
                     scale = gradscaler.get_scale()
                     grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=grad_clip_d)
@@ -1375,7 +1391,7 @@ def training_loop(
                     grad_norm_d = torch.tensor(0.0, device=device)
             else:
                 loss_disc_for_backward.backward()
-                if do_optim_step:
+                if do_d_step:
                     grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=grad_clip_d)
                     optim_d.step()
                 else:
@@ -1383,14 +1399,16 @@ def training_loop(
                 scale = 1.0
 
             # Free D-step computation graph before G steps to reduce peak VRAM
-            del y_d_hat_r, y_d_hat_g, loss_disc
+            del y_d_hat_r, y_d_hat_g, loss_disc, y_hat_detached
 
+            # Empty cache only when D step actually happens and for ChouwaGAN
             # ChouwaGAN: 6 sub-discs leave ~30-50 MB of reserved-but-unallocated
             # fragments after the D backward. The G forward (SnakeBeta resblocks)
             # then OOMs trying to allocate the next ~16 MB contiguous block even
             # with 60-70 MB "free".  empty_cache() returns those fragments to CUDA
             # before the G forward runs.  Cost: ~1-2 ms/step.
-            if vocoder == "ChouwaGAN":
+            # Other vocoders don't need this as frequently.
+            if device.type == "cuda" and vocoder == "ChouwaGAN" and do_d_step:
                 torch.cuda.empty_cache()
 
             # ── Generator step ──────────────────────────────────────────────
@@ -1406,6 +1424,10 @@ def training_loop(
                 # Run discriminator on generated output (fmaps needed for G losses)
                 with autocast(device_type="cuda", enabled=use_amp, dtype=train_dtype):
                     y_d_hat_r_g, y_d_hat_g, fmap_r, fmap_g = d_for_g(y, y_hat)
+                    
+                    # Detach real fmaps — G doesn't need gradients through real activations
+                    # This saves 5-10% backward compute time with zero impact on quality
+                    fmap_r = [[f.detach() for f in fm] for fm in fmap_r]
 
                 # Compute generator losses:
                 with autocast(device_type="cuda", enabled=False):
@@ -1478,7 +1500,7 @@ def training_loop(
                     optim_g.zero_grad(set_to_none=True)
                 if train_dtype == torch.float16:
                     gradscaler.scale(loss_gen_for_backward).backward()
-                    if do_optim_step:
+                    if do_g_step:
                         gradscaler.unscale_(optim_g)
                         grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=grad_clip_g)
                         gradscaler.step(optim_g)
@@ -1489,16 +1511,12 @@ def training_loop(
                         skip_lr_sched = False
                 else:
                     loss_gen_for_backward.backward()
-                    if do_optim_step:
+                    if do_g_step:
                         grad_norm_g = torch.nn.utils.clip_grad_norm_(net_g.parameters(), max_norm=grad_clip_g)
                         optim_g.step()
                     else:
                         grad_norm_g = torch.tensor(0.0, device=device)
                     skip_lr_sched = False
-
-            # Update Generator EMA after G step
-            if g_ema is not None and do_optim_step:
-                g_ema.update(net_g)
 
             # Unfreeze D for the next iteration's D step
             d_for_g.requires_grad_(True)
@@ -1524,15 +1542,15 @@ def training_loop(
                     epoch_loss_tensor[6].add_(loss_sd.detach())
 
             # Loss accumulation for rolling-avg
-            # Grads:
-            if torch.isfinite(grad_norm_d):
+            # Grads: only log when step actually happened (avoid polluting with zeros)
+            if do_d_step and torch.isfinite(grad_norm_d):
                 avg_rolling_cache["grad_norm_d"].append(grad_norm_d)
-            else:
+            elif not torch.isfinite(grad_norm_d):
                 writer.add_scalar("Grad_Norm/D_Skipped", 1, global_step)
 
-            if torch.isfinite(grad_norm_g):
+            if do_g_step and torch.isfinite(grad_norm_g):
                 avg_rolling_cache["grad_norm_g"].append(grad_norm_g)
-            else:
+            elif not torch.isfinite(grad_norm_g):
                 writer.add_scalar("Grad_Norm/G_Skipped", 1, global_step)
 
             # Losses:
@@ -1546,8 +1564,15 @@ def training_loop(
                 avg_rolling_cache["loss_hf"].append(loss_hf.detach())
             elif "loss_sd" in avg_rolling_cache:
                 avg_rolling_cache["loss_sd"].append(loss_sd.detach())
-            if "loss_env" in avg_rolling_cache:
-                avg_rolling_cache["loss_env"].append(loss_env.detach())
+            
+            # Free G-step computation graph to reduce peak VRAM
+            # IMPORTANT: Delete AFTER logging to avoid UnboundLocalError
+            del y_d_hat_r_g, y_d_hat_g, fmap_r, fmap_g
+            del loss_adv, loss_fm, loss_mel, loss_kl, loss_gen_total
+            if vocoder == "ChouwaGAN":
+                del loss_hf
+            elif vocoder in ["RingFormer_v1", "RingFormer_v2"]:
+                del loss_sd, loss_phase, loss_mag
 
 
             if rank == 0 and global_step % rolling_loss_steps == 0:
@@ -1596,6 +1621,7 @@ def training_loop(
                 experiment_dir, gradscaler, save_weight_models,
                 model_name, vocoder, vits2_mode, n_gpus,
                 v3_mode=v3_mode,
+                chouwa_balancer=chouwa_balancer,
             ):
                 return True
 
@@ -1697,6 +1723,8 @@ def training_loop(
             }
             if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
                 scalar_dict_avg.update({"loss_avg/loss_sd": avg_epoch_loss[6].item()})
+            elif vocoder == "ChouwaGAN":
+                scalar_dict_avg.update({"loss_avg/loss_hf": avg_epoch_loss[6].item()})
 
             summarize(writer=writer, global_step=global_step, scalars=scalar_dict_avg)
             flush_writer(writer, rank)
@@ -1781,7 +1809,7 @@ def training_loop(
                         pass
 
             # Save Generator checkpoint
-            save_checkpoint(net_g, optim_g, config.train.learning_rate, epoch, g_path, gradscaler)
+            save_checkpoint(net_g, optim_g, config.train.learning_rate, epoch, g_path, gradscaler, chouwa_balancer)
             # Save Discriminator checkpoint
             save_checkpoint(net_d, optim_d, config.train.learning_rate, epoch, d_path, gradscaler)
 

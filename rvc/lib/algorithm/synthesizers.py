@@ -132,7 +132,6 @@ class Synthesizer(torch.nn.Module):
                     upsample_kernel_sizes,
                     gin_channels=gin_channels,
                     sr=sr,
-                    checkpointing=checkpointing,
                 )
                 print("    ██████  Vocoder: ChouwaGAN-PCPH")
             else:  # vocoder == "HiFi-GAN"
@@ -175,7 +174,6 @@ class Synthesizer(torch.nn.Module):
                 n_layers=8,
                 gin_channels=gin_channels,
                 mlp_ratio=4.0,
-                checkpointing=checkpointing,
             )
             self.flow = ResidualCouplingBlock_v3(
                 inter_channels,
@@ -186,7 +184,6 @@ class Synthesizer(torch.nn.Module):
                 gin_channels=gin_channels,
                 cam_kernel_size=31,
                 mlp_ratio=4.0,
-                checkpointing=checkpointing,
             )
             print("    ██████  v3 mode: ConvNeXt Posterior Encoder + ConvNeXt+CAM Flow")
         else:

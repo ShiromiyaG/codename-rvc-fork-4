@@ -75,10 +75,12 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1, strict=T
         optimizer,
         checkpoint_dict.get("learning_rate", 0),
         checkpoint_dict["iteration"],
-        checkpoint_dict.get("gradscaler", {})
+        checkpoint_dict.get("gradscaler", {}),
+        None,  # g_ema removed
+        checkpoint_dict.get("chouwa_balancer", None),
     )
 
-def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path, gradscaler=None):
+def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path, gradscaler=None, chouwa_balancer=None):
     state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
 
     # Strip torch.compile's "_orig_mod." prefix so checkpoints are always
@@ -95,6 +97,15 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path,
 
     if gradscaler is not None:
         checkpoint_data["gradscaler"] = gradscaler.state_dict()
+
+    # ChouwaGAN-specific: save balancer state
+    if chouwa_balancer is not None:
+        checkpoint_data["chouwa_balancer"] = {
+            "d_real_ema": chouwa_balancer.d_real_ema,
+            "d_fake_ema": chouwa_balancer.d_fake_ema,
+            "_d_skipping": chouwa_balancer._d_skipping,
+            "_warmup": chouwa_balancer._warmup,
+        }
 
     torch.save(checkpoint_data, checkpoint_path)
     print(f"Saved model to {checkpoint_path}")
@@ -508,6 +519,7 @@ def early_stopper(
     vits2_mode,
     n_gpus,
     v3_mode=False,
+    chouwa_balancer=None,
 ):
     if stopper is not None and stopper.stop_triggered:
         net_g, net_d = nets
@@ -520,7 +532,7 @@ def early_stopper(
             d_path = os.path.join(experiment_dir, f"D_{global_step}.pth")
 
             # Save Generator checkpoint
-            save_checkpoint(net_g, optim_g, config.train.learning_rate, epoch, g_path, gradscaler)
+            save_checkpoint(net_g, optim_g, config.train.learning_rate, epoch, g_path, gradscaler, chouwa_balancer)
             # Save Discriminator checkpoint
             save_checkpoint(net_d, optim_d, config.train.learning_rate, epoch, d_path, gradscaler)
 

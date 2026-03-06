@@ -15,60 +15,35 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp import autocast
 from torch.nn.utils.parametrizations import weight_norm
 from torch.nn.utils.parametrize import remove_parametrizations
-from torch.utils.checkpoint import checkpoint
 
-from rvc.lib.algorithm.residuals import LRELU_SLOPE, ResBlock
+from rvc.lib.algorithm.residuals import LRELU_SLOPE, ResBlock_SnakeBeta
 from rvc.lib.algorithm.conformer.activations import SnakeBeta
 from rvc.lib.algorithm.generators.pcph_gan import SourceModulePCPH
 
 
 # ---------------------------------------------------------------------------
-# ConvNeXt Backbone (adapted from fish-vocoder)
+# ConvNeXt Backbone
 # ---------------------------------------------------------------------------
-
-def drop_path(x, drop_prob: float = 0.0, training: bool = False, scale_by_keep: bool = True):
-    if drop_prob == 0.0 or not training:
-        return x
-    keep_prob = 1 - drop_prob
-    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-    random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
-    if keep_prob > 0.0 and scale_by_keep:
-        random_tensor.div_(keep_prob)
-    return x * random_tensor
-
-
-class DropPath(nn.Module):
-    def __init__(self, drop_prob: float = 0.0, scale_by_keep: bool = True):
-        super().__init__()
-        self.drop_prob = drop_prob
-        self.scale_by_keep = scale_by_keep
-
-    def forward(self, x):
-        return drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
 
 
 class GlobalResponseNorm(nn.Module):
-    """Global Response Normalization (ConvNeXt V2) in channels-last format (B, T, C).
-
-    Normalises each channel's response relative to the global aggregate,
-    encouraging feature diversity. Initialised as identity (gamma=beta=0)
-    so it is safe to add to any pretrained model and has no effect until
-    trained.
+    """
+    Global Response Normalization (ConvNeXt V2) in channels-last format (B, T, C).
+    Normalises each channel's response relative to the global aggregate.
     """
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, eps: float = 1e-6):
         super().__init__()
         self.gamma = nn.Parameter(torch.zeros(1, 1, channels))
         self.beta  = nn.Parameter(torch.zeros(1, 1, channels))
+        self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, C) from ConvNeXtBlock's permuted representation
-        gx = torch.norm(x, p=2, dim=1, keepdim=True)          # (B, 1, C)
-        nx = gx / (gx.mean(dim=2, keepdim=True) + 1e-6)       # (B, 1, C)
-        return self.gamma * (x * nx) + self.beta + x
+        gx = torch.linalg.vector_norm(x, ord=2, dim=1, keepdim=True)
+        nx = gx / (gx.mean(dim=2, keepdim=True) + self.eps)
+        return x * nx * self.gamma + self.beta
 
 
 class ConvNeXtLayerNorm(nn.Module):
@@ -84,12 +59,8 @@ class ConvNeXtLayerNorm(nn.Module):
 
     def forward(self, x):
         if self.data_format == "channels_last":
-            # F.layer_norm upcasts to FP32 internally — safe for BF16/FP16.
             return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
         elif self.data_format == "channels_first":
-            # Manual implementation: upcast to FP32 for numerical stability
-            # when running in BF16 (BF16 has only 7 mantissa bits; variance
-            # computed in BF16 loses precision and destabilises training).
             orig_dtype = x.dtype
             x = x.float()
             u = x.mean(1, keepdim=True)
@@ -101,68 +72,65 @@ class ConvNeXtLayerNorm(nn.Module):
 
 class ConvNeXtBlock(nn.Module):
     """
-    ConvNeXt Block: DwConv -> Permute -> LayerNorm -> Linear -> GELU -> Linear -> Permute -> DropPath
+    ConvNeXt Block: DwConv -> Permute -> LayerNorm -> Linear -> GELU -> GRN -> Linear -> Permute
     """
 
-    def __init__(self, dim: int, drop_path_rate: float = 0.0,
-                 layer_scale_init_value: float = 1e-6, mlp_ratio: float = 4.0,
-                 kernel_size: int = 7, dilation: int = 1):
+    def __init__(self, dim: int, layer_scale_init_value: float = 1e-6, 
+                 mlp_ratio: float = 4.0, kernel_size: int = 7, dilation: int = 1):
         super().__init__()
         self.dwconv = nn.Conv1d(
             dim, dim, kernel_size=kernel_size,
             padding=int(dilation * (kernel_size - 1) / 2),
-            groups=dim,
+            groups=dim, bias=True,
         )
         self.norm = ConvNeXtLayerNorm(dim, eps=1e-6)
-        self.pwconv1 = nn.Linear(dim, int(mlp_ratio * dim))
+        
+        hidden_dim = int(mlp_ratio * dim)
+        self.pwconv1 = nn.Linear(dim, hidden_dim)
         self.act = nn.GELU()
-        self.grn = GlobalResponseNorm(int(mlp_ratio * dim))  # ConvNeXt V2 GRN
-        self.pwconv2 = nn.Linear(int(mlp_ratio * dim), dim)
+        self.grn = GlobalResponseNorm(hidden_dim)
+        self.pwconv2 = nn.Linear(hidden_dim, dim)
+        
         self.gamma = (
             nn.Parameter(layer_scale_init_value * torch.ones(dim), requires_grad=True)
             if layer_scale_init_value > 0 else None
         )
-        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
 
     def forward(self, x, apply_residual: bool = True):
         residual = x
         x = self.dwconv(x)
-        x = x.permute(0, 2, 1)  # (N, C, L) -> (N, L, C)
+        x = x.transpose(1, 2)
         x = self.norm(x)
         x = self.pwconv1(x)
         x = self.act(x)
-        x = self.grn(x)           # GRN: feature diversity
+        x = self.grn(x)
         x = self.pwconv2(x)
+        
         if self.gamma is not None:
             x = self.gamma * x
-        x = x.permute(0, 2, 1)  # (N, L, C) -> (N, C, L)
-        x = self.drop_path(x)
+        
+        x = x.transpose(1, 2)
+        
         if apply_residual:
             x = residual + x
         return x
 
 
 class ConvNeXtEncoder(nn.Module):
-    """
-    Multi-stage ConvNeXt encoder. Processes mel/latent features into a deeper
-    representation for the HiFiGAN head.
-    """
+    """Multi-stage ConvNeXt encoder."""
 
     def __init__(
         self,
         input_channels: int = 192,
         depths: list = [3, 3, 9, 3],
         dims: list = [128, 256, 384, 512],
-        drop_path_rate: float = 0.2,
         layer_scale_init_value: float = 1e-6,
         kernel_size: int = 7,
-        checkpointing: bool = False,
     ):
         super().__init__()
         assert len(depths) == len(dims)
 
         self.downsample_layers = nn.ModuleList()
-        # Stem
         stem = nn.Sequential(
             nn.Conv1d(input_channels, dims[0], kernel_size=kernel_size,
                       padding=kernel_size // 2, padding_mode="zeros"),
@@ -170,7 +138,6 @@ class ConvNeXtEncoder(nn.Module):
         )
         self.downsample_layers.append(stem)
 
-        # Intermediate transition layers
         for i in range(len(depths) - 1):
             mid_layer = nn.Sequential(
                 ConvNeXtLayerNorm(dims[i], eps=1e-6, data_format="channels_first"),
@@ -178,25 +145,19 @@ class ConvNeXtEncoder(nn.Module):
             )
             self.downsample_layers.append(mid_layer)
 
-        # ConvNeXt stages
         self.stages = nn.ModuleList()
-        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
-        cur = 0
         for i in range(len(depths)):
             stage = nn.Sequential(*[
                 ConvNeXtBlock(
                     dim=dims[i],
-                    drop_path_rate=dp_rates[cur + j],
                     layer_scale_init_value=layer_scale_init_value,
                     kernel_size=kernel_size,
                 )
                 for j in range(depths[i])
             ])
             self.stages.append(stage)
-            cur += depths[i]
 
         self.norm = ConvNeXtLayerNorm(dims[-1], eps=1e-6, data_format="channels_first")
-        self.checkpointing = checkpointing
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -207,17 +168,13 @@ class ConvNeXtEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for i in range(len(self.downsample_layers)):
-            if self.training and self.checkpointing:
-                x = checkpoint(self.downsample_layers[i], x, use_reentrant=False)
-                x = checkpoint(self.stages[i], x, use_reentrant=False)
-            else:
-                x = self.downsample_layers[i](x)
-                x = self.stages[i](x)
+            x = self.downsample_layers[i](x)
+            x = self.stages[i](x)
         return self.norm(x)
 
 
 # ---------------------------------------------------------------------------
-# HiFiGAN-PCPH Head (processes ConvNeXt backbone output with PCPH injection)
+# HiFiGAN-PCPH Head
 # ---------------------------------------------------------------------------
 
 def get_padding(kernel_size, dilation=1):
@@ -225,46 +182,55 @@ def get_padding(kernel_size, dilation=1):
 
 
 def init_weights(m, mean=0.0, std=0.01):
+    """Initialize weights with normal distribution."""
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
         m.weight.data.normal_(mean, std)
+        
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
 
 
-def _make_sinc_lowpass(channels: int, kernel_size: int, cutoff: float) -> nn.Conv1d:
+def _make_sinc_lowpass(channels: int, kernel_size: int, cutoff: float, freeze: bool = True) -> nn.Conv1d:
     """
-    Create a depthwise Conv1d initialized as a Hamming-windowed sinc low-pass filter.
-
+    Create a depthwise Conv1d initialized as a Blackman-windowed sinc low-pass filter.
+    Uses Blackman window for better stopband attenuation (-74dB vs -43dB Hamming).
+    
     Args:
-        channels:    number of input/output channels (depthwise: groups=channels)
-        kernel_size: filter length (odd recommended; 5 gives better rolloff than 3)
-        cutoff:      normalized cutoff frequency in (0, 0.5], where 0.5 = Nyquist.
-                     For an upsampling stage with rate u, pass cutoff = 0.5 / u.
+        channels: Number of channels
+        kernel_size: Filter kernel size
+        cutoff: Normalized cutoff frequency (0 to 0.5)
+        freeze: If True, freeze filter weights to preserve anti-aliasing properties
     """
     conv = nn.Conv1d(channels, channels, kernel_size=kernel_size,
                      padding=kernel_size // 2, groups=channels, bias=False)
 
     k = kernel_size
     center = (k - 1) / 2.0
-    n = torch.arange(k, dtype=torch.float64) - center  # [-c, ..., 0, ..., c]
+    n = torch.arange(k, dtype=torch.float64) - center
 
-    # Sinc kernel: h[n] = 2*fc * sinc(2*pi*fc*n)
     eps = 1e-8
     h = torch.where(
         n.abs() < eps,
         torch.full_like(n, 2.0 * cutoff),
-        torch.sin(2.0 * math.pi * cutoff * n) / (math.pi * n + eps)
+        torch.sin(2.0 * math.pi * cutoff * n) / (math.pi * n)
     )
 
-    # Hamming window: better sidelobe attenuation than Hann for short kernels
-    hamming = 0.54 - 0.46 * torch.cos(2.0 * math.pi * torch.arange(k, dtype=torch.float64) / (k - 1))
-    h = h * hamming
-    h = h / h.sum()  # unity DC gain
+    blackman_n = torch.arange(k, dtype=torch.float64)
+    blackman = (0.42 
+                - 0.5 * torch.cos(2.0 * math.pi * blackman_n / (k - 1))
+                + 0.08 * torch.cos(4.0 * math.pi * blackman_n / (k - 1)))
+    
+    h = h * blackman
+    h = h / h.sum()
 
-    # Broadcast to all channels (depthwise: out_ch=in_ch, each with kernel [1, k])
     h_init = h.float().view(1, 1, k).expand(channels, 1, k).contiguous()
 
     with torch.no_grad():
         conv.weight.copy_(h_init)
+    
+    if freeze:
+        conv.weight.requires_grad_(False)
 
     return conv
 
@@ -273,12 +239,6 @@ class HiFiGANNSFHead(nn.Module):
     """
     HiFiGAN generator head with NSF source injection and SnakeBeta activations.
     Takes backbone features + f0 and generates audio waveform.
-
-    SnakeBeta replaces LeakyReLU in both the upsample loop and the residual
-    blocks. The periodic nature of Snake (x + 1/β · sin²(αx)) is fundamentally
-    better at modelling audio sinusoidal components than a piecewise-linear
-    activation; this is the core architectural improvement from BigVGAN.
-    Cost is negligible: two trainable scalars (α, β) per channel per layer.
     """
 
     def __init__(
@@ -291,58 +251,36 @@ class HiFiGANNSFHead(nn.Module):
         upsample_initial_channel: int = 512,
         gin_channels: int = 256,
         sr: int = 48000,
-        checkpointing: bool = False,
         pre_conv_kernel_size: int = 13,
         post_conv_kernel_size: int = 13,
     ):
         super().__init__()
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
-        self.checkpointing = checkpointing
-        self.lrelu_slope = LRELU_SLOPE
 
         self.upp = math.prod(upsample_rates)
-        # PCPH source: sums all harmonics up to Nyquist — band-limited by construction,
-        # no aliasing vs the old single-sine NSF source.
-        self.m_source = SourceModulePCPH(
-            sample_rate=sr,
-            hop_length=self.upp,
-            random_init_phase=True,
-            power_factor=0.1,
-            add_noise_std=0.003,
-            use_pchip=True,
-        )
 
-        # Pre-conv to map backbone output channels to upsample_initial_channel
         self.conv_pre = weight_norm(nn.Conv1d(
             input_channels, upsample_initial_channel,
             pre_conv_kernel_size, 1,
             padding=get_padding(pre_conv_kernel_size),
         ))
 
-        # SnakeBeta activations before each upsample stage.
-        # One per stage, each with its own learnable α/β per channel.
         self.pre_snake = nn.ModuleList()
-
-        # Upsampling layers
         self.ups = nn.ModuleList()
-        self.noise_convs = nn.ModuleList()
-        # Learned depthwise anti-aliasing filters after each upsample stage.
-        # Acts as a trainable low-pass filter suppressing aliased components
-        # introduced by ConvTranspose1d (mirrors/reflections in spectrogram).
+        self.har_convs = nn.ModuleList()
         self.anti_alias_convs = nn.ModuleList()
 
-        channels = [
+        self.channels = [
             upsample_initial_channel // (2 ** (i + 1))
             for i in range(len(upsample_rates))
         ]
-        stride_f0s = [
+        self.stride_f0s = [
             math.prod(upsample_rates[i + 1:]) if i + 1 < len(upsample_rates) else 1
             for i in range(len(upsample_rates))
         ]
 
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
-            # SnakeBeta activation for this upsample stage's input channels
             self.pre_snake.append(
                 SnakeBeta(upsample_initial_channel // (2 ** i),
                           alpha_trainable=True, alpha_logscale=True)
@@ -356,71 +294,59 @@ class HiFiGANNSFHead(nn.Module):
             self.ups.append(
                 weight_norm(nn.ConvTranspose1d(
                     upsample_initial_channel // (2 ** i),
-                    channels[i],
+                    self.channels[i],
                     k, u,
                     padding=padding,
                     output_padding=u % 2,
                 ))
             )
 
-            # Depthwise sinc low-pass filter to suppress aliasing from ConvTranspose1d.
-            # Initialized as a Hamming-windowed sinc with cutoff = 0.5/u so it
-            # attenuates the aliased spectral copies introduced by upsampling rate u.
-            # Initialized BEFORE weight_norm so the parametrization starts from the
-            # correct low-pass direction (prevents early convergence to spurious
-            # frequencies such as sr/4 = 8 kHz at 32 kHz training).
-            aa_kernel = 5  # 5-tap gives ~40 dB rolloff vs ~20 dB for 3-tap
-            
-            # For small upsample rates (2×), the aliased images are well-separated
-            # and a gentler cutoff preserves HF content (15-16 kHz).
+            # Scaled anti-alias kernel: larger for high upsampling rates, smaller for low
+            # u=8 → 17 taps (excellent stopband), u=2 → 5 taps (sufficient, no overhead)
+            aa_kernel = max(5, u * 2 + 1)
             if u <= 2:
-                aa_cutoff = 0.45 / u  # For u=2: 0.225 → cuts at ~21.6 kHz @ 48 kHz
+                aa_cutoff = 0.45 / u
             else:
-                aa_cutoff = 0.5 / u   # Higher rates need tighter filtering
+                aa_cutoff = 0.5 / u
                 
-            aa_conv = _make_sinc_lowpass(channels[i], aa_kernel, aa_cutoff)
-            self.anti_alias_convs.append(weight_norm(aa_conv))
+            aa_conv = _make_sinc_lowpass(self.channels[i], aa_kernel, aa_cutoff, freeze=True)
+            self.anti_alias_convs.append(aa_conv)
 
-            # NSF source injection convs
-            stride = stride_f0s[i]
+            stride = self.stride_f0s[i]
             kernel = 1 if stride == 1 else stride * 2 - stride % 2
             pad = 0 if stride == 1 else (kernel - stride) // 2
-            self.noise_convs.append(
-                nn.Conv1d(1, channels[i], kernel_size=kernel, stride=stride, padding=pad)
+            
+            self.har_convs.append(
+                nn.Conv1d(1, self.channels[i], kernel_size=kernel, stride=stride, padding=pad)
             )
 
-        # Residual blocks with SnakeBeta activations (BigVGAN-style).
-        # ResBlock_SnakeBeta uses per-layer learnable periodic activations
-        # instead of LeakyReLU, capturing harmonic structure much better.
-        # post_act=False: removes the optional 3rd BigVGAN-v2 post-residual
-        # SnakeBeta per dilation step (36 extra ops across 12 resblocks × 3
-        # dilations).  The core 2-activation-per-step structure is preserved.
-        from rvc.lib.algorithm.residuals import ResBlock_SnakeBeta
         self.resblocks = nn.ModuleList([
-            ResBlock_SnakeBeta(channels[i], k, d, post_act=False)
+            ResBlock_SnakeBeta(self.channels[i], k, d, post_act=False)
             for i in range(len(self.ups))
             for k, d in zip(resblock_kernel_sizes, resblock_dilation_sizes)
         ])
 
-        # Final SnakeBeta before conv_post
         self.post_snake = SnakeBeta(
-            channels[-1], alpha_trainable=True, alpha_logscale=True
+            self.channels[-1], alpha_trainable=True, alpha_logscale=True
         )
 
-        # Post-conv
         self.conv_post = weight_norm(nn.Conv1d(
-            channels[-1], 1,
+            self.channels[-1], 1,
             post_conv_kernel_size, 1,
             padding=get_padding(post_conv_kernel_size),
         ))
 
         self.ups.apply(init_weights)
-        # anti_alias_convs are already initialized as sinc; no random re-init.
-        self.conv_post.apply(init_weights)
+        
+        # Zero-init conv_post for stable training start (generator begins emitting silence)
+        nn.init.zeros_(self.conv_post.weight)
+        nn.init.zeros_(self.conv_post.bias)
 
-        # Speaker conditioning
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
+            nn.init.normal_(self.cond.weight, mean=0.0, std=0.01)
+            if self.cond.bias is not None:
+                nn.init.constant_(self.cond.bias, 0.0)
 
     def forward(self, x: torch.Tensor, har_source: torch.Tensor,
                 g: Optional[torch.Tensor] = None):
@@ -435,27 +361,18 @@ class HiFiGANNSFHead(nn.Module):
         if g is not None:
             x = x + self.cond(g)
 
-        for i, (ups, noise_convs) in enumerate(zip(self.ups, self.noise_convs)):
+        for i in range(self.num_upsamples):
             x = self.pre_snake[i](x)
-
-            if self.training and self.checkpointing:
-                x = checkpoint(ups, x, use_reentrant=False)
-                x = checkpoint(self.anti_alias_convs[i], x, use_reentrant=False)
-                x = x + noise_convs(har_source)
-                xs = sum([
-                    checkpoint(resblock, x, use_reentrant=False)
-                    for j, resblock in enumerate(self.resblocks)
-                    if j in range(i * self.num_kernels, (i + 1) * self.num_kernels)
-                ])
-            else:
-                x = ups(x)
-                x = self.anti_alias_convs[i](x)
-                x = x + noise_convs(har_source)
-                xs = sum([
-                    resblock(x)
-                    for j, resblock in enumerate(self.resblocks)
-                    if j in range(i * self.num_kernels, (i + 1) * self.num_kernels)
-                ])
+            x = self.ups[i](x)
+            x = self.anti_alias_convs[i](x)
+            
+            har_out = self.har_convs[i](har_source)
+            min_len = min(x.shape[-1], har_out.shape[-1])
+            x = x[..., :min_len] + har_out[..., :min_len]
+            
+            start_idx = i * self.num_kernels
+            xs = sum(self.resblocks[start_idx + j](x) for j in range(self.num_kernels))
+            
             x = xs / self.num_kernels
 
         x = self.post_snake(x)
@@ -464,13 +381,14 @@ class HiFiGANNSFHead(nn.Module):
         return x
 
     def remove_weight_norm(self):
+        remove_parametrizations(self.conv_pre)
+        
         for l in self.ups:
             remove_parametrizations(l)
-        for l in self.anti_alias_convs:
-            remove_parametrizations(l)
+        
         for l in self.resblocks:
             l.remove_weight_norm()
-        remove_parametrizations(self.conv_pre)
+        
         remove_parametrizations(self.conv_post)
 
 
@@ -502,29 +420,21 @@ class ChouwaGANGenerator(nn.Module):
         upsample_kernel_sizes: list,
         gin_channels: int,
         sr: int,
-        checkpointing: bool = False,
-        # ConvNeXt backbone config
         backbone_depths: list = [3, 3, 4, 3],
         backbone_dims: list = [96, 192, 256, 320],
-        backbone_drop_path_rate: float = 0.2,
         backbone_kernel_size: int = 7,
     ):
         super().__init__()
-        self.checkpointing = checkpointing
 
-        # ConvNeXt backbone: maps VITS latent (initial_channel) -> backbone output (backbone_dims[-1])
         self.backbone = ConvNeXtEncoder(
             input_channels=initial_channel,
             depths=backbone_depths,
             dims=backbone_dims,
-            drop_path_rate=backbone_drop_path_rate,
             kernel_size=backbone_kernel_size,
-            checkpointing=checkpointing,
         )
 
         backbone_out_channels = backbone_dims[-1]
 
-        # HiFiGAN-NSF head: maps backbone features + f0 harmonic source -> audio
         self.head = HiFiGANNSFHead(
             input_channels=backbone_out_channels,
             upsample_rates=upsample_rates,
@@ -534,12 +444,19 @@ class ChouwaGANGenerator(nn.Module):
             upsample_initial_channel=upsample_initial_channel,
             gin_channels=gin_channels,
             sr=sr,
-            checkpointing=checkpointing,
         )
 
-        # Store total upsampling factor and share source module reference
         self.upp = math.prod(upsample_rates)
-        self.m_source = self.head.m_source
+        
+        self.m_source = SourceModulePCPH(
+            sample_rate=sr,
+            hop_length=self.upp,
+            random_init_phase=True,
+            power_factor=0.1,
+            add_noise_std=0.003,
+            use_pchip=True,
+        )
+
 
     def forward(
         self, x: torch.Tensor, f0: torch.Tensor, g: Optional[torch.Tensor] = None
@@ -553,17 +470,15 @@ class ChouwaGANGenerator(nn.Module):
         Returns:
             Audio waveform [B, 1, T_audio]
         """
-        # Generate band-limited PCPH harmonic source from f0.
-        # SourceModulePCPH returns [B, 1, T_audio] directly (no transpose needed),
-        # unlike the old NSF source which returned [B, T_audio, 1].
-        har_source = self.m_source(f0, self.upp)  # [B, 1, T_audio]
-
-        # Encode through ConvNeXt backbone
+        if x.shape[-1] != f0.shape[-1]:
+            raise ValueError(
+                f"Temporal dimension mismatch: x has {x.shape[-1]} frames, "
+                f"f0 has {f0.shape[-1]} frames. They must match."
+            )
+        
+        har_source = self.m_source(f0, self.upp)
         x = self.backbone(x)
-
-        # Synthesize through HiFiGAN-NSF head
         x = self.head(x, har_source, g=g)
-
         return x
 
     def remove_weight_norm(self):
