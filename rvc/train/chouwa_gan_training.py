@@ -19,8 +19,8 @@ import torch.nn.functional as F
 
 CHOUWA_GRAD_CLIP_D = 10.0       # Discriminator gradient clipping threshold
 CHOUWA_GRAD_CLIP_G = 150.0      # Generator gradient clipping threshold
-CHOUWA_C_FM = 6.0               # Feature matching loss weight
-CHOUWA_C_HF = 5.0               # High-frequency reconstruction loss weight
+CHOUWA_C_FM = 5.0               # Feature matching loss weight
+CHOUWA_C_HF = 4.0               # High-frequency reconstruction loss weight
 CHOUWA_R1_GAMMA = 0.0           # R1 penalty coefficient (disabled by default)
 CHOUWA_R1_INTERVAL = 16         # R1 penalty application interval
 CHOUWA_D_REAL_LABEL = 1.0       # Real label value for discriminator
@@ -345,22 +345,27 @@ class HighFrequencyReconstructionLoss(nn.Module):
             loss_hf = F.l1_loss(mag_y_hat[:, hf_bin:, :], mag_y[:, hf_bin:, :])
             
             # High frequency phase loss (Instantaneous Frequency Deviation)
-            # Extract HF region once for both real and generated
+            # To avoid catastrophic gradients from `torch.angle(z)` when |z| ≈ 0,
+            # we compute IFD differences in the complex domain without explicit angles.
             Y_hf = Y[:, hf_bin:, :]
             Y_hat_hf = Y_hat[:, hf_bin:, :]
             
-            # Compute phase difference efficiently
-            phase_y = Y_hf.angle()
-            phase_y_hat = Y_hat_hf.angle()
+            # 1. Normalize complex vectors to unit circle (with epsilon)
+            Y_hf_norm = Y_hf / (mag_y[:, hf_bin:, :] + 1e-8)
+            Y_hat_hf_norm = Y_hat_hf / (mag_y_hat[:, hf_bin:, :] + 1e-8)
             
-            # IFD computation
-            ifd_y = torch.diff(phase_y, dim=-1)
-            ifd_y_hat = torch.diff(phase_y_hat, dim=-1)
+            # 2. Compute instantaneous frequency (phase difference between adjacent time steps)
+            # Y(t) * conj(Y(t-1)) gives a complex number whose angle is phase(t) - phase(t-1)
+            ifd_complex_y = Y_hf_norm[..., 1:] * Y_hf_norm[..., :-1].conj()
+            ifd_complex_hat = Y_hat_hf_norm[..., 1:] * Y_hat_hf_norm[..., :-1].conj()
             
-            # Wrap phase difference to [-π, π] (vectorized)
-            phase_diff = ifd_y_hat - ifd_y
-            phase_diff = torch.atan2(torch.sin(phase_diff), torch.cos(phase_diff))
-            loss_phase_hf = phase_diff.abs().mean()
+            # 3. Compute error between IFDs
+            # ifd_hat * conj(ifd_y) gives a complex number representing the IFD error
+            ifd_error_complex = ifd_complex_hat * ifd_complex_y.conj()
+            
+            # 4. Phase loss = 1 - cos(phase_error)
+            # The real part of a unit complex number is cos(angle)
+            loss_phase_hf = (1.0 - ifd_error_complex.real).mean()
             
             # Perceptual weighting: weight by frequency importance
             # Higher frequencies are perceptually less important, so we can
@@ -368,11 +373,12 @@ class HighFrequencyReconstructionLoss(nn.Module):
             freq_weight = 1.0 - (idx / len(self.n_ffts)) * 0.2  # 1.0 -> 0.8
             
             # Accumulate losses for this scale with perceptual weighting
-            total_loss += freq_weight * (loss_lf + self.hf_weight * loss_hf + 2.0 * loss_phase_hf)
+            # Increased phase weight slightly since 1-cos(theta) has a smaller range than |theta|
+            total_loss += freq_weight * (loss_lf + self.hf_weight * loss_hf + 3.0 * loss_phase_hf)
             
             # Free memory immediately
-            del Y, Y_hat, mag_y, mag_y_hat, Y_hf, Y_hat_hf, phase_y, phase_y_hat
-            del ifd_y, ifd_y_hat, phase_diff
+            del Y, Y_hat, mag_y, mag_y_hat, Y_hf, Y_hat_hf, Y_hf_norm, Y_hat_hf_norm
+            del ifd_complex_y, ifd_complex_hat, ifd_error_complex
         
         return total_loss / len(self.n_ffts)
 

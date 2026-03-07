@@ -74,7 +74,7 @@ class HighFrequencySubBandDiscriminator(nn.Module):
         x_float = x_squeezed.float() if x_squeezed.dtype != torch.float32 else x_squeezed
         
         pad = (self.n_fft - self.hop) // 2
-        x_float = F.pad(x_float, (pad, pad), mode="reflect")
+        x_float = F.pad(x_float, (pad, pad), mode="constant")
         stft = torch.stft(
             x_float, self.n_fft, self.hop, self.n_fft,
             window=self.window.to(dtype=x_float.dtype, device=x_float.device), 
@@ -188,7 +188,7 @@ class DiscriminatorSTFT(nn.Module):
         x_float = x_squeezed.float() if x_squeezed.dtype != torch.float32 else x_squeezed
         
         pad = (self.n_fft - self.hop_length) // 2
-        x_float = F.pad(x_float, (pad, pad), mode="reflect")
+        x_float = F.pad(x_float, (pad, pad), mode="constant")
         stft = torch.stft(
             x_float,
             n_fft=self.n_fft,
@@ -263,7 +263,7 @@ class DiscriminatorR(nn.Module):
         x_float = x_squeezed.float() if x_squeezed.dtype != torch.float32 else x_squeezed
         
         pad = (n_fft - hop_length) // 2
-        x_float = F.pad(x_float, (pad, pad), mode="reflect")
+        x_float = F.pad(x_float, (pad, pad), mode="constant")
         stft = torch.stft(
             x_float, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
             window=self.window.to(dtype=x_float.dtype, device=x_float.device), 
