@@ -371,12 +371,12 @@ def get_d_model(config, vocoder, use_checkpointing):
             **mrd_config
         )
     elif vocoder == "ChouwaGAN":
-        from rvc.lib.algorithm.discriminators.multi import MSSTFT_MRD_Combined
-        # MS-STFT + MRD (frequency-domain only, lightweight, balanced)
+        from rvc.lib.algorithm.discriminators.multi import ChouwaGANDiscriminator
+        # MS-STFT + FastMPD + UnivHD (frequency + time-domain, ~2.7M params)
         chouwa_cfg = dict(config.mrd) if hasattr(config, "mrd") else {}
-        sample_rate = config.data.sample_rate if hasattr(config.data, "sample_rate") else 40000
-        return MSSTFT_MRD_Combined(
-            config.model.use_spectral_norm,
+        sample_rate = config.data.sample_rate if hasattr(config.data, "sample_rate") else 48000
+        return ChouwaGANDiscriminator(
+            use_spectral_norm=config.model.use_spectral_norm,
             use_checkpointing=use_checkpointing,
             sample_rate=sample_rate,
             **chouwa_cfg

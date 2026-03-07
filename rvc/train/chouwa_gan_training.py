@@ -17,10 +17,10 @@ import torch.nn.functional as F
 # Training Constants
 # ══════════════════════════════════════════════════════════════════════════════
 
-CHOUWA_GRAD_CLIP_D = 10.0       # Discriminator gradient clipping threshold
-CHOUWA_GRAD_CLIP_G = 150.0      # Generator gradient clipping threshold
-CHOUWA_C_FM = 5.0               # Feature matching loss weight
-CHOUWA_C_HF = 4.0               # High-frequency reconstruction loss weight
+CHOUWA_GRAD_CLIP_D = 5.0        # Discriminator gradient clipping threshold (FIX #4)
+CHOUWA_GRAD_CLIP_G = 10.0       # Generator gradient clipping threshold (FIX #4)
+CHOUWA_C_FM = 2.0               # Feature matching loss weight (FIX #3)
+CHOUWA_C_HF = 1.0               # High-frequency reconstruction loss weight (FIX #3)
 CHOUWA_R1_GAMMA = 0.0           # R1 penalty coefficient (disabled by default)
 CHOUWA_R1_INTERVAL = 16         # R1 penalty application interval
 CHOUWA_D_REAL_LABEL = 1.0       # Real label value for discriminator
@@ -65,7 +65,7 @@ def softplus_d_loss(y_d_hat_r, y_d_hat_g):
         y_d_hat_g: List of discriminator scores for generated samples
     
     Returns:
-        loss_disc: Discriminator loss (not normalized by n_disc)
+        loss_disc: Discriminator loss (normalized by n_disc) (FIX #6)
         d_real_mean: Mean D(real) score for monitoring
         d_fake_mean: Mean D(fake) score for monitoring
     """
@@ -79,7 +79,7 @@ def softplus_d_loss(y_d_hat_r, y_d_hat_g):
         d_fake_sum += dg.detach().mean().item()
     
     n = len(y_d_hat_r)
-    return loss, d_real_sum / n, d_fake_sum / n
+    return loss / n, d_real_sum / n, d_fake_sum / n  # FIX #6: Normalize D loss
 
 
 def softplus_g_loss(y_d_hat_g, n_disc):
@@ -286,13 +286,13 @@ class HighFrequencyReconstructionLoss(nn.Module):
     """
     
     def __init__(self, sr=48000, n_ffts=[2048, 1024, 512],
-                 hf_start_hz=8000, hf_weight=10.0):
+                 hf_start_hz=8000, hf_weight=3.0):  # FIX #3: Reduced from 10.0
         """
         Args:
             sr: Sample rate
             n_ffts: List of FFT sizes for multi-scale analysis
             hf_start_hz: Frequency threshold for high-frequency region
-            hf_weight: Weight multiplier for high-frequency components
+            hf_weight: Weight multiplier for high-frequency components (FIX #3)
         """
         super().__init__()
         self.n_ffts = n_ffts
@@ -373,8 +373,8 @@ class HighFrequencyReconstructionLoss(nn.Module):
             freq_weight = 1.0 - (idx / len(self.n_ffts)) * 0.2  # 1.0 -> 0.8
             
             # Accumulate losses for this scale with perceptual weighting
-            # Increased phase weight slightly since 1-cos(theta) has a smaller range than |theta|
-            total_loss += freq_weight * (loss_lf + self.hf_weight * loss_hf + 3.0 * loss_phase_hf)
+            # FIX #3: Reduced phase weight from 3.0 to 1.0
+            total_loss += freq_weight * (loss_lf + self.hf_weight * loss_hf + 1.0 * loss_phase_hf)
             
             # Free memory immediately
             del Y, Y_hat, mag_y, mag_y_hat, Y_hf, Y_hat_hf, Y_hf_norm, Y_hat_hf_norm

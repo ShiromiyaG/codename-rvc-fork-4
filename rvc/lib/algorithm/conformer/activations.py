@@ -136,6 +136,10 @@ class SnakeBeta(nn.Module):
 
         alpha = alpha.float()
         beta = beta.float()
+        
+        # FIX #5: Clamp alpha and beta to prevent extreme gradients
+        alpha = alpha.clamp(max=100.0)
+        beta = beta.clamp(max=100.0)
 
         # In-place fused SnakeBeta: x + sin²(x·α)/(β+ε)
         # Original allocates 4 temp FP32 tensors (~16 MB each at typical batch

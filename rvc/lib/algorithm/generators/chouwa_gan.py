@@ -316,8 +316,9 @@ class HiFiGANNSFHead(nn.Module):
             kernel = 1 if stride == 1 else stride * 2 - stride % 2
             pad = 0 if stride == 1 else (kernel - stride) // 2
             
+            # FIX #1: Apply weight_norm to har_convs to prevent uncontrolled weight growth
             self.har_convs.append(
-                nn.Conv1d(1, self.channels[i], kernel_size=kernel, stride=stride, padding=pad)
+                weight_norm(nn.Conv1d(1, self.channels[i], kernel_size=kernel, stride=stride, padding=pad))
             )
 
         self.resblocks = nn.ModuleList([
@@ -337,6 +338,9 @@ class HiFiGANNSFHead(nn.Module):
         ))
 
         self.ups.apply(init_weights)
+        
+        # FIX #1: Apply init_weights to har_convs for controlled initialization
+        self.har_convs.apply(init_weights)
         
         # Zero-init conv_post for stable training start (generator begins emitting silence)
         nn.init.zeros_(self.conv_post.weight)
@@ -384,6 +388,10 @@ class HiFiGANNSFHead(nn.Module):
         remove_parametrizations(self.conv_pre)
         
         for l in self.ups:
+            remove_parametrizations(l)
+        
+        # FIX #1: Remove weight_norm from har_convs
+        for l in self.har_convs:
             remove_parametrizations(l)
         
         for l in self.resblocks:

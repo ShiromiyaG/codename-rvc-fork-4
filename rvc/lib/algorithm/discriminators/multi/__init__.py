@@ -4,3 +4,4 @@ from .mpd_msd_mrd_combined import MPD_MSD_MRD_Combined
 from .mpd_msd_mrd_combined_refinegan import MPD_MSD_MRD_Combined_RefineGan
 from .fastmpd_cqt_combined import FastMPD_CQT_Combined
 from .msstft_mrd_combined import MSSTFT_MRD_Combined
+from .msstft_fastmpd_univhd_combined import ChouwaGANDiscriminator

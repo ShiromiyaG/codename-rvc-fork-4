@@ -25,16 +25,22 @@ def phase_loss(x_fft: torch.Tensor, g_fft: torch.Tensor, reduction: str = 'mean'
 def feature_loss(fmap_r, fmap_g):
     """
     Compute the feature loss between reference and generated feature maps.
+    FIX #2: Normalized by total number of layers to prevent gradient explosion.
 
     Args:
         fmap_r (list of torch.Tensor): List of reference feature maps.
         fmap_g (list of torch.Tensor): List of generated feature maps.
     """
-    return 2 * sum(
-        torch.mean(torch.abs(rl - gl))
-        for dr, dg in zip(fmap_r, fmap_g)
-        for rl, gl in zip(dr, dg)
-    )
+    loss = 0.0
+    n_layers = 0
+    
+    for dr, dg in zip(fmap_r, fmap_g):
+        for rl, gl in zip(dr, dg):
+            loss += torch.mean(torch.abs(rl - gl))
+            n_layers += 1
+    
+    # FIX #2: Normalize by total number of layers (~45 with 9 discriminators)
+    return 2 * loss / n_layers
 
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs, real_label: float = 1.0):
