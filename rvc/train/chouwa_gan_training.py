@@ -17,13 +17,13 @@ import torch.nn.functional as F
 # Training Constants
 # ══════════════════════════════════════════════════════════════════════════════
 
-CHOUWA_GRAD_CLIP_D = 5.0        # Discriminator gradient clipping threshold (FIX #4)
+CHOUWA_GRAD_CLIP_D = 10.0       # Discriminator gradient clipping threshold (FIX #4)
 CHOUWA_GRAD_CLIP_G = 10.0       # Generator gradient clipping threshold (FIX #4)
 CHOUWA_C_FM = 2.0               # Feature matching loss weight (FIX #3)
 CHOUWA_C_HF = 1.0               # High-frequency reconstruction loss weight (FIX #3)
 CHOUWA_R1_GAMMA = 0.0           # R1 penalty coefficient (disabled by default)
 CHOUWA_R1_INTERVAL = 16         # R1 penalty application interval
-CHOUWA_D_REAL_LABEL = 1.0       # Real label value for discriminator
+CHOUWA_D_REAL_LABEL = 0.9       # Real label value for discriminator
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -65,7 +65,7 @@ def softplus_d_loss(y_d_hat_r, y_d_hat_g):
         y_d_hat_g: List of discriminator scores for generated samples
     
     Returns:
-        loss_disc: Discriminator loss (normalized by n_disc) (FIX #6)
+        loss_disc: Discriminator loss (unnormalized, normalization happens in train.py)
         d_real_mean: Mean D(real) score for monitoring
         d_fake_mean: Mean D(fake) score for monitoring
     """
@@ -79,7 +79,7 @@ def softplus_d_loss(y_d_hat_r, y_d_hat_g):
         d_fake_sum += dg.detach().mean().item()
     
     n = len(y_d_hat_r)
-    return loss / n, d_real_sum / n, d_fake_sum / n  # FIX #6: Normalize D loss
+    return loss, d_real_sum / n, d_fake_sum / n  # Let train.py handle normalization of the loss
 
 
 def softplus_g_loss(y_d_hat_g, n_disc):
@@ -148,7 +148,7 @@ def r1_penalty_eager(d_module, y_real, y_hat_d, loss_disc_in,
     r1_grad = torch.autograd.grad(
         outputs=[p.float().mean() for p in _d_real_r1],
         inputs=y_r1,
-        create_graph=False,
+        create_graph=True,
     )[0]
 
     r1_penalty = r1_grad.pow(2).reshape(r1_grad.shape[0], -1).mean(1).mean()
@@ -239,17 +239,30 @@ class AdaptiveBalancer:
         """
         Dynamic adversarial loss weight multiplier for G.
         
-        When D is very confident, boost the adversarial signal to G.
-        When D is weak, reduce it to let reconstruction losses dominate.
+        When D is weak, boost the adversarial signal to force G to adapt to D's specific features.
+        When D is confident, reduce it to prevent overwhelming G.
         Returns a multiplier in [0.5, 2.0].
         """
         gap = self.gap
-        if gap > 2.0:
-            # D too strong → boost adv signal to G (up to 2×)
-            return min(2.0, 1.0 + (gap - 2.0) * 0.25)
-        elif gap < 0.5:
-            # D too weak → reduce adv signal
-            return max(0.5, 0.5 + gap)
+        if gap < 0.5:
+            # D too weak → boost adv signal to G to force adaptation
+            return min(2.0, 1.0 + (0.5 - gap))
+        elif gap > 2.0:
+            # D too strong → reduce adv signal to prevent overwhelming G
+            return max(0.5, 1.0 - (gap - 2.0) * 0.25)
+        return 1.0
+
+    def d_lr_scale(self) -> float:
+        """
+        Dynamic LR multiplier for D.
+        Boosts LR up to 2.0x when D is weak (gap < 0.5).
+        Reduces LR down to 0.5x when D is strong (gap > 2.0).
+        """
+        gap = self.gap
+        if gap < 0.5:
+            return min(2.0, 1.0 + (0.5 - gap))
+        elif gap > 2.0:
+            return max(0.5, 1.0 - (gap - 2.0) * 0.25)
         return 1.0
 
     def get_log_dict(self):
@@ -259,6 +272,7 @@ class AdaptiveBalancer:
             "chouwa/d_fake_ema": self.d_fake_ema,
             "chouwa/d_gap": self.gap,
             "chouwa/adv_weight_scale": self.adv_weight_scale(),
+            "chouwa/d_lr_scale": self.d_lr_scale(),
             "chouwa/d_skipping": float(self._d_skipping),
         }
 
@@ -286,26 +300,34 @@ class HighFrequencyReconstructionLoss(nn.Module):
     """
     
     def __init__(self, sr=48000, n_ffts=[2048, 1024, 512],
-                 hf_start_hz=8000, hf_weight=3.0):  # FIX #3: Reduced from 10.0
+                 hf_start_hz=None, hf_weight=3.0):  # FIX #3: Reduced from 10.0
         """
         Args:
             sr: Sample rate
             n_ffts: List of FFT sizes for multi-scale analysis
-            hf_start_hz: Frequency threshold for high-frequency region
+            hf_start_hz: Frequency threshold for high-frequency region.
+                         Defaults to sr * 0.3 (~60% of Nyquist) to avoid
+                         coinciding with intermediate upsampling boundaries.
             hf_weight: Weight multiplier for high-frequency components (FIX #3)
         """
         super().__init__()
         self.n_ffts = n_ffts
         self.sr = sr
+        if hf_start_hz is None:
+            hf_start_hz = int(sr * 0.3)
         self.hf_start_hz = hf_start_hz
         self.hf_weight = hf_weight
         
-        # Pre-compute HF bin thresholds for each FFT size
-        self.hf_bins = [int(hf_start_hz / (sr / n_fft)) for n_fft in n_ffts]
-        
-        # Register Hann windows for each FFT size
+        # Register Hann windows and smooth HF masks for each FFT size
         for n_fft in self.n_ffts:
             self.register_buffer(f"window_{n_fft}", torch.hann_window(n_fft))
+            
+            # Smooth transition for HF masking (prevents gradient discontinuity)
+            freqs = torch.arange((n_fft // 2) + 1, dtype=torch.float32) * (sr / n_fft)
+            transition_width = 2000.0  # Smooth transition over 2kHz band
+            steepness = 4.0 / (transition_width / 2) # Sigma reaches ~0.88 at +/- 1kHz
+            weight = torch.sigmoid(steepness * (freqs - hf_start_hz))
+            self.register_buffer(f"weight_{n_fft}", weight.view(1, -1, 1))
     
     @torch._dynamo.disable(recursive=False)
     def forward(self, y_hat, y):
@@ -326,7 +348,7 @@ class HighFrequencyReconstructionLoss(nn.Module):
         for idx, n_fft in enumerate(self.n_ffts):
             hop = n_fft // 4
             window = getattr(self, f"window_{n_fft}")
-            hf_bin = self.hf_bins[idx]
+            hf_weight_mask = getattr(self, f"weight_{n_fft}")
             
             # Compute STFT (float32 for cuFFT)
             Y = torch.stft(y, n_fft, hop, n_fft,
@@ -338,47 +360,24 @@ class HighFrequencyReconstructionLoss(nn.Module):
             mag_y = Y.abs()
             mag_y_hat = Y_hat.abs()
             
-            # Low frequency magnitude loss (normal weight)
-            loss_lf = F.l1_loss(mag_y_hat[:, :hf_bin, :], mag_y[:, :hf_bin, :])
-            
             # High frequency magnitude loss (boosted weight)
-            loss_hf = F.l1_loss(mag_y_hat[:, hf_bin:, :], mag_y[:, hf_bin:, :])
-            
-            # High frequency phase loss (Instantaneous Frequency Deviation)
-            # To avoid catastrophic gradients from `torch.angle(z)` when |z| ≈ 0,
-            # we compute IFD differences in the complex domain without explicit angles.
-            Y_hf = Y[:, hf_bin:, :]
-            Y_hat_hf = Y_hat[:, hf_bin:, :]
-            
-            # 1. Normalize complex vectors to unit circle (with epsilon)
-            Y_hf_norm = Y_hf / (mag_y[:, hf_bin:, :] + 1e-8)
-            Y_hat_hf_norm = Y_hat_hf / (mag_y_hat[:, hf_bin:, :] + 1e-8)
-            
-            # 2. Compute instantaneous frequency (phase difference between adjacent time steps)
-            # Y(t) * conj(Y(t-1)) gives a complex number whose angle is phase(t) - phase(t-1)
-            ifd_complex_y = Y_hf_norm[..., 1:] * Y_hf_norm[..., :-1].conj()
-            ifd_complex_hat = Y_hat_hf_norm[..., 1:] * Y_hat_hf_norm[..., :-1].conj()
-            
-            # 3. Compute error between IFDs
-            # ifd_hat * conj(ifd_y) gives a complex number representing the IFD error
-            ifd_error_complex = ifd_complex_hat * ifd_complex_y.conj()
-            
-            # 4. Phase loss = 1 - cos(phase_error)
-            # The real part of a unit complex number is cos(angle)
-            loss_phase_hf = (1.0 - ifd_error_complex.real).mean()
+            # We ONLY compute HF magnitude. LF is covered by c_mel, and phase
+            # is covered by the MS-STFT discriminator + it descends too slowly.
+            # Using smooth mask instead of array slicing prevents gradient discontinuity.
+            diff = torch.abs(mag_y_hat - mag_y)
+            mask_sum = hf_weight_mask.sum() * diff.shape[0] * diff.shape[2]
+            loss_hf = (diff * hf_weight_mask).sum() / (mask_sum + 1e-8)
             
             # Perceptual weighting: weight by frequency importance
             # Higher frequencies are perceptually less important, so we can
             # slightly reduce their weight while still maintaining quality
             freq_weight = 1.0 - (idx / len(self.n_ffts)) * 0.2  # 1.0 -> 0.8
             
-            # Accumulate losses for this scale with perceptual weighting
-            # FIX #3: Reduced phase weight from 3.0 to 1.0
-            total_loss += freq_weight * (loss_lf + self.hf_weight * loss_hf + 1.0 * loss_phase_hf)
+            # Accumulate only HF magnitude loss
+            total_loss += freq_weight * self.hf_weight * loss_hf
             
             # Free memory immediately
-            del Y, Y_hat, mag_y, mag_y_hat, Y_hf, Y_hat_hf, Y_hf_norm, Y_hat_hf_norm
-            del ifd_complex_y, ifd_complex_hat, ifd_error_complex
+            del Y, Y_hat, mag_y, mag_y_hat
         
         return total_loss / len(self.n_ffts)
 

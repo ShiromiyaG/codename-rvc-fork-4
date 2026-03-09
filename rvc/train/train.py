@@ -958,8 +958,8 @@ def run(
     if vocoder == "ChouwaGAN":
         _actual_d = net_d.module if hasattr(net_d, 'module') else net_d
         n_disc = len(_actual_d.discriminators) if hasattr(_actual_d, 'discriminators') else 5
-        # Add 1 for the HF sub-band discriminator
-        if hasattr(_actual_d, 'hf_disc'):
+        # Add 1 for the UnivHD discriminator (replaces hf_disc)
+        if hasattr(_actual_d, 'univhd'):
             n_disc += 1
     else:
         n_disc = 1
@@ -970,7 +970,7 @@ def run(
     if vocoder == "ChouwaGAN":
         from rvc.train.chouwa_gan_training import AdaptiveBalancer, HighFrequencyReconstructionLoss
         
-        chouwa_balancer = AdaptiveBalancer(ema_decay=0.99, skip_threshold=5.0, resume_threshold=2.0)
+        chouwa_balancer = AdaptiveBalancer(ema_decay=0.99, skip_threshold=8.0, resume_threshold=3.0)
         
         # Load balancer state if resuming from checkpoint
         if chouwa_balancer_state is not None:
@@ -986,9 +986,9 @@ def run(
         print("    ██████  ChouwaGAN: Adaptive D/G balancer active")
         print("    ██████  ChouwaGAN: HF Reconstruction Loss active")
 
-    # Gradient clip ceiling for G — raised for ChouwaGAN so the adversarial
+    # Gradient clip ceiling for G — aligned with D so the adversarial
     # signal isn't overwhelmed after per-disc normalization.
-    grad_clip_g = 500.0 if vocoder == "ChouwaGAN" else 200.0
+    grad_clip_g = 10.0 if vocoder == "ChouwaGAN" else 200.0
 
     # Tensorboard handling
     if rank == 0:
@@ -1323,6 +1323,16 @@ def training_loop(
                         config.train.segment_size,
                         dim=3,
                     )
+                    
+                # Ensure exact length match. Interpolation-based generators
+                # can output 1-2 frames fewer than expected target due to padding
+                # differences vs ConvTranspose. Trim BOTH `y` and `y_hat` so ALL 
+                # subsequent discriminator and loss calculations match precisely.
+                min_len = min(y.shape[-1], y_hat.shape[-1])
+                if y.shape[-1] > min_len:
+                    y = y[..., :min_len]
+                if y_hat.shape[-1] > min_len:
+                    y_hat = y_hat[..., :min_len]
 
             if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
                 reshaped_y = y.view(-1, y.size(-1))
@@ -1345,7 +1355,7 @@ def training_loop(
                     from rvc.train.chouwa_gan_training import softplus_d_loss
                     loss_disc, d_real_mean, d_fake_mean = softplus_d_loss(y_d_hat_r, y_d_hat_g)
                 elif adversarial_loss == "lsgan":
-                    loss_disc = discriminator_loss(y_d_hat_r, y_d_hat_g, real_label=d_real_label)
+                    loss_disc, d_real_mean, d_fake_mean = discriminator_loss(y_d_hat_r, y_d_hat_g, real_label=d_real_label)
                 elif adversarial_loss == "tprls":
                     loss_disc = discriminator_loss_v2(y_d_hat_r, y_d_hat_g, real_label=d_real_label)
                 elif adversarial_loss == "hinge":
@@ -1365,7 +1375,7 @@ def training_loop(
                     from rvc.train.chouwa_gan_training import r1_penalty_eager
                     loss_disc = r1_penalty_eager(
                         net_d.module if hasattr(net_d, 'module') else net_d,
-                        y, y_hat, loss_disc,
+                        y, y_hat_detached, loss_disc,
                         r1_gamma, r1_interval, global_step,
                     )
 
@@ -1385,7 +1395,17 @@ def training_loop(
                     gradscaler.unscale_(optim_d)
                     scale = gradscaler.get_scale()
                     grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=grad_clip_d)
+                    
+                    if chouwa_balancer is not None:
+                        _d_scale = chouwa_balancer.d_lr_scale()
+                        for _pg in optim_d.param_groups:
+                            _pg["lr"] *= _d_scale
+                            
                     gradscaler.step(optim_d)
+                    
+                    if chouwa_balancer is not None:
+                        for _pg in optim_d.param_groups:
+                            _pg["lr"] /= _d_scale
                 else:
                     scale = gradscaler.get_scale()
                     grad_norm_d = torch.tensor(0.0, device=device)
@@ -1393,7 +1413,17 @@ def training_loop(
                 loss_disc_for_backward.backward()
                 if do_d_step:
                     grad_norm_d = torch.nn.utils.clip_grad_norm_(net_d.parameters(), max_norm=grad_clip_d)
+                    
+                    if chouwa_balancer is not None:
+                        _d_scale = chouwa_balancer.d_lr_scale()
+                        for _pg in optim_d.param_groups:
+                            _pg["lr"] *= _d_scale
+                            
                     optim_d.step()
+                    
+                    if chouwa_balancer is not None:
+                        for _pg in optim_d.param_groups:
+                            _pg["lr"] /= _d_scale
                 else:
                     grad_norm_d = torch.tensor(0.0, device=device)
                 scale = 1.0
@@ -1433,9 +1463,29 @@ def training_loop(
                 with autocast(device_type="cuda", enabled=False):
 
                     # Spectral loss (referenced as "loss_mel" for log consistency):
+                    
+                    # Ensure exact length match. Interpolation-based generators
+                    # can output 1-2 frames fewer than expected target due to padding
+                    # differences vs ConvTranspose. Trim the target 'y' to match 'y_hat'.
+                    min_len = min(y.shape[-1], y_hat.shape[-1])
+                    if y.shape[-1] > min_len:
+                        y = y[..., :min_len]
+                    if y_hat.shape[-1] > min_len:
+                        y_hat = y_hat[..., :min_len]
+                        
                     if spectral_loss == "L1 Mel Loss":
                         y_mel = wave_to_mel(config, y, half=train_dtype)
                         y_hat_mel = wave_to_mel(config, y_hat, half=train_dtype)
+                        
+                        # Guarantee exact frame match for STFT loss. A single sample difference
+                        # in the time domain (from interpolation padding) can occasionally result
+                        # in a 1-frame difference in the Mel-spectrogram output.
+                        min_mel_len = min(y_mel.shape[-1], y_hat_mel.shape[-1])
+                        if y_mel.shape[-1] > min_mel_len:
+                            y_mel = y_mel[..., :min_mel_len]
+                        if y_hat_mel.shape[-1] > min_mel_len:
+                            y_hat_mel = y_hat_mel[..., :min_mel_len]
+                            
                         loss_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
                     elif spectral_loss == "Multi-Scale Mel Loss":
                         loss_mel = fn_spectral_loss(y, y_hat) * config.train.c_mel / 3.0
@@ -1450,7 +1500,7 @@ def training_loop(
                         from rvc.train.chouwa_gan_training import softplus_g_loss
                         loss_adv = softplus_g_loss(y_d_hat_g, n_disc)
                     elif adversarial_loss == "lsgan":
-                        loss_adv = generator_loss(y_d_hat_g) / n_disc
+                        loss_adv = generator_loss(y_d_hat_g, real_label=d_real_label) / n_disc
                     elif adversarial_loss == "tprls":
                         y_d_hat_r_detached = [i.detach() for i in y_d_hat_r_g]
                         loss_adv = generator_loss_v2(y_d_hat_g, y_d_hat_r_detached) / n_disc
