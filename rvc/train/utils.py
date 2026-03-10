@@ -62,6 +62,9 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1, strict=T
     saved_state = checkpoint_dict["model"]
     if any(k.startswith("_orig_mod.") for k in saved_state):
         saved_state = {k.replace("_orig_mod.", "", 1): v for k, v in saved_state.items()}
+    
+    # Load the model state
+    model_state.load_state_dict(saved_state, strict=strict)
 
     if optimizer and load_opt == 1:
         opt_state = checkpoint_dict.get("optimizer")
