@@ -402,6 +402,8 @@ def get_chouwa_config(from_scratch: bool) -> dict:
         "grad_clip_d": CHOUWA_GRAD_CLIP_D,
         "c_fm": CHOUWA_C_FM,
         "c_hf": CHOUWA_C_HF,
+        "c_mel": 45.0,
+        "c_kl": 1.0,
         "r1_gamma": CHOUWA_R1_GAMMA,
         "r1_interval": CHOUWA_R1_INTERVAL,
         "d_real_label": CHOUWA_D_REAL_LABEL,
