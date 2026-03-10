@@ -255,8 +255,8 @@ class AdaptiveBalancer:
     def d_lr_scale(self) -> float:
         """
         Dynamic LR multiplier for D.
-        Boosts LR up to 2.0x when D is weak (gap < 0.5).
-        Reduces LR down to 0.5x when D is strong (gap > 2.0).
+        Boosts LR up to 2.0x when D is weak.
+        Reduces LR down to 0.5x when D is strong.
         """
         gap = self.gap
         if gap < 0.5:

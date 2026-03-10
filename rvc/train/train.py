@@ -211,7 +211,7 @@ use_trajectory = False
 #       'max-autotune-no-cudagraphs' runs Triton autotuning for best kernel
 #       tile sizes without requiring fixed shapes.  First step is slow (~2-5
 #       min while autotuning), steady-state is faster than 'default'.
-use_compile = True
+use_compile = False
 compile_mode = "max-autotune-no-cudagraphs"  # 'default' | 'max-autotune-no-cudagraphs'
 
 use_sid_swap = False
@@ -1254,7 +1254,7 @@ def training_loop(
         from rvc.train.chouwa_gan_training import get_chouwa_config
         _cc = get_chouwa_config(from_scratch)
         grad_clip_d, c_fm = _cc["grad_clip_d"], _cc["c_fm"]
-        c_hf = _cc["c_hf"]
+        c_hf, c_mel = _cc["c_hf"], _cc["c_mel"]
         r1_gamma, r1_interval = _cc["r1_gamma"], _cc["r1_interval"]
         d_real_label = _cc["d_real_label"]
         grad_accum_steps = _cc["grad_accum_steps"]
@@ -1486,9 +1486,11 @@ def training_loop(
                         if y_hat_mel.shape[-1] > min_mel_len:
                             y_hat_mel = y_hat_mel[..., :min_mel_len]
                             
-                        loss_mel = fn_spectral_loss(y_mel, y_hat_mel) * config.train.c_mel
+                        active_c_mel = c_mel if vocoder == "ChouwaGAN" else config.train.c_mel
+                        loss_mel = fn_spectral_loss(y_mel, y_hat_mel) * active_c_mel
                     elif spectral_loss == "Multi-Scale Mel Loss":
-                        loss_mel = fn_spectral_loss(y, y_hat) * config.train.c_mel / 3.0
+                        active_c_mel = c_mel if vocoder == "ChouwaGAN" else config.train.c_mel
+                        loss_mel = fn_spectral_loss(y, y_hat) * active_c_mel / 3.0
                     elif spectral_loss == "Multi-Res STFT Loss":
                         loss_mel = fn_spectral_loss(y_hat.float(), y.float()) * c_stft
 
@@ -1870,7 +1872,7 @@ def training_loop(
 
         # Check completion
         if epoch >= total_epoch_count:
-            print(f"Training has been successfully completed with {epoch} epoch, {global_step} steps and {round(loss_gen_total.item(), 3)} loss gen.")
+            print(f"Training has been successfully completed with {epoch} epoch and {global_step} steps.")
             # Final model
             weight_model_name = small_model_naming(model_name, epoch, global_step)
             model_add.append(os.path.join(experiment_dir, weight_model_name))

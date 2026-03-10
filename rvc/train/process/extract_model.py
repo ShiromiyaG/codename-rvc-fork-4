@@ -17,7 +17,11 @@ def replace_keys_in_dict(d, old_key_part, new_key_part):
     else:
         updated_dict = {}
     for key, value in d.items():
-        new_key = key.replace(old_key_part, new_key_part)
+        if isinstance(key, str) and key.endswith(old_key_part):
+            new_key = key[:-len(old_key_part)] + new_key_part
+        else:
+            new_key = key
+            
         if isinstance(value, dict):
             value = replace_keys_in_dict(value, old_key_part, new_key_part)
         updated_dict[new_key] = value
@@ -37,6 +41,7 @@ def extract_model(
     pitch_guidance=True,
     version="v2",
     vits2_mode=False,
+    v3_mode=False,
 ):
     try:
         model_dir = os.path.dirname(model_path)
@@ -56,11 +61,15 @@ def extract_model(
             data = json.load(f)
             model_author = data.get("model_author", None)
 
-        opt = OrderedDict(
-            weight={
-                key: value.half() for key, value in ckpt.items() if "enc_q" not in key
-            }
-        )
+        # Strip torch.compile's "_orig_mod." prefix so checkpoints are always portable
+        weight_dict = {}
+        for key, value in ckpt.items():
+            if "enc_q" not in key:
+                if key.startswith("_orig_mod."):
+                    key = key.replace("_orig_mod.", "", 1)
+                weight_dict[key] = value.half()
+
+        opt = OrderedDict(weight=weight_dict)
 
         # Base configuration list
         config_list = [
@@ -105,6 +114,7 @@ def extract_model(
         opt["vocoder"] = vocoder
         opt["vocoder_architecture"] = vocoder_architecture
         opt["vits2_mode"] = vits2_mode
+        opt["v3_mode"] = v3_mode
 
         if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
             opt["ringformer_istft"] = [
