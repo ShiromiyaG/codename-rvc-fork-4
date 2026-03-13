@@ -1506,8 +1506,8 @@ def parse_arguments():
     train_parser.add_argument(
         "--vits_version",
         type=str,
-        choices=["v1", "v2", "mod", "fast"],
-        help="VITS version to use: v1 (default), v2, mod, or fast.",
+        choices=["v1", "v2", "mod"],
+        help="VITS version to use: v1 (default), v2, or mod.",
         default="v1",
     )
     train_parser.add_argument(

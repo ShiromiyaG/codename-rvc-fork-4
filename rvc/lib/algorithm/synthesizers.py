@@ -8,7 +8,6 @@ from rvc.lib.algorithm.encoders import PosteriorEncoder # Posterior encoder, sha
 from rvc.lib.algorithm.encoders_vits2 import TextEncoder_VITS2
 from rvc.lib.algorithm.encoders import TextEncoder as TextEncoder_VITS1
 from rvc.lib.algorithm.modules_mod import PosteriorEncoderMod, ResidualCouplingBlockMod
-from rvc.lib.algorithm.modules_fast import FastPosteriorEncoder, FastCouplingBlock
 
 
 debug_shapes = False
@@ -170,26 +169,7 @@ class Synthesizer(torch.nn.Module):
                     gin_channels=gin_channels,
                     checkpointing=checkpointing,
                 )
-        if vits_version == "fast":
-            # Depthwise-separable conv posterior encoder + flow
-            self.enc_q = FastPosteriorEncoder(
-                spec_channels,
-                inter_channels,
-                hidden_channels,
-                kernel_size=7,
-                n_layers=8,
-                gin_channels=gin_channels,
-            )
-            self.flow = FastCouplingBlock(
-                inter_channels,
-                hidden_channels,
-                kernel_size=7,
-                n_layers=4,
-                n_flows=4,
-                gin_channels=gin_channels,
-            )
-            print("    ██████  VITS Fast: DWSep Posterior Encoder + DWSep Flow")
-        elif vits_version == "mod":
+        if vits_version == "mod":
             # ConvNeXt-based posterior encoder + flow
             self.enc_q = PosteriorEncoderMod(
                 spec_channels,
