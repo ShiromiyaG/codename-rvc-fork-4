@@ -1,5 +1,5 @@
 """
-v3 modules: ConvNeXt-based Posterior Encoder and Normalizing Flow.
+VITS Mod modules: ConvNeXt-based Posterior Encoder and Normalizing Flow.
 
 Replaces the WaveNet backbone used in VITS v1/v2 with ConvNeXt 1D blocks
 and FiLM conditioning. These modules are drop-in replacements with the same
@@ -171,7 +171,7 @@ class ConvNeXtBlock1D(nn.Module):
 # Posterior Encoder v3
 # ---------------------------------------------------------------------------
 
-class PosteriorEncoder_v3(nn.Module):
+class PosteriorEncoderMod(nn.Module):
     """Posterior Encoder using ConvNeXt blocks with FiLM conditioning."""
 
     def __init__(
@@ -261,7 +261,7 @@ class Flip(nn.Module):
         return x, logdet
 
 
-class ResidualCouplingLayer_v3(nn.Module):
+class ResidualCouplingLayerMod(nn.Module):
     """Affine coupling layer with ConvNeXt + CAM backbone."""
 
     def __init__(
@@ -355,7 +355,7 @@ class ResidualCouplingLayer_v3(nn.Module):
         pass
 
 
-class ResidualCouplingBlock_v3(nn.Module):
+class ResidualCouplingBlockMod(nn.Module):
     """Normalizing flow with ConvNeXt + CAM coupling layers."""
 
     def __init__(
@@ -375,7 +375,7 @@ class ResidualCouplingBlock_v3(nn.Module):
         self.flows = nn.ModuleList()
         for _ in range(n_flows):
             self.flows.append(
-                ResidualCouplingLayer_v3(
+                ResidualCouplingLayerMod(
                     channels,
                     hidden_channels,
                     kernel_size=kernel_size,

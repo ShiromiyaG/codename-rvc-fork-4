@@ -17,33 +17,13 @@ import torch.nn.functional as F
 # Training Constants
 # ══════════════════════════════════════════════════════════════════════════════
 
-CHOUWA_GRAD_CLIP_D = 10.0       # Discriminator gradient clipping threshold (FIX #4)
-CHOUWA_GRAD_CLIP_G = 10.0       # Generator gradient clipping threshold (FIX #4)
-CHOUWA_C_FM = 2.0               # Feature matching loss weight (FIX #3)
-CHOUWA_C_HF = 1.0               # High-frequency reconstruction loss weight (FIX #3)
+CHOUWA_GRAD_CLIP_D = 25.0       # Discriminator gradient clipping threshold (FIX #4)
+CHOUWA_GRAD_CLIP_G = 50.0       # Generator gradient clipping threshold (FIX #4)
+CHOUWA_C_FM = 1.0               # Feature matching loss weight (Lowered for stability)
+CHOUWA_C_HF = 1.0               # High-frequency reconstruction loss weight (Lowered for stability)
 CHOUWA_R1_GAMMA = 0.0           # R1 penalty coefficient (disabled by default)
 CHOUWA_R1_INTERVAL = 16         # R1 penalty application interval
 CHOUWA_D_REAL_LABEL = 0.9       # Real label value for discriminator
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Pre-emphasis Filter
-# ══════════════════════════════════════════════════════════════════════════════
-
-def pre_emphasis(x: torch.Tensor, coef: float = 0.97) -> torch.Tensor:
-    """
-    High-pass filter: y[n] = x[n] - coef * x[n-1].
-    Amplifies high frequencies in spectral loss without computational cost.
-    Zero-cost, in-place friendly operation.
-    
-    Args:
-        x: Input waveform (B, 1, T) or (B, T)
-        coef: Pre-emphasis coefficient (default: 0.97)
-    
-    Returns:
-        Pre-emphasized waveform with same shape as input
-    """
-    return torch.cat([x[..., :1], x[..., 1:] - coef * x[..., :-1]], dim=-1)
 
 
 
@@ -402,10 +382,11 @@ def get_chouwa_config(from_scratch: bool) -> dict:
         "grad_clip_d": CHOUWA_GRAD_CLIP_D,
         "c_fm": CHOUWA_C_FM,
         "c_hf": CHOUWA_C_HF,
-        "c_mel": 45.0,
+        "c_mel": 2.0,
         "c_kl": 1.0,
+        "c_stft": 2.0,
         "r1_gamma": CHOUWA_R1_GAMMA,
         "r1_interval": CHOUWA_R1_INTERVAL,
         "d_real_label": CHOUWA_D_REAL_LABEL,
-        "grad_accum_steps": 2 if from_scratch else 1,
+        "grad_accum_steps": 1,
     }

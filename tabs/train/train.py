@@ -31,15 +31,13 @@ saved_components = [] # List of components that should have their states saved ~
 
 RVC_VOCODER_CHOICES = ["HiFi-GAN"]
 APPLIO_VOCODER_CHOICES = ["RefineGAN"]
-FORK_VOCODER_CHOICES = ["RingFormer_v1", "RingFormer_v2", "PCPH-GAN"]
-V3_VOCODER_CHOICES = ["ChouwaGAN"]
-ALL_VOCODER_CHOICES = [*RVC_VOCODER_CHOICES, *APPLIO_VOCODER_CHOICES, *FORK_VOCODER_CHOICES, *V3_VOCODER_CHOICES]
+FORK_VOCODER_CHOICES = ["RingFormer_v1", "RingFormer_v2", "PCPH-GAN", "ChouwaGAN"]
+ALL_VOCODER_CHOICES = [*RVC_VOCODER_CHOICES, *APPLIO_VOCODER_CHOICES, *FORK_VOCODER_CHOICES]
 
 VOCODER_INFO = {
     "RVC": "**HiFi-GAN:** \n- **Arch overview:ㅤHiFi-GAN + Hn-NSF for f0 handling. ( RVC's og vocoder )** \n- **COMPATIBILITY:ㅤAll clients incl. Mainline RVC / W-okada etc.**",
     "Fork/Applio": "**RefineGAN:** \n- **Arch overview:ㅤHiFi-Gan + Hn-NSF + ParallelResBlock + AdaIN** \n- **COMPATIBILITY:ㅤThis Fork or Applio ( As for rt-vc, vonovox beta supports it. )**",
-    "Fork": "**RingFormer:** \n- **Arch overview:ㅤA hybrid Conformer-Based Vocoder + Snake-Beta act. + RingAttention + Hn-NSF** \n- **COMPATIBILITY:ㅤThis Fork ( As for rt-vc, 'Vonovox' supports it. )** \n\n**PCPH-GAN:** \n- **Arch overview:ㅤHiFi-GAN + PCPH prior + SnakeBeta & Silu** \n- **COMPATIBILITY:ㅤThis Fork ( No rt-vc clients support it atm. )** \n\n **NOTES:** \n **( RingFormer Requires min. RTX 30xx [ At least Ampere microarchitecture ] )** \n **( Each Vocoder and it's supported sample rates require appropriate pretrained models. )**",
-    "v3": "**ChouwaGAN:** \n- **Arch overview:ㅤConvNeXt backbone + HiFi-GAN vocoder head + Snake act.** \n- **COMPATIBILITY:ㅤThis Fork only ( No rt-vc clients support it atm. )**",
+    "Fork": "**RingFormer:** \n- **Arch overview:ㅤA hybrid Conformer-Based Vocoder + Snake-Beta act. + RingAttention + Hn-NSF** \n- **COMPATIBILITY:ㅤThis Fork ( As for rt-vc, 'Vonovox' supports it. )** \n\n**PCPH-GAN:** \n- **Arch overview:ㅤHiFi-GAN + PCPH prior + SnakeBeta & Silu** \n- **COMPATIBILITY:ㅤThis Fork ( No rt-vc clients support it atm. )** \n\n**ChouwaGAN:** \n- **Arch overview:ㅤConvNeXt backbone + HiFi-GAN vocoder head + Snake act.** \n- **COMPATIBILITY:ㅤThis Fork only ( No rt-vc clients support it atm. )** \n\n **NOTES:** \n **( RingFormer Requires min. RTX 30xx [ At least Ampere microarchitecture ] )** \n **( Each Vocoder and it's supported sample rates require appropriate pretrained models. )**",
 }
 
 
@@ -287,13 +285,13 @@ if microarchitecture_capability_checker():
     # Ampere-Microarchitecture and higher viable:
     initial_optimizer = "AdamW BF16"
     initial_optimizer_choices = ["AdamW BF16", "AdamW", "RAdam", "AdamSPD", "Ranger21", "DiffGrad", "Prodigy"]
-    architecture_choices = ["RVC", "Fork/Applio", "Fork", "v3"]
+    architecture_choices = ["RVC", "Fork/Applio", "Fork"]
     fp16_check = True
 else:
     # Below Ampere-Microarchitecture viable:
     initial_optimizer = "AdamW"
     initial_optimizer_choices = ["AdamW", "RAdam", "AdamSPD", "Ranger21", "DiffGrad", "Prodigy"]
-    architecture_choices = ["RVC", "Fork/Applio", "v3"]
+    architecture_choices = ["RVC", "Fork/Applio", "Fork"]
     fp16_check = True
 
 # FP16 checker
@@ -336,18 +334,21 @@ def train_tab():
                 )
                 architecture = gr.Radio(
                     label="Architecture",
-                    info="Choose the model architecture:\n- **RVC (V2):ㅤDefault/OG-Architecture - Compatible with all clients.**\n- **Fork/Applio:ㅤOG-Arch's discs + RefineGAN** - Only for this Fork or Applio **( Experimental. )** \n- **Fork:ㅤCodename-selected custom archs** - Only for this Fork **( Exclusive. )**\n- **v3:ㅤConvNeXt Posterior Encoder + ConvNeXt+CAM Flow** - Replaces WaveNet backbone. ~2-3x faster, ~15-25% better quality.",
+                    info="Choose the model architecture:\n- **RVC (V2):ㅤDefault/OG-Architecture - Compatible with all clients.**\n- **Fork/Applio:ㅤOG-Arch's discs + RefineGAN** - Only for this Fork or Applio **( Experimental. )** \n- **Fork:ㅤCodename-selected custom archs** - Only for this Fork **( Exclusive. )**",
                     choices=architecture_choices,
                     value="RVC",
                     interactive=True,
                     visible=True,
                     key='architecture'
                 )
-                vits2_mode = gr.Checkbox(
-                    label="Enable VITS2 modeㅤ( Requires compatible pretrains! )",
-                    value=False,
+                vits_version = gr.Radio(
+                    label="VITS Version",
+                    info="Choose the VITS encoder/flow backbone:\n- **v1:ㅤWaveNet backbone - OG VITS.**\n- **v2:ㅤWaveNet + FiLM (VITS2 mode) - Requires VITS2-compatible pretrains.**\n- **mod:ㅤConvNeXt Posterior Encoder + ConvNeXt+CAM Flow.** **Requires mod-compatible pretrains.**\n- **fast:ㅤDepthwise-Separable Conv with dilated receptive field. ~2.7x lighter enc_q+flow. No weight_norm.** **Requires fast-compatible pretrains.**\n\n**⚠ Each combination of Vocoder + VITS version requires its own pretrained models!**",
+                    choices=["v1", "v2", "mod", "fast"],
+                    value="v1",
                     interactive=True,
                     visible=True,
+                    key='vits_version'
                 )
                 vocoder_arch = gr.State("hifi_refine")
                 optimizer = gr.Radio(
@@ -739,6 +740,23 @@ def train_tab():
                         interactive=True,
                         key='use_validation'
                     )
+                    use_compile = gr.Checkbox(
+                        label="torch.compile",
+                        info="Compiles the model for faster training. First step may be slow due to compilation. \n**Requires min. RTX 30xx ( At least Ampere microarchitecture )**",
+                        value=False,
+                        interactive=microarchitecture_capability_checker(),
+                        visible=microarchitecture_capability_checker(),
+                        key='use_compile'
+                    )
+                    compile_mode = gr.Dropdown(
+                        label="Compile Mode",
+                        info="'default' — fast compile, good speedup. \n'max-autotune-no-cudagraphs' — slower first step, best steady-state speed.",
+                        choices=["default", "max-autotune-no-cudagraphs"],
+                        value="default",
+                        interactive=True,
+                        visible=False,
+                        key='compile_mode'
+                    )
                     use_tf32 = gr.Checkbox(
                         label="use 'TF32' precision",
                         info="Uses TF32 precision instead of FP32, typically resulting in 30% to 100% faster training. \n**Requires min. RTX 30xx ( At least Ampere microarchitecture )**",
@@ -980,6 +998,8 @@ def train_tab():
                     optimizer,
                     adversarial_loss,
                     use_checkpointing,
+                    use_compile,
+                    compile_mode,
                     use_tf32,
                     use_benchmark,
                     use_deterministic,
@@ -989,7 +1009,7 @@ def train_tab():
                     use_validation,
                     use_kl_annealing,
                     kl_annealing_cycle_duration,
-                    vits2_mode,
+                    vits_version,
                     rolling_loss_steps,
                     use_tstp,
                     use_custom_lr,
@@ -1129,12 +1149,13 @@ def train_tab():
                         "RingFormer_v1": "ringformer_v1",
                         "RingFormer_v2": "ringformer_v2",
                         "PCPH-GAN": "pcph_gan",
+                        "ChouwaGAN": "chouwa_gan",
                     }[selected_vocoder]
                     return (
                         {
-                            "choices": ["24000", "32000", "40000", "48000"],
+                            "choices": ["24000", "32000", "40000", "48000"] if selected_vocoder != "ChouwaGAN" else ["32000", "40000", "48000"],
                             "__type__": "update",
-                            "value": "48000",
+                            "value": "48000" if selected_vocoder != "ChouwaGAN" else "32000",
                         },
                         {
                             "choices": FORK_VOCODER_CHOICES,
@@ -1142,23 +1163,6 @@ def train_tab():
                             "interactive": True,
                             "value": selected_vocoder,
                             "info": VOCODER_INFO["Fork"],
-                        },
-                        vocoder_arch_value,
-                    )
-                elif architecture == "v3":
-                    vocoder_arch_value = "chouwa_gan"
-                    return (
-                        {
-                            "choices": ["32000", "40000", "48000"],
-                            "__type__": "update",
-                            "value": "32000",
-                        },
-                        {
-                            "choices": V3_VOCODER_CHOICES,
-                            "__type__": "update",
-                            "interactive": False,
-                            "value": "ChouwaGAN",
-                            "info": VOCODER_INFO["v3"],
                         },
                         vocoder_arch_value,
                     )
@@ -1207,6 +1211,15 @@ def train_tab():
                         },
                         "pcph_gan",
                     )
+                elif architecture == "Fork" and vocoder == "ChouwaGAN":
+                    return (
+                        {
+                            "choices": ["32000", "40000", "48000"],
+                            "__type__": "update",
+                            "value": "32000",
+                        },
+                        "chouwa_gan",
+                    )
                 else:
                     return gr.skip()
 
@@ -1230,12 +1243,12 @@ def train_tab():
                 batch_size, epoch_save_frequency, total_epoch_count,
                 save_only_latest_net_models, save_weight_models, pretrained,
                 cleanup, use_checkpointing,
-                use_tf32, use_benchmark, use_deterministic, spectral_loss,
+                use_tf32, use_benchmark, use_deterministic, use_compile, compile_mode, spectral_loss,
                 lr_scheduler, exp_decay_gamma, use_validation,
                 custom_pretrained, g_pretrained_path,
                 d_pretrained_path, multiple_gpu, training_gpu, use_warmup,
                 warmup_duration, use_custom_lr, custom_lr_g,
-                custom_lr_d, use_kl_annealing, kl_annealing_cycle_duration, vits2_mode,
+                custom_lr_d, use_kl_annealing, kl_annealing_cycle_duration, vits_version,
                 rolling_loss_steps, use_tstp, index_algorithm, use_kl_annealing
             ])
 
@@ -1265,6 +1278,9 @@ def train_tab():
                 if "vocoder_v2" not in settings and "vocoder" in settings:
                     settings["vocoder_v2"] = settings["vocoder"]
 
+                if "vits_version" not in settings:
+                    settings["vits_version"] = "v1"
+
                 # Sanitize vocoder against selected architecture
                 architecture_value = settings.get("architecture", "RVC")
                 current_vocoder = settings.get("vocoder_v2", "HiFi-GAN")
@@ -1274,8 +1290,6 @@ def train_tab():
                         settings["vocoder_v2"] = "RingFormer_v2"
                 elif architecture_value == "Fork/Applio":
                     settings["vocoder_v2"] = "RefineGAN"
-                elif architecture_value == "v3":
-                    settings["vocoder_v2"] = "ChouwaGAN"
                 else:
                     settings["vocoder_v2"] = "HiFi-GAN"
 
@@ -1374,6 +1388,11 @@ def train_tab():
                 fn=toggle_visible,
                 inputs=[use_warmup],
                 outputs=[warmup_settings],
+            )
+            use_compile.change(
+                fn=toggle_visible,
+                inputs=[use_compile],
+                outputs=[compile_mode],
             )
             use_custom_lr.change(
                 fn=toggle_visible,

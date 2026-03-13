@@ -7,7 +7,8 @@ from rvc.lib.algorithm.normalizing_flows import ResidualCouplingBlock, ResidualC
 from rvc.lib.algorithm.encoders import PosteriorEncoder # Posterior encoder, shared between Vits1 and Vits2
 from rvc.lib.algorithm.encoders_vits2 import TextEncoder_VITS2
 from rvc.lib.algorithm.encoders import TextEncoder as TextEncoder_VITS1
-from rvc.lib.algorithm.modules_v3 import PosteriorEncoder_v3, ResidualCouplingBlock_v3
+from rvc.lib.algorithm.modules_mod import PosteriorEncoderMod, ResidualCouplingBlockMod
+from rvc.lib.algorithm.modules_fast import FastPosteriorEncoder, FastCouplingBlock
 
 
 debug_shapes = False
@@ -39,8 +40,7 @@ class Synthesizer(torch.nn.Module):
         vocoder: str = "HiFi-GAN",
         checkpointing: bool = False,
         randomized: bool = True,
-        vits2_mode: bool = False,
-        v3_mode: bool = False,
+        vits_version: str = "v1",
         gen_istft_n_fft: int = 120,
         gen_istft_hop_size: int = 30,
         **kwargs,
@@ -50,10 +50,9 @@ class Synthesizer(torch.nn.Module):
         self.use_f0 = use_f0
         self.vocoder = vocoder
         self.randomized = randomized
-        self.vits2_mode = vits2_mode
-        self.v3_mode = v3_mode
+        self.vits_version = vits_version
 
-        if vits2_mode:
+        if vits_version == "v2":
             self.enc_p = TextEncoder_VITS2(
                 inter_channels,
                 hidden_channels,
@@ -132,6 +131,13 @@ class Synthesizer(torch.nn.Module):
                     upsample_kernel_sizes,
                     gin_channels=gin_channels,
                     sr=sr,
+                    backbone_depths=kwargs.get("backbone_depths", [2, 2, 5, 2]),
+                    backbone_dims=kwargs.get("backbone_dims", [192, 256, 384, 384]),
+                    backbone_dilations=kwargs.get("backbone_dilations", [[1, 2], [1, 2], [1, 1, 2, 4, 8], [1, 2]]),
+                    backbone_kernel_size=kwargs.get("backbone_kernel_size", 13),
+                    backbone_mlp_ratio=kwargs.get("backbone_mlp_ratio", 3.0),
+                    n_harmonics=kwargs.get("n_harmonics", 32),
+                    checkpointing=checkpointing,
                 )
                 print("    ██████  Vocoder: ChouwaGAN-PCPH")
             else:  # vocoder == "HiFi-GAN"
@@ -164,9 +170,28 @@ class Synthesizer(torch.nn.Module):
                     gin_channels=gin_channels,
                     checkpointing=checkpointing,
                 )
-        if v3_mode:
-            # v3: ConvNeXt-based posterior encoder + flow
-            self.enc_q = PosteriorEncoder_v3(
+        if vits_version == "fast":
+            # Depthwise-separable conv posterior encoder + flow
+            self.enc_q = FastPosteriorEncoder(
+                spec_channels,
+                inter_channels,
+                hidden_channels,
+                kernel_size=7,
+                n_layers=8,
+                gin_channels=gin_channels,
+            )
+            self.flow = FastCouplingBlock(
+                inter_channels,
+                hidden_channels,
+                kernel_size=7,
+                n_layers=4,
+                n_flows=4,
+                gin_channels=gin_channels,
+            )
+            print("    ██████  VITS Fast: DWSep Posterior Encoder + DWSep Flow")
+        elif vits_version == "mod":
+            # ConvNeXt-based posterior encoder + flow
+            self.enc_q = PosteriorEncoderMod(
                 spec_channels,
                 inter_channels,
                 hidden_channels,
@@ -175,7 +200,7 @@ class Synthesizer(torch.nn.Module):
                 gin_channels=gin_channels,
                 mlp_ratio=4.0,
             )
-            self.flow = ResidualCouplingBlock_v3(
+            self.flow = ResidualCouplingBlockMod(
                 inter_channels,
                 hidden_channels,
                 kernel_size=7,
@@ -185,8 +210,9 @@ class Synthesizer(torch.nn.Module):
                 cam_kernel_size=31,
                 mlp_ratio=4.0,
             )
-            print("    ██████  v3 mode: ConvNeXt Posterior Encoder + ConvNeXt+CAM Flow")
+            print("    ██████  VITS Mod: ConvNeXt Posterior Encoder + ConvNeXt+CAM Flow")
         else:
+            # v1 / v2: WaveNet-based posterior encoder
             self.enc_q = PosteriorEncoder(
                 spec_channels,
                 inter_channels,
@@ -196,7 +222,7 @@ class Synthesizer(torch.nn.Module):
                 16,
                 gin_channels=gin_channels,
             )
-            if vits2_mode:
+            if vits_version == "v2":
                 self.flow = ResidualCouplingTransformersBlock(
                     inter_channels,
                     hidden_channels,
@@ -225,8 +251,12 @@ class Synthesizer(torch.nn.Module):
 
     def remove_weight_norm(self):
         """Removes weight normalization from the model."""
-        for module in [self.dec, self.flow, self.enc_q]:
-            self._remove_weight_norm_from(module)
+        for container in [self.dec, self.flow, self.enc_q]:
+            if container is None:
+                continue
+            # Recursively remove weight norm from all submodules
+            for module in container.modules():
+                self._remove_weight_norm_from(module)
 
     def __prepare_scriptable__(self):
         self.remove_weight_norm()
@@ -256,7 +286,7 @@ class Synthesizer(torch.nn.Module):
         """
         g = self.emb_g(ds).unsqueeze(-1)
 
-        if self.vits2_mode:
+        if self.vits_version == "v2":
             m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths, g=g)
         else:
             m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
@@ -332,7 +362,7 @@ class Synthesizer(torch.nn.Module):
         """
         g = self.emb_g(sid).unsqueeze(-1)
 
-        if self.vits2_mode:
+        if self.vits_version == "v2":
             m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths, g=g)
         else:
             m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
@@ -362,6 +392,11 @@ class Synthesizer(torch.nn.Module):
 
         if self.vocoder in ["RingFormer_v1", "RingFormer_v2"]:
             o, _, _ = self.dec(z * x_mask, nsff0, g=g)
+        elif self.vocoder == "ChouwaGAN":
+            o = self.dec(z * x_mask, nsff0, g=g) if self.use_f0 else self.dec(z * x_mask, g=g)
+            # Handle potential tuple return from ChouwaGAN (audio, harmonics)
+            if isinstance(o, tuple):
+                o = o[0]
         else:
             o = (self.dec(z * x_mask, nsff0, g=g) if self.use_f0 else self.dec(z * x_mask, g=g))
 

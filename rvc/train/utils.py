@@ -381,7 +381,7 @@ def print_init_setup(
     kl_annealing_cycle_duration,
     spectral_loss,
     adversarial_loss,
-    vits2_mode,
+    vits_version,
     use_tstp
 ):
     # Warmup init msg:
@@ -436,11 +436,8 @@ def print_init_setup(
         elif adversarial_loss == "softplus":
             print("    ██████  Adversarial loss: SOFTPLUS (logistic)")
 
-        # Vits maode checkup:
-        if vits2_mode:
-            print("    ██████  Vits mode: vits-based + few vits2 tweaks (Custom)")
-        else:
-            print("    ██████  Vits mode: vits-based (Default RVC)")
+        # VITS version:
+        print(f"    ██████  VITS version: {vits_version}")
 
         # Validation check:
         print(f"    ██████  Using Validation: {use_validation}")
@@ -519,9 +516,8 @@ def early_stopper(
     save_weight_models,
     model_name,
     vocoder,
-    vits2_mode,
+    vits_version,
     n_gpus,
-    v3_mode=False,
     chouwa_balancer=None,
 ):
     if stopper is not None and stopper.stop_triggered:
@@ -555,8 +551,7 @@ def early_stopper(
                     hps=config, 
                     vocoder=vocoder, 
                     architecture=architecture, 
-                    vits2_mode=vits2_mode,
-                    v3_mode=v3_mode,
+                    vits_version=vits_version,
                 )
                 print(f"[TRAINING] All finished .. You can ignore anything past this msg.")
         if n_gpus > 1:

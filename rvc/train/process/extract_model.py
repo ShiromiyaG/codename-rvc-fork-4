@@ -40,8 +40,7 @@ def extract_model(
     architecture,
     pitch_guidance=True,
     version="v2",
-    vits2_mode=False,
-    v3_mode=False,
+    vits_version="v1",
 ):
     try:
         model_dir = os.path.dirname(model_path)
@@ -62,12 +61,18 @@ def extract_model(
             model_author = data.get("model_author", None)
 
         # Strip torch.compile's "_orig_mod." prefix so checkpoints are always portable
+        # Flow and encoder weights are kept in FP32 to avoid precision loss that
+        # compounds during normalizing flow reverse transforms at inference.
+        fp32_prefixes = ("flow.", "enc_p.", "dec.")
         weight_dict = {}
         for key, value in ckpt.items():
             if "enc_q" not in key:
                 if key.startswith("_orig_mod."):
                     key = key.replace("_orig_mod.", "", 1)
-                weight_dict[key] = value.half()
+                if key.startswith(fp32_prefixes):
+                    weight_dict[key] = value
+                else:
+                    weight_dict[key] = value.half()
 
         opt = OrderedDict(weight=weight_dict)
 
@@ -113,14 +118,23 @@ def extract_model(
         opt["speakers_id"] = speakers_id
         opt["vocoder"] = vocoder
         opt["vocoder_architecture"] = vocoder_architecture
-        opt["vits2_mode"] = vits2_mode
-        opt["v3_mode"] = v3_mode
+        opt["vits_version"] = vits_version
 
         if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
             opt["ringformer_istft"] = [
                 hps.model.gen_istft_n_fft,
                 hps.model.gen_istft_hop_size,
             ]
+
+        if vocoder == "ChouwaGAN":
+            opt["chouwa_backbone"] = {
+                "backbone_depths": hps.model.backbone_depths,
+                "backbone_dims": hps.model.backbone_dims,
+                "backbone_dilations": hps.model.backbone_dilations,
+                "backbone_kernel_size": hps.model.backbone_kernel_size,
+                "backbone_mlp_ratio": getattr(hps.model, "backbone_mlp_ratio", 3.0),
+                "n_harmonics": hps.model.n_harmonics,
+            }
 
         # Backwards compatibility for mainline for "RVC" architecture
         if architecture == "RVC":

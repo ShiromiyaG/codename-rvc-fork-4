@@ -135,19 +135,20 @@ exp_decay_gamma = float(sys.argv[24])
 use_validation = strtobool(sys.argv[25])
 use_kl_annealing = strtobool(sys.argv[26])
 kl_annealing_cycle_duration = int(sys.argv[27])
-vits2_mode = strtobool(sys.argv[28])
+vits_version = sys.argv[28]
 rolling_loss_steps = int(sys.argv[29])
 use_tstp = bool(strtobool(sys.argv[30]))
 use_custom_lr = strtobool(sys.argv[31])
 custom_lr_g, custom_lr_d = (float(sys.argv[32]), float(sys.argv[33])) if use_custom_lr else (None, None)
+use_compile = bool(strtobool(sys.argv[34]))
+compile_mode = sys.argv[35]
 assert not use_custom_lr or (custom_lr_g and custom_lr_d), "Invalid custom LR values."
 
 # Parse command line arguments end region ===========================
 
 current_dir = os.getcwd()
 
-# Derive v3_mode from architecture string
-v3_mode = architecture == "v3"
+# Derive experiment directory from model name
 experiment_dir = os.path.join(current_dir, "logs", model_name)
 config_save_path = os.path.join(experiment_dir, "config.json")
 dataset_path = os.path.join(experiment_dir, "sliced_audios")
@@ -211,8 +212,7 @@ use_trajectory = False
 #       'max-autotune-no-cudagraphs' runs Triton autotuning for best kernel
 #       tile sizes without requiring fixed shapes.  First step is slow (~2-5
 #       min while autotuning), steady-state is faster than 'default'.
-use_compile = False
-compile_mode = "max-autotune-no-cudagraphs"  # 'default' | 'max-autotune-no-cudagraphs'
+# use_compile and compile_mode are now parsed from sys.argv above.
 
 use_sid_swap = False
 custom_sid = 1
@@ -349,8 +349,7 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing, randomized):
         vocoder = vocoder,
         checkpointing = use_checkpointing,
         randomized = randomized,
-        vits2_mode = vits2_mode,
-        v3_mode = v3_mode,
+        vits_version = vits_version,
     )
 
 def get_d_model(config, vocoder, use_checkpointing):
@@ -685,8 +684,8 @@ def prepare_schedulers(optim_g, optim_d, use_warmup, warmup_duration, use_lr_sch
 
         elif lr_scheduler == "cosine annealing epoch":
             # Cosine annealing lr scheduler per epoch
-            scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(optim_g, T_max=total_epoch_count, eta_min=3e-5, last_epoch=scheduler_resume_epoch)
-            scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(optim_d, T_max=total_epoch_count, eta_min=3e-5, last_epoch=scheduler_resume_epoch)
+            scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(optim_g, T_max=total_epoch_count, eta_min=2e-5, last_epoch=scheduler_resume_epoch)
+            scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(optim_d, T_max=total_epoch_count, eta_min=2e-5, last_epoch=scheduler_resume_epoch)
 
     return warmup_scheduler_g, warmup_scheduler_d, scheduler_g, scheduler_d
 
@@ -871,7 +870,7 @@ def run(
         kl_annealing_cycle_duration,
         spectral_loss,
         adversarial_loss,
-        vits2_mode,
+        vits_version,
         use_tstp
     )
 
@@ -1044,6 +1043,9 @@ def run(
 
     # torch.compile opt-in (requires PyTorch >= 2.0 and CUDA Ampere+)
     if use_compile and device.type == "cuda" and torch.cuda.is_available():
+        # Suppress harmless GCC preprocessor warnings from Triton JIT
+        # (_POSIX_C_SOURCE redefined between Python's pyconfig.h and glibc features.h)
+        os.environ["CFLAGS"] = os.environ.get("CFLAGS", "") + " -Wno-cpp"
         try:
             if rank == 0:
                 print(f"    ██████  torch.compile: mode='{compile_mode}' — compiling G and D...")
@@ -1255,6 +1257,7 @@ def training_loop(
         _cc = get_chouwa_config(from_scratch)
         grad_clip_d, c_fm = _cc["grad_clip_d"], _cc["c_fm"]
         c_hf, c_mel = _cc["c_hf"], _cc["c_mel"]
+        c_stft = _cc["c_stft"]
         r1_gamma, r1_interval = _cc["r1_gamma"], _cc["r1_interval"]
         d_real_label = _cc["d_real_label"]
         grad_accum_steps = _cc["grad_accum_steps"]
@@ -1355,7 +1358,11 @@ def training_loop(
                     from rvc.train.chouwa_gan_training import softplus_d_loss
                     loss_disc, d_real_mean, d_fake_mean = softplus_d_loss(y_d_hat_r, y_d_hat_g)
                 elif adversarial_loss == "lsgan":
-                    loss_disc, d_real_mean, d_fake_mean = discriminator_loss(y_d_hat_r, y_d_hat_g, real_label=d_real_label)
+                    loss_disc, d_real_mean, d_fake_mean = discriminator_loss(
+                        [d.float() for d in y_d_hat_r],
+                        [d.float() for d in y_d_hat_g],
+                        real_label=d_real_label
+                    )
                 elif adversarial_loss == "tprls":
                     loss_disc = discriminator_loss_v2(y_d_hat_r, y_d_hat_g, real_label=d_real_label)
                 elif adversarial_loss == "hinge":
@@ -1492,17 +1499,24 @@ def training_loop(
                         active_c_mel = c_mel if vocoder == "ChouwaGAN" else config.train.c_mel
                         loss_mel = fn_spectral_loss(y, y_hat) * active_c_mel / 3.0
                     elif spectral_loss == "Multi-Res STFT Loss":
-                        loss_mel = fn_spectral_loss(y_hat.float(), y.float()) * c_stft
+                        active_c_stft = 2.0 if vocoder == "ChouwaGAN" else c_stft
+                        loss_mel = fn_spectral_loss(y_hat.float(), y.float()) * active_c_stft
 
                     # Feature Matching loss (normalized per sub-disc, 2× for ChouwaGAN)
-                    loss_fm = feature_loss(fmap_r, fmap_g) / n_disc * c_fm
+                    loss_fm = feature_loss(
+                        [[f.float() for f in fm] for fm in fmap_r],
+                        [[f.float() for f in fm] for fm in fmap_g]
+                    ) / n_disc * c_fm
 
                     # Generator loss (normalized per sub-discriminator)
                     if adversarial_loss == "softplus":
                         from rvc.train.chouwa_gan_training import softplus_g_loss
                         loss_adv = softplus_g_loss(y_d_hat_g, n_disc)
                     elif adversarial_loss == "lsgan":
-                        loss_adv = generator_loss(y_d_hat_g, real_label=d_real_label) / n_disc
+                        loss_adv = generator_loss(
+                            [d.float() for d in y_d_hat_g],
+                            real_label=d_real_label
+                        ) / n_disc
                     elif adversarial_loss == "tprls":
                         y_d_hat_r_detached = [i.detach() for i in y_d_hat_r_g]
                         loss_adv = generator_loss_v2(y_d_hat_g, y_d_hat_r_detached) / n_disc
@@ -1528,7 +1542,12 @@ def training_loop(
 
                     # Total generator loss + kl ( encoders )
                     if not training_loop.encoders_frozen: # For when encoders aren't frozen yet
-                        loss_kl = kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl # KL ( Kullback–Leibler divergence ) loss
+                        # KL loss — logger/exp in fp16 loses precision
+                        loss_kl = kl_loss_clamped(
+                            z_p.float(), logs_q.float(),
+                            m_p.float(), logs_p.float(),
+                            z_mask.float()
+                        ) * config.train.c_kl # KL ( Kullback–Leibler divergence ) loss
                         if vocoder == "ChouwaGAN":
                             loss_hf = hf_recon_loss(y_hat, y) * c_hf
                             loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta + loss_hf
@@ -1671,8 +1690,7 @@ def training_loop(
                 stopper, rank, global_step, epoch, architecture, 
                 [net_g, net_d], [optim_g, optim_d], config, 
                 experiment_dir, gradscaler, save_weight_models,
-                model_name, vocoder, vits2_mode, n_gpus,
-                v3_mode=v3_mode,
+                model_name, vocoder, vits_version, n_gpus,
                 chouwa_balancer=chouwa_balancer,
             ):
                 return True
@@ -1893,8 +1911,7 @@ def training_loop(
                         hps=config,
                         vocoder=vocoder,
                         architecture=architecture,
-                        vits2_mode=vits2_mode,
-                        v3_mode=v3_mode,
+                        vits_version=vits_version,
                     )
         if done:
             # Clean-up process IDs from memory

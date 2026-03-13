@@ -104,7 +104,9 @@ class DiscriminatorP(nn.Module):
             nn.Conv2d(in_ch, 1, (3, 1), padding=(1, 0))
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    def forward(
+        self, x: torch.Tensor, compute_fmaps: bool = True
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         fmap = []
 
         # Reshape to periodic 2D view: (B, 1, T) → (B, 1, T//p, p)
@@ -118,15 +120,18 @@ class DiscriminatorP(nn.Module):
         # Strided convolutions
         for conv in self.convs:
             x = F.leaky_relu(conv(x), 0.1)
-            fmap.append(x)
+            if compute_fmaps:
+                fmap.append(x)
 
         # Final non-strided conv
         x = F.leaky_relu(self.conv_final(x), 0.1)
-        fmap.append(x)
+        if compute_fmaps:
+            fmap.append(x)
 
         # Score prediction
         x = self.conv_post(x)
-        fmap.append(x)
+        if compute_fmaps:
+            fmap.append(x)
 
         return torch.flatten(x, 1, -1), fmap
 
@@ -213,15 +218,23 @@ class HarmonicFilterbank(nn.Module):
         Returns:
             harmonic_tensor: (B, n_total_harmonics, n_bins, T)
         """
-        if self.training:
+        if self.training or self._cached_filt is None:
             filt = self._build_filter()
-            self._cached_filt = None  # invalidate cache during training
+            if not self.training:
+                self._cached_filt = filt
         else:
-            if self._cached_filt is None:
-                self._cached_filt = self._build_filter()
             filt = self._cached_filt
 
-        return torch.einsum("hfk,bft->bhkt", filt, stft_mag)
+        # Reshape for bmm: more GPU-friendly than einsum
+        H, F, K = filt.shape
+        B, _, T = stft_mag.shape
+
+        filt_t = filt.permute(0, 2, 1)          # (H, K, F)
+        filt_exp = filt_t.unsqueeze(0).expand(B, -1, -1, -1).reshape(B * H, K, F)
+        mag_exp = stft_mag.unsqueeze(1).expand(-1, H, -1, -1).reshape(B * H, F, T)
+        
+        out = torch.bmm(filt_exp, mag_exp)       # (B*H, K, T)
+        return out.reshape(B, H, K, T)
 
 
 class HybridConvBlock(nn.Module):
@@ -394,15 +407,41 @@ class UniversalHarmonicDiscriminator(nn.Module):
         fmaps = []
 
         x = self.hcb(h_tensor)
-        fmaps.append(x)
+        if compute_fmaps:
+            fmaps.append(x)
 
         for mdc in self.mdc_blocks:
             x = mdc(x)
-            fmaps.append(x)
+            if compute_fmaps:
+                fmaps.append(x)
 
         x = self.conv_post(x)
-        fmaps.append(x)
+        if compute_fmaps:
+            fmaps.append(x)
 
+        return torch.flatten(x, 1, -1), fmaps
+
+    def forward_from_mag(
+        self, stft_mag: torch.Tensor, compute_fmaps: bool = True
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Forward using pre-computed STFT magnitude."""
+        h_tensor = self.filterbank(stft_mag)
+        h_tensor = h_tensor.to(memory_format=torch.channels_last)
+
+        fmaps = []
+        x = self.hcb(h_tensor)
+        if compute_fmaps:
+            fmaps.append(x)
+            
+        for mdc in self.mdc_blocks:
+            x = mdc(x)
+            if compute_fmaps:
+                fmaps.append(x)
+                
+        x = self.conv_post(x)
+        if compute_fmaps:
+            fmaps.append(x)
+            
         return torch.flatten(x, 1, -1), fmaps
 
     def _stft_magnitude(self, x: torch.Tensor) -> torch.Tensor:
@@ -459,7 +498,7 @@ class DiscriminatorSTFT(nn.Module):
 
         # First conv: 2 channels (real + imag) → channels
         self.convs.append(
-            norm_f(nn.Conv2d(2, channels, (3, 9), padding=(1, 4)))
+            norm_f(nn.Conv2d(2, channels, (3, 7), padding=(1, 3)))
         )
 
         # Intermediate convs with stride-2 along time
@@ -469,8 +508,8 @@ class DiscriminatorSTFT(nn.Module):
             self.convs.append(
                 norm_f(
                     nn.Conv2d(
-                        in_ch, out_ch, (3, 9),
-                        stride=(1, 2), padding=(1, 4),
+                        in_ch, out_ch, (3, 7),
+                        stride=(1, 2), padding=(1, 3),
                     )
                 )
             )
@@ -487,7 +526,7 @@ class DiscriminatorSTFT(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor,
+        self, x: torch.Tensor, compute_fmaps: bool = True
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         x = self._stft(x)
         x = x.to(memory_format=torch.channels_last)
@@ -495,11 +534,32 @@ class DiscriminatorSTFT(nn.Module):
         fmap = []
         for conv in self.convs:
             x = F.leaky_relu(conv(x), 0.1)
-            fmap.append(x)
+            if compute_fmaps:
+                fmap.append(x)
 
         x = self.conv_post(x)
-        fmap.append(x)
+        if compute_fmaps:
+            fmap.append(x)
 
+        return torch.flatten(x, 1, -1), fmap
+
+    def forward_from_stft(
+        self, stft_complex: torch.Tensor, compute_fmaps: bool = True
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Forward using pre-computed STFT (avoids redundant computation)."""
+        x = torch.stack([stft_complex.real, stft_complex.imag], dim=1)
+        x = x.to(memory_format=torch.channels_last)
+
+        fmap = []
+        for conv in self.convs:
+            x = F.leaky_relu(conv(x), 0.1)
+            if compute_fmaps:
+                fmap.append(x)
+                
+        x = self.conv_post(x)
+        if compute_fmaps:
+            fmap.append(x)
+            
         return torch.flatten(x, 1, -1), fmap
 
     def _stft(self, x: torch.Tensor) -> torch.Tensor:
@@ -577,7 +637,7 @@ class ChouwaGANDiscriminator(nn.Module):
         stft_n_layers = cfg.get("stft_n_layers", 3)
 
         # ── FastMPD ──────────────────────────────────────────────────────
-        mpd_periods = cfg.get("mpd_periods", [2, 3, 5, 7, 11])
+        mpd_periods = cfg.get("mpd_periods", [2, 3, 5, 7])
         mpd_channels = cfg.get("mpd_channels", 32)
         mpd_max_channels = cfg.get("mpd_max_channels", 128)
         mpd_n_layers = cfg.get("mpd_n_layers", 4)
@@ -620,6 +680,29 @@ class ChouwaGANDiscriminator(nn.Module):
             use_spectral_norm=use_spectral_norm,
         )
 
+        # Register shared STFT params for reuse detection
+        self._shared_stft_key = (2048, 512, 2048)  # (n_fft, hop, win)
+        self.register_buffer("_shared_window", torch.hann_window(2048))
+
+    def _compute_stft(self, x: torch.Tensor) -> torch.Tensor:
+        """Shared STFT computation for MS-STFT scale 0 and UnivHD."""
+        x_sq = x.squeeze(1)
+        if x_sq.dtype != torch.float32:
+            x_sq = x_sq.float()
+        pad = (2048 - 512) // 2
+        x_sq = F.pad(x_sq, (pad, pad), mode="constant")
+        window = self._shared_window.to(dtype=x_sq.dtype, device=x_sq.device)
+        stft = torch.stft(
+            x_sq, n_fft=2048, hop_length=512, win_length=2048,
+            window=window, center=False, return_complex=True,
+        )
+        return stft
+
+    def _is_shared_config(self, d: nn.Module) -> bool:
+        if not isinstance(d, DiscriminatorSTFT):
+            return False
+        return (d.n_fft, d.hop_length, d.win_length) == self._shared_stft_key
+
     def forward(
         self,
         y: torch.Tensor,
@@ -649,18 +732,26 @@ class ChouwaGANDiscriminator(nn.Module):
 
         use_ckpt = self.use_checkpointing and self.training
 
+        # Pre-compute shared STFT (saves 2 redundant STFT ops)
+        stft_real = self._compute_stft(y)
+        stft_fake = self._compute_stft(y_hat)
+
         # ── MS-STFT + FastMPD ────────────────────────────────────────────
         for d in self.discriminators:
-            if use_ckpt:
+            if self._is_shared_config(d):
+                # Reuse pre-computed STFT
+                y_d_r, fmap_r = d.forward_from_stft(stft_real, compute_fmaps=compute_fmaps)
+                y_d_g, fmap_g = d.forward_from_stft(stft_fake, compute_fmaps=compute_fmaps)
+            elif use_ckpt:
                 y_d_r, fmap_r = grad_checkpoint(
-                    d, y, use_reentrant=False
+                    d, y, compute_fmaps, use_reentrant=False
                 )
                 y_d_g, fmap_g = grad_checkpoint(
-                    d, y_hat, use_reentrant=False
+                    d, y_hat, compute_fmaps, use_reentrant=False
                 )
             else:
-                y_d_r, fmap_r = d(y)
-                y_d_g, fmap_g = d(y_hat)
+                y_d_r, fmap_r = d(y, compute_fmaps=compute_fmaps)
+                y_d_g, fmap_g = d(y_hat, compute_fmaps=compute_fmaps)
 
             y_d_rs.append(y_d_r)
             y_d_gs.append(y_d_g)
@@ -669,21 +760,28 @@ class ChouwaGANDiscriminator(nn.Module):
                 fmap_gs.append(fmap_g)
 
         # ── UnivHD ───────────────────────────────────────────────────────
+        # UnivHD — reuse shared STFT magnitude
+        stft_mag_real = stft_real.abs()
+        stft_mag_fake = stft_fake.abs()
+
         if use_ckpt:
             y_d_r_h, fmap_r_h = grad_checkpoint(
-                self.univhd, y, use_reentrant=False
+                self.univhd.forward_from_mag, stft_mag_real, compute_fmaps, use_reentrant=False
             )
             y_d_g_h, fmap_g_h = grad_checkpoint(
-                self.univhd, y_hat, use_reentrant=False
+                self.univhd.forward_from_mag, stft_mag_fake, compute_fmaps, use_reentrant=False
             )
         else:
-            y_d_r_h, fmap_r_h = self.univhd(y)
-            y_d_g_h, fmap_g_h = self.univhd(y_hat)
+            y_d_r_h, fmap_r_h = self.univhd.forward_from_mag(stft_mag_real, compute_fmaps=compute_fmaps)
+            y_d_g_h, fmap_g_h = self.univhd.forward_from_mag(stft_mag_fake, compute_fmaps=compute_fmaps)
 
         y_d_rs.append(y_d_r_h)
         y_d_gs.append(y_d_g_h)
         if compute_fmaps:
             fmap_rs.append(fmap_r_h)
             fmap_gs.append(fmap_g_h)
+
+        # Free shared STFT tensors
+        del stft_real, stft_fake, stft_mag_real, stft_mag_fake
 
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs

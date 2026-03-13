@@ -530,6 +530,8 @@ def run_train_script(
     optimizer: str = "AdamW",
     adversarial_loss: str = "lsgan",
     use_checkpointing: bool = False,
+    use_compile: bool = False,
+    compile_mode: str = "default",
     use_tf32: bool = False,
     use_benchmark: bool = True,
     use_deterministic: bool = False,
@@ -539,7 +541,7 @@ def run_train_script(
     use_validation: bool = True,
     use_kl_annealing: bool = False,
     kl_annealing_cycle_duration: int = 3,
-    vits2_mode: bool = False,
+    vits_version: str = "v1",
     rolling_loss_steps: int = 50,
     use_tstp: bool = False,
     use_custom_lr: bool = False,
@@ -599,12 +601,14 @@ def run_train_script(
                 use_validation,
                 use_kl_annealing,
                 kl_annealing_cycle_duration,
-                vits2_mode,
+                vits_version,
                 rolling_loss_steps,
                 use_tstp,
                 use_custom_lr,
                 custom_lr_g,
-                custom_lr_d
+                custom_lr_d,
+                use_compile,
+                compile_mode
             ],
         ),
     ]
@@ -2134,6 +2138,20 @@ def parse_arguments():
         default=10,
     )
     train_parser.add_argument(
+        "--use_compile",
+        type=lambda x: bool(strtobool(x)),
+        choices=[True, False],
+        help="Enable torch.compile for potential training speedup (requires Ampere+ GPU).",
+        default=False,
+    )
+    train_parser.add_argument(
+        "--compile_mode",
+        type=str,
+        choices=["default", "max-autotune-no-cudagraphs"],
+        help="torch.compile mode to use.",
+        default="default",
+    )
+    train_parser.add_argument(
         "--use_tf32",
         type=lambda x: bool(strtobool(x)),
         choices=[True, False],
@@ -2196,11 +2214,11 @@ def parse_arguments():
         default=3,
     )
     train_parser.add_argument(
-        "--vits2_mode",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="Whether to use VITS2 enhancements or not.",
-        default=False,
+        "--vits_version",
+        type=str,
+        choices=["v1", "v2", "mod", "fast"],
+        help="VITS version to use: v1 (default), v2, mod, or fast.",
+        default="v1",
     )
     train_parser.add_argument(
         "--rolling_loss_steps",
@@ -2552,6 +2570,8 @@ def main():
                 optimizer=args.optimizer,
                 adversarial_loss=args.adversarial_loss,
                 use_checkpointing=args.use_checkpointing,
+                use_compile=args.use_compile,
+                compile_mode=args.compile_mode,
                 use_tf32=args.use_tf32,
                 use_benchmark=args.use_benchmark,
                 use_deterministic=args.use_deterministic,
@@ -2559,7 +2579,7 @@ def main():
                 lr_scheduler=args.lr_scheduler,
                 exp_decay_gamma=args.exp_decay_gamma,
                 use_validation=args.use_validation,
-                vits2_mode=args.vits2_mode,
+                vits_version=args.vits_version,
                 rolling_loss_steps=args.rolling_loss_steps,
                 use_tstp=args.use_tstp,
                 use_custom_lr=args.use_custom_lr,

@@ -1,8 +1,8 @@
 import torch
 from itertools import chain
 from typing import Optional, Tuple
-from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils.parametrize import remove_parametrizations
 
 # for resblock_s and resblock_s_mask
 import torch.nn as nn
@@ -106,7 +106,7 @@ class ResBlock_PReLU(torch.nn.Module):
 
     def remove_weight_norm(self):
         for conv in chain(self.convs1, self.convs2):
-            remove_weight_norm(conv)
+            remove_parametrizations(conv, "weight")
 
 
 class ResBlock_SnakeBeta(torch.nn.Module):
@@ -176,7 +176,7 @@ class ResBlock_SnakeBeta(torch.nn.Module):
 
     def remove_weight_norm(self):
         for conv in chain(self.convs1, self.convs2):
-            remove_weight_norm(conv)
+            remove_parametrizations(conv, "weight")
 
 
 class ResBlock_Snake_Fused(torch.nn.Module):
@@ -245,7 +245,7 @@ class ResBlock_Snake_Fused(torch.nn.Module):
 
     def remove_weight_norm(self):
         for conv in chain(self.convs1, self.convs2):
-            remove_weight_norm(conv)
+            remove_parametrizations(conv, "weight")
 
 
 class ResBlock_Snake(torch.nn.Module): # Modified
@@ -312,7 +312,7 @@ class ResBlock_Snake(torch.nn.Module): # Modified
 
     def remove_weight_norm(self):
         for conv in chain(self.convs1, self.convs2):
-            remove_weight_norm(conv)
+            remove_parametrizations(conv, "weight")
 
 
 class ResBlock(torch.nn.Module):
@@ -380,4 +380,4 @@ class ResBlock(torch.nn.Module):
 
     def remove_weight_norm(self):
         for conv in chain(self.convs1, self.convs2):
-            remove_weight_norm(conv)
+            remove_parametrizations(conv, "weight")
