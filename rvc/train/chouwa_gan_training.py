@@ -383,7 +383,7 @@ def get_chouwa_config(from_scratch: bool) -> dict:
         "c_fm": CHOUWA_C_FM,
         "c_hf": CHOUWA_C_HF,
         "c_mel": 2.0,
-        "c_kl": 1.0,
+        "c_kl": 5.0,
         "c_stft": 2.0,
         "r1_gamma": CHOUWA_R1_GAMMA,
         "r1_interval": CHOUWA_R1_INTERVAL,

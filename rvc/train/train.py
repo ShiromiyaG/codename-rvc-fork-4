@@ -16,13 +16,6 @@ os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
 # Reduce CUDA allocator fragmentation — critical on small VRAM GPUs (<= 8 GB)
 # when R1 penalty or other ops cause irregular allocation patterns.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-# Suppress _POSIX_C_SOURCE redefinition noise emitted by GCC when Triton
-# JIT-compiles its C stubs. Conda's pyconfig.h and the system's features.h
-# both define the macro to different values; -w silences all GCC warnings
-# for that translation unit without affecting PyTorch/CUDA compilation.
-# Use append (not setdefault) so that conda's existing CFLAGS are preserved.
-os.environ["CFLAGS"] = os.environ.get("CFLAGS", "") + " -w"
-os.environ["CXXFLAGS"] = os.environ.get("CXXFLAGS", "") + " -w"
 import warnings
 # torch.inductor falls back to eager for complex-valued ops (STFT in MRD).
 # This is expected for our training setup; suppress the per-step noise.
@@ -199,20 +192,6 @@ new_pretrain_lr = 5e-5 # If you changed it, it needs to be re-adjusted to the mo
 
 # EXPERIMENTAL
 use_trajectory = False
-
-# torch.compile — Ampere+ (RTX 3090 / A100 / H100) with PyTorch 2.x
-# 'default'  — inductor kernel fusion + op optimization, no CUDA Graphs.
-#              Best balance of speed and compatibility for GAN training
-#              (variable-length batches from bucket sampler, complex STFT in MRD).
-# 'max-autotune' — profiles kernels at startup (~5 min), best for >12 h runs.
-#              Also avoids CUDA Graphs (uses inductor's autotuned triton kernels).
-# NOTE: 'reduce-overhead' / 'max-autotune' enable CUDA Graphs which are
-#       incompatible with this setup (variable shapes, multi-model steps,
-#       complex ops → stalls, empty-graph warnings, tensor aliasing crashes).
-#       'max-autotune-no-cudagraphs' runs Triton autotuning for best kernel
-#       tile sizes without requiring fixed shapes.  First step is slow (~2-5
-#       min while autotuning), steady-state is faster than 'default'.
-# use_compile and compile_mode are now parsed from sys.argv above.
 
 use_sid_swap = False
 custom_sid = 1
@@ -684,8 +663,8 @@ def prepare_schedulers(optim_g, optim_d, use_warmup, warmup_duration, use_lr_sch
 
         elif lr_scheduler == "cosine annealing epoch":
             # Cosine annealing lr scheduler per epoch
-            scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(optim_g, T_max=total_epoch_count, eta_min=2e-5, last_epoch=scheduler_resume_epoch)
-            scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(optim_d, T_max=total_epoch_count, eta_min=2e-5, last_epoch=scheduler_resume_epoch)
+            scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(optim_g, T_max=total_epoch_count, eta_min=3e-5, last_epoch=scheduler_resume_epoch)
+            scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(optim_d, T_max=total_epoch_count, eta_min=3e-5, last_epoch=scheduler_resume_epoch)
 
     return warmup_scheduler_g, warmup_scheduler_d, scheduler_g, scheduler_d
 
@@ -985,9 +964,8 @@ def run(
         print("    ██████  ChouwaGAN: Adaptive D/G balancer active")
         print("    ██████  ChouwaGAN: HF Reconstruction Loss active")
 
-    # Gradient clip ceiling for G — aligned with D so the adversarial
-    # signal isn't overwhelmed after per-disc normalization.
-    grad_clip_g = 10.0 if vocoder == "ChouwaGAN" else 200.0
+    # Gradient clip ceiling for G
+    grad_clip_g = 10.0 if vocoder == "ChouwaGAN" else float("inf")
 
     # Tensorboard handling
     if rank == 0:
@@ -1043,9 +1021,6 @@ def run(
 
     # torch.compile opt-in (requires PyTorch >= 2.0 and CUDA Ampere+)
     if use_compile and device.type == "cuda" and torch.cuda.is_available():
-        # Suppress harmless GCC preprocessor warnings from Triton JIT
-        # (_POSIX_C_SOURCE redefined between Python's pyconfig.h and glibc features.h)
-        os.environ["CFLAGS"] = os.environ.get("CFLAGS", "") + " -Wno-cpp"
         try:
             if rank == 0:
                 print(f"    ██████  torch.compile: mode='{compile_mode}' — compiling G and D...")
@@ -1262,7 +1237,7 @@ def training_loop(
         d_real_label = _cc["d_real_label"]
         grad_accum_steps = _cc["grad_accum_steps"]
     else:
-        grad_clip_d = 150.0
+        grad_clip_d = float("inf")
         c_fm = 1.0
         r1_gamma = 0.0
         r1_interval = 16
@@ -1314,9 +1289,9 @@ def training_loop(
                 model_output = net_g(phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid)
                 # Unpacking:
                 if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
-                    y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q), (mag, phase) = (model_output)
+                    y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q, flow_logdet), (mag, phase) = (model_output)
                 else:
-                    y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q) = (model_output)
+                    y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q, flow_logdet) = (model_output)
 
                 # Slice the original waveform ( y ) to match the generated slice:
                 if randomized:
@@ -1349,7 +1324,10 @@ def training_loop(
             with autocast(device_type="cuda", enabled=use_amp, dtype=train_dtype):
                 # Detach y_hat early to free generator's computation graph
                 y_hat_detached = y_hat.detach()
-                y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat_detached, compute_fmaps=False)
+                if vocoder == "ChouwaGAN":
+                    y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat_detached, compute_fmaps=False)
+                else:
+                    y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat_detached)
 
             with autocast(device_type="cuda", enabled=False):
                 # Compute discriminator loss:
@@ -1358,11 +1336,15 @@ def training_loop(
                     from rvc.train.chouwa_gan_training import softplus_d_loss
                     loss_disc, d_real_mean, d_fake_mean = softplus_d_loss(y_d_hat_r, y_d_hat_g)
                 elif adversarial_loss == "lsgan":
-                    loss_disc, d_real_mean, d_fake_mean = discriminator_loss(
-                        [d.float() for d in y_d_hat_r],
-                        [d.float() for d in y_d_hat_g],
-                        real_label=d_real_label
-                    )
+                    if vocoder == "ChouwaGAN":
+                        loss_disc, d_real_mean, d_fake_mean = discriminator_loss(
+                            [d.float() for d in y_d_hat_r],
+                            [d.float() for d in y_d_hat_g],
+                            real_label=d_real_label,
+                            return_means=True,
+                        )
+                    else:
+                        loss_disc = discriminator_loss(y_d_hat_r, y_d_hat_g)
                 elif adversarial_loss == "tprls":
                     loss_disc = discriminator_loss_v2(y_d_hat_r, y_d_hat_g, real_label=d_real_label)
                 elif adversarial_loss == "hinge":
@@ -1502,21 +1484,25 @@ def training_loop(
                         active_c_stft = 2.0 if vocoder == "ChouwaGAN" else c_stft
                         loss_mel = fn_spectral_loss(y_hat.float(), y.float()) * active_c_stft
 
-                    # Feature Matching loss (normalized per sub-disc, 2× for ChouwaGAN)
+                    # Feature Matching loss
                     loss_fm = feature_loss(
                         [[f.float() for f in fm] for fm in fmap_r],
-                        [[f.float() for f in fm] for fm in fmap_g]
+                        [[f.float() for f in fm] for fm in fmap_g],
+                        normalize=(vocoder == "ChouwaGAN"),
                     ) / n_disc * c_fm
 
-                    # Generator loss (normalized per sub-discriminator)
+                    # Generator loss
                     if adversarial_loss == "softplus":
                         from rvc.train.chouwa_gan_training import softplus_g_loss
                         loss_adv = softplus_g_loss(y_d_hat_g, n_disc)
                     elif adversarial_loss == "lsgan":
-                        loss_adv = generator_loss(
-                            [d.float() for d in y_d_hat_g],
-                            real_label=d_real_label
-                        ) / n_disc
+                        if vocoder == "ChouwaGAN":
+                            loss_adv = generator_loss(
+                                [d.float() for d in y_d_hat_g],
+                                real_label=d_real_label
+                            ) / n_disc
+                        else:
+                            loss_adv = generator_loss(y_d_hat_g)
                     elif adversarial_loss == "tprls":
                         y_d_hat_r_detached = [i.detach() for i in y_d_hat_r_g]
                         loss_adv = generator_loss_v2(y_d_hat_g, y_d_hat_r_detached) / n_disc
@@ -1546,7 +1532,7 @@ def training_loop(
                         loss_kl = kl_loss_clamped(
                             z_p.float(), logs_q.float(),
                             m_p.float(), logs_p.float(),
-                            z_mask.float()
+                            z_mask.float(),
                         ) * config.train.c_kl # KL ( Kullback–Leibler divergence ) loss
                         if vocoder == "ChouwaGAN":
                             loss_hf = hf_recon_loss(y_hat, y) * c_hf

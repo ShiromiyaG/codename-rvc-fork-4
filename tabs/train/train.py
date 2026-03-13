@@ -748,7 +748,7 @@ def train_tab():
                         visible=microarchitecture_capability_checker(),
                         key='use_compile'
                     )
-                    compile_mode = gr.Dropdown(
+                    compile_mode = gr.Radio(
                         label="Compile Mode",
                         info="'default' — fast compile, good speedup. \n'max-autotune-no-cudagraphs' — slower first step, best steady-state speed.",
                         choices=["default", "max-autotune-no-cudagraphs"],

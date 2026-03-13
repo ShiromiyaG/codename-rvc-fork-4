@@ -138,7 +138,7 @@ class Synthesizer(torch.nn.Module):
                     n_harmonics=kwargs.get("n_harmonics", 32),
                     checkpointing=checkpointing,
                 )
-                print("    ██████  Vocoder: ChouwaGAN-PCPH")
+                print("    ██████  Vocoder: ChouwaGAN")
             else:  # vocoder == "HiFi-GAN"
                 from rvc.lib.algorithm.generators import HiFiGANNSFGenerator
                 self.dec = HiFiGANNSFGenerator(
@@ -281,7 +281,11 @@ class Synthesizer(torch.nn.Module):
             if debug_shapes:
                 print(f"[DEBUG PRE-DECODER] z shape: {z.shape}")
 
-            z_p = self.flow(z, spec_mask, g=g)
+            if self.vits_version == "mod":
+                z_p, flow_logdet = self.flow(z, spec_mask, g=g)
+            else:
+                z_p = self.flow(z, spec_mask, g=g)
+                flow_logdet = None
 
             if self.vocoder in ["RingFormer_v1", "RingFormer_v2"]:
                 if self.randomized:
@@ -289,11 +293,11 @@ class Synthesizer(torch.nn.Module):
                     pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
                     o, spec, phase = self.dec(z_slice, pitchf, g=g) # f0 output
 
-                    return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q), (spec, phase)
+                    return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q, flow_logdet), (spec, phase)
                 else:
                     o, spec, phase = self.dec(z, pitchf, g=g) # f0 output
 
-                    return o, None, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q), (spec, phase)
+                    return o, None, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q, flow_logdet), (spec, phase)
 
             else: # For HiFi-Gan, PCPH-Gan and RefineGan training
                 if self.randomized:
@@ -305,17 +309,17 @@ class Synthesizer(torch.nn.Module):
                     else:
                         o = self.dec(z_slice, g=g)
 
-                    return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+                    return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q, flow_logdet)
                 else:
                     if self.use_f0:
                         o = self.dec(z, pitchf, g=g)
                     else:
                         o = self.dec(z, g=g)
 
-                    return o, None, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+                    return o, None, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q, flow_logdet)
         else:
             print(" NONE SPEC ")
-            return None, None, x_mask, None, (None, None, m_p, logs_p, None, None)
+            return None, None, x_mask, None, (None, None, m_p, logs_p, None, None, None)
 
     @torch.jit.export
     def infer(
@@ -368,7 +372,10 @@ class Synthesizer(torch.nn.Module):
             if self.use_f0 and nsff0 is not None:
                 nsff0 = nsff0[:, head:]
 
-        z = self.flow(z_p, x_mask, g=g, reverse=True)
+        if self.vits_version == "mod":
+            z, _ = self.flow(z_p, x_mask, g=g, reverse=True)
+        else:
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
 
         if self.vocoder in ["RingFormer_v1", "RingFormer_v2"]:
             o, _, _ = self.dec(z * x_mask, nsff0, g=g)

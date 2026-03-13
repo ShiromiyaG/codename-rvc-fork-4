@@ -61,15 +61,16 @@ def extract_model(
             model_author = data.get("model_author", None)
 
         # Strip torch.compile's "_orig_mod." prefix so checkpoints are always portable
-        # Flow and encoder weights are kept in FP32 to avoid precision loss that
-        # compounds during normalizing flow reverse transforms at inference.
-        fp32_prefixes = ("flow.", "enc_p.", "dec.")
+        # For VITS Mod: flow weights are kept in FP32 to avoid precision loss
+        # that compounds during ConvNeXt normalizing flow reverse transforms.
+        is_mod = (vits_version == "mod") if isinstance(vits_version, str) else False
+        fp32_prefixes = ("flow.",) if is_mod else ()
         weight_dict = {}
         for key, value in ckpt.items():
             if "enc_q" not in key:
                 if key.startswith("_orig_mod."):
                     key = key.replace("_orig_mod.", "", 1)
-                if key.startswith(fp32_prefixes):
+                if fp32_prefixes and key.startswith(fp32_prefixes):
                     weight_dict[key] = value
                 else:
                     weight_dict[key] = value.half()

@@ -332,7 +332,7 @@ class ResidualCouplingLayerMod(nn.Module):
 
         if not self.mean_only:
             m, logs = torch.split(stats, [self.half_channels] * 2, 1)
-            logs = torch.clamp(logs, min=-10.0, max=2.0)
+            logs = torch.clamp(logs, min=-10.0, max=0.5)
         else:
             # mean_only mode: logs are always zero (no scale transformation)
             m = stats
@@ -395,13 +395,15 @@ class ResidualCouplingBlockMod(nn.Module):
         g: Optional[torch.Tensor] = None,
         reverse: bool = False,
     ):
+        logdet_total = torch.zeros(x.size(0), device=x.device)
         if not reverse:
             for flow in self.flows:
-                x, _ = flow(x, x_mask, g=g, reverse=reverse)
+                x, logdet = flow(x, x_mask, g=g, reverse=reverse)
+                logdet_total = logdet_total + logdet
         else:
             for flow in self.flows[::-1]:
                 x, _ = flow(x, x_mask, g=g, reverse=reverse)
-        return x
+        return x, logdet_total
 
     def remove_weight_norm(self):
         # No weight_norm used in v3 modules

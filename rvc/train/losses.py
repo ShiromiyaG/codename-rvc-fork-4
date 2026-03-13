@@ -22,14 +22,14 @@ def phase_loss(x_fft: torch.Tensor, g_fft: torch.Tensor, reduction: str = 'mean'
         raise ValueError(f"Unsupported reduction mode: {reduction}")
 
 
-def feature_loss(fmap_r, fmap_g):
+def feature_loss(fmap_r, fmap_g, normalize=False):
     """
     Compute the feature loss between reference and generated feature maps.
-    FIX #2: Normalized by total number of layers to prevent gradient explosion.
 
     Args:
         fmap_r (list of torch.Tensor): List of reference feature maps.
         fmap_g (list of torch.Tensor): List of generated feature maps.
+        normalize (bool): If True, normalize by total number of layers (for multi-disc setups like ChouwaGAN).
     """
     loss = 0.0
     n_layers = 0
@@ -39,11 +39,12 @@ def feature_loss(fmap_r, fmap_g):
             loss += torch.mean(torch.abs(rl - gl))
             n_layers += 1
     
-    # FIX #2: Normalize by total number of layers (~45 with 9 discriminators)
-    return 2 * loss / n_layers
+    if normalize and n_layers > 0:
+        return 2 * loss / n_layers
+    return 2 * loss
 
 
-def discriminator_loss(disc_real_outputs, disc_generated_outputs, real_label: float = 1.0):
+def discriminator_loss(disc_real_outputs, disc_generated_outputs, real_label: float = 1.0, return_means: bool = False):
     """
     Compute the discriminator loss for real and generated outputs.
 
@@ -51,6 +52,7 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs, real_label: fl
         disc_real_outputs (list of torch.Tensor): List of discriminator outputs for real samples.
         disc_generated_outputs (list of torch.Tensor): List of discriminator outputs for generated samples.
         real_label (float): Target value for real samples. Use <1.0 for label smoothing (e.g. 0.9).
+        return_means (bool): If True, also return mean D(real) and D(fake) scores.
     """
     loss = 0
     d_real_sum, d_fake_sum = 0.0, 0.0
@@ -59,11 +61,14 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs, real_label: fl
         g_loss = torch.mean(dg.float() ** 2)
 
         loss += r_loss + g_loss
-        d_real_sum += dr.detach().mean().item()
-        d_fake_sum += dg.detach().mean().item()
+        if return_means:
+            d_real_sum += dr.detach().mean().item()
+            d_fake_sum += dg.detach().mean().item()
 
-    n = len(disc_real_outputs)
-    return loss, d_real_sum / n, d_fake_sum / n
+    if return_means:
+        n = len(disc_real_outputs)
+        return loss, d_real_sum / n, d_fake_sum / n
+    return loss
 
 
 def generator_loss(disc_outputs, real_label: float = 1.0):
@@ -102,10 +107,9 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
 
     return loss
 
-def kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask):
+def kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask, flow_logdet=None):
     """
     Compute the Kullback-Leibler divergence loss.
-    Variant with non-negativity clamp.
     Always computed in FP32: the exp(-2*logs_p) term is sensitive to BF16/FP16
     quantization (~3 decimal digits), which can cause the KL to go negative.
 
@@ -115,6 +119,7 @@ def kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask):
         m_p (torch.Tensor): Mean of the prior distribution p [b, h, t_t].
         logs_p (torch.Tensor): Log variance of the prior distribution p [b, h, t_t].
         z_mask (torch.Tensor): Mask for the latent variables [b, h, t_t].
+        flow_logdet (torch.Tensor, optional): Log-determinant of the flow Jacobian [b].
     """
     z_p    = z_p.float()
     logs_q = logs_q.float()
@@ -124,8 +129,11 @@ def kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask):
 
     kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
     kl = (kl * z_mask).sum()
+    if flow_logdet is not None:
+        kl = kl - flow_logdet.detach().float().sum()
     loss = kl / z_mask.sum()
-    loss = torch.clamp(loss, min=0.0)
+    if flow_logdet is None:
+        loss = torch.clamp(loss, min=0.0)
 
     return loss
 
