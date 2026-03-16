@@ -107,19 +107,22 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
 
     return loss
 
-def kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask, flow_logdet=None):
+def kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask, flow_logdet=None, free_bits=0.0):
     """
     Compute the Kullback-Leibler divergence loss.
     Always computed in FP32: the exp(-2*logs_p) term is sensitive to BF16/FP16
     quantization (~3 decimal digits), which can cause the KL to go negative.
 
     Args:
-        z_p (torch.Tensor): Sampled latent variable transformed by the flow [b, h, t_t].
-        logs_q (torch.Tensor): Log variance of the posterior distribution q [b, h, t_t].
-        m_p (torch.Tensor): Mean of the prior distribution p [b, h, t_t].
-        logs_p (torch.Tensor): Log variance of the prior distribution p [b, h, t_t].
-        z_mask (torch.Tensor): Mask for the latent variables [b, h, t_t].
-        flow_logdet (torch.Tensor, optional): Log-determinant of the flow Jacobian [b].
+        free_bits (float): Per-dimension KL floor in nats (Kingma et al. 2016).
+            When a dimension's KL drops below this threshold, its gradient is
+            zeroed — only reconstruction drives the posterior for that dimension.
+            Prevents KL collapse when the decoder has rich non-z information.
+            Use 0.0 to disable (default, backward-compatible).
+
+    Returns:
+        loss (Tensor): scalar loss for backprop.
+        raw_kl (Tensor): mean KL per dimension (for monitoring).
     """
     z_p    = z_p.float()
     logs_q = logs_q.float()
@@ -127,15 +130,40 @@ def kl_loss_clamped(z_p, logs_q, m_p, logs_p, z_mask, flow_logdet=None):
     logs_p = logs_p.float()
     z_mask = z_mask.float()
 
+    # Per-element KL: (b, h, t)
     kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
-    kl = (kl * z_mask).sum()
-    if flow_logdet is not None:
-        kl = kl - flow_logdet.detach().float().sum()
-    loss = kl / z_mask.sum()
-    if flow_logdet is None:
-        loss = torch.clamp(loss, min=0.0)
 
-    return loss
+    # Raw mean KL per dimension for monitoring (before free bits)
+    n_dims = kl.shape[1]
+    mask_sum = z_mask.sum()
+    raw_kl = (kl * z_mask).sum() / (mask_sum * n_dims)
+    raw_kl = torch.clamp(raw_kl, min=0.0)
+
+    if free_bits > 0.0:
+        # Free bits with preserved prior gradient.
+        # Standard free bits (torch.clamp) zeros ALL gradients for dims below
+        # threshold — including the prior's. This causes prior collapse:
+        # text encoder stops learning, m_p_std → 0.
+        #
+        # Fix: for below-threshold dims, detach posterior terms (z_p, logs_q)
+        # so only prior (m_p, logs_p) gets KL gradient. The posterior is freed
+        # for reconstruction, but the prior still tracks where the posterior goes.
+        kl_per_dim = (kl * z_mask).sum(dim=[0, 2]) / mask_sum  # (h,)
+        below = (kl_per_dim.detach() < free_bits)  # bool mask, no gradient
+
+        z_p_fb = torch.where(below[None, :, None], z_p.detach(), z_p)
+        logs_q_fb = torch.where(below[None, :, None], logs_q.detach(), logs_q)
+
+        kl_fb = logs_p - logs_q_fb - 0.5 + 0.5 * ((z_p_fb - m_p) ** 2) * torch.exp(-2 * logs_p)
+        loss = (kl_fb * z_mask).sum() / mask_sum
+    else:
+        loss = (kl * z_mask).sum() / mask_sum
+
+    # Change-of-variables correction for normalizing flow
+    if flow_logdet is not None:
+        loss = loss - flow_logdet.detach().float().sum() / mask_sum
+
+    return loss, raw_kl
 
 
 def discriminator_TPRLS_loss(disc_real_outputs, disc_generated_outputs):

@@ -1,178 +1,147 @@
 """
-VITS Mod modules: ConvNeXt-based Posterior Encoder and Normalizing Flow.
+VITS Mod modules: Lightweight Posterior Encoder and Normalizing Flow.
 
-Replaces the WaveNet backbone used in VITS v1/v2 with ConvNeXt 1D blocks
-and FiLM conditioning. These modules are drop-in replacements with the same
-input/output signatures as the original PosteriorEncoder and ResidualCouplingBlock.
+Uses depthwise separable gated convolutions instead of full WaveNet convolutions,
+reducing parameter count by ~3x and FLOPs by ~4x while preserving:
+- Gated activation (tanh*sigmoid) — audio inductive bias
+- Exponential dilation pattern — same receptive field
+- FiLM speaker conditioning — per-layer adaptation
+- Skip accumulation — multi-scale feature extraction
+- logs_q clamping in posterior encoder (prevents variance collapse)
+- logs clamping in coupling layers (prevents unbounded scaling)
+- flow_logdet properly accumulated and returned (used in KL computation)
+
+Drop-in replacements: PosteriorEncoderMod and ResidualCouplingBlockMod.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional, Tuple
 
 from rvc.lib.algorithm.commons import sequence_mask
 
 
 # ---------------------------------------------------------------------------
-# Building blocks
+# Lightweight gated dilated convolution stack
 # ---------------------------------------------------------------------------
 
-class ConvNeXtLayerNorm1D(nn.Module):
-    """Channel-first LayerNorm for 1D sequences (B, C, T)."""
+class LightConvNet(nn.Module):
+    """
+    Lightweight WaveNet-style backbone using depthwise separable convolutions.
 
-    def __init__(self, channels: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(channels))
-        self.bias = nn.Parameter(torch.zeros(channels))
-        self.eps = eps
+    Each layer: GroupNorm -> DwConv(dilated) -> PwConv(->2H) + FiLM(g) -> tanh*sigmoid -> proj
+    Output: skip accumulation from all layers (multi-scale, same as WaveNet).
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_dtype = x.dtype
-        needs_upcast = orig_dtype in (torch.bfloat16, torch.float16)
-        
-        if needs_upcast:
-            x = x.float()
-        
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
-        
-        if needs_upcast:
-            x = self.weight[:, None].float() * x + self.bias[:, None].float()
-            return x.to(orig_dtype)
-        else:
-            return self.weight[:, None] * x + self.bias[:, None]
-
-
-class FiLM(nn.Module):
-    """Feature-wise Linear Modulation."""
-
-    def __init__(self, gin_channels: int, channels: int):
-        super().__init__()
-        self.proj = nn.Conv1d(gin_channels, channels * 2, 1)
-        
-        nn.init.trunc_normal_(self.proj.weight, std=0.02)
-        nn.init.constant_(self.proj.bias[:channels], 0.0)
-        nn.init.constant_(self.proj.bias[channels:], 0.0)
-
-    def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        gamma_beta = self.proj(g)
-        gamma, beta = gamma_beta.chunk(2, dim=1)
-        return (1.0 + gamma) * x + beta
-
-
-class CAM(nn.Module):
-    """Context Aware Module - large-kernel depthwise convolution."""
-
-    def __init__(self, channels: int, kernel_size: int = 31):
-        super().__init__()
-        self.dwconv = nn.Conv1d(
-            channels, channels,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2,
-            groups=channels,
-            bias=True,
-        )
-        self.norm = ConvNeXtLayerNorm1D(channels)
-        
-        nn.init.constant_(self.dwconv.weight, 0.0)
-        nn.init.constant_(self.dwconv.bias, 0.0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.norm(self.dwconv(x))
-
-
-class GRN(nn.Module):
-    """Global Response Normalization (ConvNeXt V2)."""
-
-    def __init__(self, channels: int, eps: float = 1e-6):
-        super().__init__()
-        self.gamma = nn.Parameter(torch.zeros(1, channels, 1))
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gx = torch.linalg.vector_norm(x, ord=2, dim=2, keepdim=True)
-        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
-        return self.gamma * (x * nx) + self.beta + x
-
-
-class ConvNeXtBlock1D(nn.Module):
-    """ConvNeXt V2 block with optional FiLM conditioning."""
+    Depthwise separable factorization:
+        Full Conv1d(H->2H, k): 2*H^2*k params
+        DwConv(H, k, groups=H) + PwConv(H->2H): H*k + 2*H^2 params  (~4x fewer for k=7)
+    """
 
     def __init__(
         self,
-        channels: int,
-        kernel_size: int = 7,
-        mlp_ratio: float = 4.0,
-        dilation: int = 1,
-        layer_scale_init: float = 1e-6,
+        hidden_channels: int,
+        kernel_size: int,
+        dilation_rate: int,
+        n_layers: int,
         gin_channels: int = 0,
+        p_dropout: float = 0.0,
     ):
         super().__init__()
-        mlp_dim = int(channels * mlp_ratio)
+        assert kernel_size % 2 == 1
 
-        self.dwconv = nn.Conv1d(
-            channels, channels,
-            kernel_size=kernel_size,
-            padding=int(dilation * (kernel_size - 1) / 2),
-            dilation=dilation,
-            groups=channels,
-            bias=True,
-        )
-        self.norm = ConvNeXtLayerNorm1D(channels)
-        self.pwconv1 = nn.Conv1d(channels, mlp_dim, 1)
-        self.act = nn.GELU()
-        self.grn = GRN(mlp_dim)
-        self.pwconv2 = nn.Conv1d(mlp_dim, channels, 1)
-        self.gamma = (
-            nn.Parameter(layer_scale_init * torch.ones(1, channels, 1))
-            if layer_scale_init > 0 else None
-        )
+        self.hidden_channels = hidden_channels
+        self.n_layers = n_layers
 
-        self.film = FiLM(gin_channels, channels) if gin_channels > 0 else None
-        
-        # Initialize weights (will be re-initialized by parent's apply())
-        self._init_weights()
+        self.norms = nn.ModuleList()
+        self.dwconvs = nn.ModuleList()
+        self.pwconvs = nn.ModuleList()
+        self.res_skip_layers = nn.ModuleList()
+        self.drop = nn.Dropout(p_dropout)
 
-    def _init_weights(self):
-        nn.init.trunc_normal_(self.dwconv.weight, std=0.02)
-        nn.init.constant_(self.dwconv.bias, 0)
-        
-        nn.init.trunc_normal_(self.pwconv1.weight, std=0.02)
-        nn.init.constant_(self.pwconv1.bias, 0)
-        
-        nn.init.trunc_normal_(self.pwconv2.weight, std=0.02)
-        nn.init.constant_(self.pwconv2.bias, 0)
+        # FiLM: per-layer conditioning via shared projection (same as WaveNet)
+        if gin_channels > 0:
+            self.cond_layer = nn.Conv1d(
+                gin_channels, 2 * hidden_channels * n_layers, 1
+            )
+        else:
+            self.cond_layer = None
+
+        for i in range(n_layers):
+            dilation = dilation_rate ** i
+            padding = (kernel_size * dilation - dilation) // 2
+
+            # GroupNorm(1, C) = LayerNorm over channels
+            self.norms.append(nn.GroupNorm(1, hidden_channels))
+
+            # Depthwise conv: each channel has its own kernel (spatial processing)
+            self.dwconvs.append(nn.Conv1d(
+                hidden_channels, hidden_channels, kernel_size,
+                dilation=dilation, padding=padding, groups=hidden_channels,
+            ))
+
+            # Pointwise conv: cross-channel mixing -> 2H for gating
+            self.pwconvs.append(nn.Conv1d(hidden_channels, 2 * hidden_channels, 1))
+
+            if i < n_layers - 1:
+                res_skip_channels = 2 * hidden_channels
+            else:
+                res_skip_channels = hidden_channels
+            self.res_skip_layers.append(
+                nn.Conv1d(hidden_channels, res_skip_channels, 1)
+            )
 
     def forward(
         self, x: torch.Tensor, x_mask: torch.Tensor,
         g: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        residual = x
-        x = self.dwconv(x * x_mask)
-        x = self.norm(x)
+        output = torch.zeros_like(x)
 
-        if self.film is not None and g is not None:
-            x = self.film(x, g)
+        if g is not None and self.cond_layer is not None:
+            g = self.cond_layer(g)
 
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.grn(x)
-        x = self.pwconv2(x)
-        if self.gamma is not None:
-            x = self.gamma * x
+        for i in range(self.n_layers):
+            # Depthwise separable: norm -> dwconv (spatial) -> pwconv (cross-channel)
+            x_in = self.norms[i](x)
+            x_in = self.dwconvs[i](x_in)
+            x_in = self.pwconvs[i](x_in)
 
-        return (residual + x) * x_mask
+            # FiLM conditioning (same mechanism as WaveNet)
+            if g is not None:
+                cond_offset = i * 2 * self.hidden_channels
+                g_l = g[:, cond_offset:cond_offset + 2 * self.hidden_channels, :]
+                x_in = x_in + g_l
+
+            # Gated activation (same audio inductive bias as WaveNet)
+            x_a, x_b = x_in.chunk(2, dim=1)
+            acts = torch.tanh(x_a) * torch.sigmoid(x_b)
+            acts = self.drop(acts)
+
+            # Skip accumulation (multi-scale output)
+            res_skip_acts = self.res_skip_layers[i](acts)
+            if i < self.n_layers - 1:
+                res_acts = res_skip_acts[:, :self.hidden_channels, :]
+                x = (x + res_acts) * x_mask
+                output = output + res_skip_acts[:, self.hidden_channels:, :]
+            else:
+                output = output + res_skip_acts
+
+        return output * x_mask
+
+    def remove_weight_norm(self):
+        """No-op: uses GroupNorm instead of weight_norm."""
+        pass
 
 
 # ---------------------------------------------------------------------------
-# Posterior Encoder v3
+# Posterior Encoder (LightConvNet + logs_q clamping)
 # ---------------------------------------------------------------------------
 
 class PosteriorEncoderMod(nn.Module):
-    """Posterior Encoder using ConvNeXt blocks with FiLM conditioning."""
+    """
+    Lightweight Posterior Encoder with variance clamping.
+
+    logs_q clamped to [-7, 2] to prevent variance collapse (sigma_q -> 0).
+    """
 
     def __init__(
         self,
@@ -182,38 +151,21 @@ class PosteriorEncoderMod(nn.Module):
         kernel_size: int = 7,
         n_layers: int = 8,
         gin_channels: int = 0,
-        mlp_ratio: float = 4.0,
+        mlp_ratio: float = 4.0,  # unused, kept for interface compatibility
     ):
         super().__init__()
         self.out_channels = out_channels
 
         self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
-
-        # Exponential dilation for larger receptive field
-        dilation_cycle = [1, 2, 4, 8]
-
-        self.blocks = nn.ModuleList([
-            ConvNeXtBlock1D(
-                channels=hidden_channels,
-                kernel_size=kernel_size,
-                mlp_ratio=mlp_ratio,
-                dilation=dilation_cycle[i % len(dilation_cycle)],
-                gin_channels=gin_channels,
-            )
-            for i in range(n_layers)
-        ])
+        self.enc = LightConvNet(
+            hidden_channels,
+            kernel_size=kernel_size,
+            dilation_rate=2,
+            n_layers=n_layers,
+            gin_channels=gin_channels,
+            p_dropout=0.0,
+        )
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
-
-        self.apply(self._init_weights)
-        
-        nn.init.trunc_normal_(self.proj.weight, std=0.01)
-        nn.init.constant_(self.proj.bias, 0)
-
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv1d, nn.Linear)):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
 
     def forward(
         self, x: torch.Tensor, x_lengths: torch.Tensor,
@@ -224,29 +176,28 @@ class PosteriorEncoderMod(nn.Module):
         ).to(x.dtype)
 
         x = self.pre(x) * x_mask
-
-        for block in self.blocks:
-            x = block(x, x_mask, g=g)
-
+        x = self.enc(x, x_mask, g=g)
         stats = self.proj(x) * x_mask
         m, logs = torch.split(stats, self.out_channels, dim=1)
-        
-        logs = torch.clamp(logs, min=-10.0, max=2.0)
-        
+
+        # Clamp logs_q to prevent variance collapse and explosion.
+        # min=-7 -> sigma_q >= exp(-7) ~ 0.0009 (posterior stays stochastic)
+        # max=2  -> sigma_q <= exp(2)  ~ 7.4    (prevents instability)
+        logs = torch.clamp(logs, min=-7.0, max=2.0)
+
         z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
         return z, m, logs, x_mask
 
     def remove_weight_norm(self):
-        # No weight_norm used in v3 modules
-        pass
+        self.enc.remove_weight_norm()
 
 
 # ---------------------------------------------------------------------------
-# Normalizing Flow v3
+# Normalizing Flow (LightConvNet + logdet + logs clamping)
 # ---------------------------------------------------------------------------
 
 class Flip(nn.Module):
-    """Channel flip for coupling layers (same as original VITS)."""
+    """Channel flip for coupling layers."""
 
     def forward(
         self,
@@ -256,24 +207,28 @@ class Flip(nn.Module):
         reverse: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = torch.flip(x, [1])
-        # Flip is volume-preserving, so logdet is always zero
         logdet = torch.zeros(x.size(0), dtype=x.dtype, device=x.device)
         return x, logdet
 
+    def remove_weight_norm(self):
+        pass
+
 
 class ResidualCouplingLayerMod(nn.Module):
-    """Affine coupling layer with ConvNeXt + CAM backbone."""
+    """
+    Affine coupling layer with lightweight backbone and logs clamping.
+    logs clamped to [-10, 0.5], properly returns logdet.
+    """
 
     def __init__(
         self,
         channels: int,
         hidden_channels: int,
         kernel_size: int = 7,
+        dilation_rate: int = 1,
         n_layers: int = 4,
         gin_channels: int = 0,
         mean_only: bool = False,
-        cam_kernel_size: int = 31,
-        mlp_ratio: float = 4.0,
     ):
         assert channels % 2 == 0
         super().__init__()
@@ -281,38 +236,21 @@ class ResidualCouplingLayerMod(nn.Module):
         self.mean_only = mean_only
 
         self.pre = nn.Conv1d(self.half_channels, hidden_channels, 1)
-        self.cam = CAM(hidden_channels, kernel_size=cam_kernel_size)
-
-        # Exponential dilation for larger receptive field
-        dilation_cycle = [1, 2, 4, 8]
-
-        self.blocks = nn.ModuleList([
-            ConvNeXtBlock1D(
-                channels=hidden_channels,
-                kernel_size=kernel_size,
-                mlp_ratio=mlp_ratio,
-                dilation=dilation_cycle[i % len(dilation_cycle)],
-                gin_channels=gin_channels,
-            )
-            for i in range(n_layers)
-        ])
+        self.enc = LightConvNet(
+            hidden_channels,
+            kernel_size=kernel_size,
+            dilation_rate=2,
+            n_layers=n_layers,
+            gin_channels=gin_channels,
+            p_dropout=0.0,
+        )
         self.post = nn.Conv1d(
             hidden_channels, self.half_channels * (2 - mean_only), 1
         )
 
-        self.apply(self._init_weights)
-        
-        # Re-zero layers that need identity init
+        # Zero-init for identity coupling at start
         self.post.weight.data.zero_()
         self.post.bias.data.zero_()
-        nn.init.constant_(self.cam.dwconv.weight, 0.0)
-        nn.init.constant_(self.cam.dwconv.bias, 0.0)
-
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv1d, nn.Linear)):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
 
     def forward(
         self,
@@ -323,18 +261,13 @@ class ResidualCouplingLayerMod(nn.Module):
     ):
         x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
         h = self.pre(x0) * x_mask
-        h = self.cam(h) * x_mask
-
-        for block in self.blocks:
-            h = block(h, x_mask, g=g)
-
+        h = self.enc(h, x_mask, g=g)
         stats = self.post(h) * x_mask
 
         if not self.mean_only:
             m, logs = torch.split(stats, [self.half_channels] * 2, 1)
             logs = torch.clamp(logs, min=-10.0, max=0.5)
         else:
-            # mean_only mode: logs are always zero (no scale transformation)
             m = stats
             logs = torch.zeros_like(m)
 
@@ -346,17 +279,18 @@ class ResidualCouplingLayerMod(nn.Module):
         else:
             x1 = (x1 - m) * torch.exp(-logs) * x_mask
             x = torch.cat([x0, x1], 1)
-            # Return consistent shape with forward pass
             logdet = torch.zeros(x.size(0), dtype=x.dtype, device=x.device)
             return x, logdet
 
     def remove_weight_norm(self):
-        # No weight_norm used in v3 modules
-        pass
+        self.enc.remove_weight_norm()
 
 
 class ResidualCouplingBlockMod(nn.Module):
-    """Normalizing flow with ConvNeXt + CAM coupling layers."""
+    """
+    Normalizing flow with lightweight coupling layers.
+    Accumulates and RETURNS flow_logdet (v1 discards it).
+    """
 
     def __init__(
         self,
@@ -366,8 +300,8 @@ class ResidualCouplingBlockMod(nn.Module):
         n_layers: int = 4,
         n_flows: int = 4,
         gin_channels: int = 0,
-        cam_kernel_size: int = 31,
-        mlp_ratio: float = 4.0,
+        cam_kernel_size: int = 31,  # unused, kept for interface compatibility
+        mlp_ratio: float = 4.0,    # unused, kept for interface compatibility
     ):
         super().__init__()
         self.n_flows = n_flows
@@ -379,11 +313,10 @@ class ResidualCouplingBlockMod(nn.Module):
                     channels,
                     hidden_channels,
                     kernel_size=kernel_size,
+                    dilation_rate=2,
                     n_layers=n_layers,
                     gin_channels=gin_channels,
                     mean_only=True,
-                    cam_kernel_size=cam_kernel_size,
-                    mlp_ratio=mlp_ratio,
                 )
             )
             self.flows.append(Flip())
@@ -406,5 +339,5 @@ class ResidualCouplingBlockMod(nn.Module):
         return x, logdet_total
 
     def remove_weight_norm(self):
-        # No weight_norm used in v3 modules
-        pass
+        for i in range(self.n_flows):
+            self.flows[i * 2].remove_weight_norm()

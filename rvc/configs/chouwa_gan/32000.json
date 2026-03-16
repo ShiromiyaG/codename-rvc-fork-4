@@ -72,13 +72,14 @@
         "use_spectral_norm": true,
         "gin_channels": 256,
         "spk_embed_dim": 109,
-        "n_harmonics": 32,
-        "backbone_kernel_size": 13,
+        "n_harmonics": 8,
+        "use_backbone": false,
+        "backbone_kernel_size": 1,
         "backbone_depths": [
-            2,
-            2,
-            5,
-            2
+            1,
+            1,
+            1,
+            1
         ],
         "backbone_dims": [
             192,
@@ -88,23 +89,16 @@
         ],
         "backbone_dilations": [
             [
-                1,
-                2
+                1
             ],
             [
-                1,
-                2
+                1
             ],
             [
-                1,
-                1,
-                2,
-                4,
-                8
+                1
             ],
             [
-                1,
-                2
+                1
             ]
         ],
         "backbone_mlp_ratio": 3.0

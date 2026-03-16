@@ -130,12 +130,13 @@ class Synthesizer(torch.nn.Module):
                     upsample_kernel_sizes,
                     gin_channels=gin_channels,
                     sr=sr,
-                    backbone_depths=kwargs.get("backbone_depths", [2, 2, 5, 2]),
+                    n_harmonics=kwargs.get("n_harmonics", 8),
+                    use_backbone=kwargs.get("use_backbone", False),
+                    backbone_depths=kwargs.get("backbone_depths", [1, 1, 1, 1]),
                     backbone_dims=kwargs.get("backbone_dims", [192, 256, 384, 384]),
-                    backbone_dilations=kwargs.get("backbone_dilations", [[1, 2], [1, 2], [1, 1, 2, 4, 8], [1, 2]]),
-                    backbone_kernel_size=kwargs.get("backbone_kernel_size", 13),
+                    backbone_dilations=kwargs.get("backbone_dilations", [[1], [1], [1], [1]]),
+                    backbone_kernel_size=kwargs.get("backbone_kernel_size", 1),
                     backbone_mlp_ratio=kwargs.get("backbone_mlp_ratio", 3.0),
-                    n_harmonics=kwargs.get("n_harmonics", 32),
                     checkpointing=checkpointing,
                 )
                 print("    ██████  Vocoder: ChouwaGAN")
@@ -170,7 +171,7 @@ class Synthesizer(torch.nn.Module):
                     checkpointing=checkpointing,
                 )
         if vits_version == "mod":
-            # ConvNeXt-based posterior encoder + flow
+            # Lightweight posterior encoder + flow
             self.enc_q = PosteriorEncoderMod(
                 spec_channels,
                 inter_channels,
@@ -190,7 +191,7 @@ class Synthesizer(torch.nn.Module):
                 cam_kernel_size=31,
                 mlp_ratio=4.0,
             )
-            print("    ██████  VITS Mod: ConvNeXt Posterior Encoder + ConvNeXt+CAM Flow")
+            print("    ██████  VITS Mod: Lightweight Posterior Encoder + Flow")
         else:
             # v1 / v2: WaveNet-based posterior encoder
             self.enc_q = PosteriorEncoder(
@@ -287,6 +288,12 @@ class Synthesizer(torch.nn.Module):
                 z_p = self.flow(z, spec_mask, g=g)
                 flow_logdet = None
 
+            # No z_dec decomposition — standard VITS gradient flow.
+            # The reduced ConvNeXt receptive field (kernel=7, max_dil=2)
+            # forces the decoder to rely on per-frame latent content,
+            # preventing the mean collapse that occurred with kernel=13/dil=8.
+            z_dec = z
+
             if self.vocoder in ["RingFormer_v1", "RingFormer_v2"]:
                 if self.randomized:
                     z_slice, ids_slice = rand_slice_segments(z, spec_lengths, self.segment_size)
@@ -301,7 +308,7 @@ class Synthesizer(torch.nn.Module):
 
             else: # For HiFi-Gan, PCPH-Gan and RefineGan training
                 if self.randomized:
-                    z_slice, ids_slice = rand_slice_segments(z, spec_lengths, self.segment_size)
+                    z_slice, ids_slice = rand_slice_segments(z_dec, spec_lengths, self.segment_size)
 
                     if self.use_f0:
                         pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
@@ -312,9 +319,9 @@ class Synthesizer(torch.nn.Module):
                     return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q, flow_logdet)
                 else:
                     if self.use_f0:
-                        o = self.dec(z, pitchf, g=g)
+                        o = self.dec(z_dec, pitchf, g=g)
                     else:
-                        o = self.dec(z, g=g)
+                        o = self.dec(z_dec, g=g)
 
                     return o, None, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q, flow_logdet)
         else:

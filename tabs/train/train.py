@@ -343,7 +343,7 @@ def train_tab():
                 )
                 vits_version = gr.Radio(
                     label="VITS Version",
-                    info="Choose the VITS encoder/flow backbone:\n- **v1:ㅤWaveNet backbone - OG VITS.**\n- **v2:ㅤWaveNet + FiLM (VITS2 mode) - Requires VITS2-compatible pretrains.**\n- **mod:ㅤConvNeXt Posterior Encoder + ConvNeXt+CAM Flow.** **Requires mod-compatible pretrains.**\n\n**⚠ Each combination of Vocoder + VITS version requires its own pretrained models!**",
+                    info="Choose the VITS encoder/flow backbone:\n- **v1:ㅤWaveNet backbone - OG VITS.**\n- **v2:ㅤWaveNet + FiLM (VITS2 mode) - Requires VITS2-compatible pretrains.**\n- **mod:ㅤLightweight Posterior Encoder + Flow.** **Requires mod-compatible pretrains.**\n\n**⚠ Each combination of Vocoder + VITS version requires its own pretrained models!**",
                     choices=["v1", "v2", "mod"],
                     value="v1",
                     interactive=True,

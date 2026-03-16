@@ -15,13 +15,19 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
-from torch.nn.utils.parametrize import remove_parametrizations
+from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 
 from rvc.lib.algorithm.residuals import LRELU_SLOPE, ResBlock_SnakeBeta
 from rvc.lib.algorithm.conformer.activations import SnakeBeta
-from rvc.lib.algorithm.generators.pcph_gan import SourceModulePCPH
-from rvc.lib.algorithm.generators.pcph_gan_modules.PchipF0UpsamplerTorch import PchipF0UpsamplerTorch
+
+
+def remove_weight_norm_legacy_safe(module):
+    if is_parametrized(module, "weight"):
+        remove_parametrizations(module, "weight", leave_parametrized=True)
+    else:
+        remove_weight_norm(module)
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +64,7 @@ class RMSNorm1D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T) — fused rsqrt avoids separate sqrt + div
         orig_dtype = x.dtype
-        if orig_dtype in (torch.float16, torch.bfloat16):
+        if orig_dtype == torch.float16:
             x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(dim=1, keepdim=True) + self.eps) * self.weight[:, None]
         return x.to(orig_dtype) if orig_dtype != torch.float32 else x
@@ -75,7 +81,7 @@ class ChannelsFirstLayerNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T)
         orig_dtype = x.dtype
-        if orig_dtype in (torch.float16, torch.bfloat16):
+        if orig_dtype == torch.float16:
             x = x.float()
         u = x.mean(dim=1, keepdim=True)
         s = (x - u).pow(2).mean(dim=1, keepdim=True)
@@ -87,10 +93,16 @@ class ChannelsFirstLayerNorm(nn.Module):
 class ConvNeXtBlock(nn.Module):
     """
     ConvNeXt Block (channels-first throughout — no transpose).
-    DwConv -> LayerNorm -> Conv1d(1x1) -> GELU -> GRN -> Conv1d(1x1)
+    DwConv -> LayerNorm -> Conv1d(1x1) -> Gated (tanh*sigmoid) -> GRN -> Conv1d(1x1)
+
+    The GELU activation is replaced by a gated unit: pwconv1 projects to
+    2*hidden_dim, one half goes through tanh and the other through sigmoid,
+    their product forms the gated output. This is the same audio inductive
+    bias as WaveNet, which significantly accelerates convergence without
+    changing parameter count or architectural complexity.
     """
 
-    def __init__(self, dim: int, layer_scale_init_value: float = 0.0, 
+    def __init__(self, dim: int, layer_scale_init_value: float = 0.0,
                  mlp_ratio: float = 3.0, kernel_size: int = 13, dilation: int = 1):
         super().__init__()
         self.dwconv = nn.Conv1d(
@@ -99,13 +111,13 @@ class ConvNeXtBlock(nn.Module):
             groups=dim, bias=True,
         )
         self.norm = ChannelsFirstLayerNorm(dim)
-        
+
         hidden_dim = int(mlp_ratio * dim)
-        self.pwconv1 = nn.Conv1d(dim, hidden_dim, 1)
-        self.act = nn.GELU()
+        # 2*hidden_dim: one half for tanh gate, one half for sigmoid gate
+        self.pwconv1 = nn.Conv1d(dim, hidden_dim * 2, 1)
         self.grn = GlobalResponseNorm(hidden_dim)
         self.pwconv2 = nn.Conv1d(hidden_dim, dim, 1)
-        
+
         self.gamma = (
             nn.Parameter(layer_scale_init_value * torch.ones(1, dim, 1), requires_grad=True)
             if layer_scale_init_value > 0 else None
@@ -116,13 +128,15 @@ class ConvNeXtBlock(nn.Module):
         x = self.dwconv(x)
         x = self.norm(x)
         x = self.pwconv1(x)
-        x = self.act(x)
+        # Gated activation: tanh(x_a) * sigmoid(x_b)
+        x_a, x_b = x.chunk(2, dim=1)
+        x = torch.tanh(x_a) * torch.sigmoid(x_b)
         x = self.grn(x)
         x = self.pwconv2(x)
-        
+
         if self.gamma is not None:
             x = self.gamma * x
-        
+
         if apply_residual:
             x = residual + x
         return x
@@ -197,44 +211,43 @@ def get_padding(kernel_size, dilation=1):
     return (kernel_size * dilation - dilation) // 2
 
 
-def init_weights(m, mean=0.0, std=0.01):
-    """Initialize weights with normal distribution."""
-    classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        if hasattr(m, 'weight') and m.weight is not None:
-            m.weight.data.normal_(mean, std)
-        if hasattr(m, 'bias') and m.bias is not None:
-            nn.init.constant_(m.bias, 0.0)
-
-
-class SubPixelConv1d(nn.Module):
+class UpsampleConvTranspose1d(nn.Module):
     """
-    Upsampling block using Sub-Pixel Convolution (PixelShuffle 1D).
-    Generates channels * upsample_factor channels via Conv1d, then interweaves them
-    to achieve upsampling without the spectral images of ConvTranspose1d or the
-    extra VRAM overhead of Interpolate.
+    Transposed-convolution upsampler (BigVGAN approach).
+
+    ConvTranspose1d with stride == upsample_factor.  The kernel size is
+    chosen so that ``padding = (kernel_size - stride) // 2``, which produces
+    an output whose length is exactly ``input_length * stride``.
+
+    Unlike nearest-neighbor + Conv1d, each output position has independent
+    weight paths through the transposed kernel, avoiding the piecewise-
+    constant gradient problem that can cause mode collapse to silence.
     """
-    def __init__(self, in_channels, out_channels, upsample_factor, kernel_size=7):
+    def __init__(self, in_channels, out_channels, upsample_factor, kernel_size=None):
         super().__init__()
-        self.factor = upsample_factor
-        padding = (kernel_size - 1) // 2
-        
-        self.conv = weight_norm(nn.Conv1d(
-            in_channels,
-            out_channels * upsample_factor,
+        stride = upsample_factor
+        if kernel_size is None:
+            kernel_size = upsample_factor * 2          # BigVGAN default: k = 2*stride
+
+        # Ensure (kernel_size - stride) is even for symmetric padding
+        if (kernel_size - stride) % 2 != 0:
+            kernel_size += 1
+
+        padding = (kernel_size - stride) // 2
+
+        _conv = nn.ConvTranspose1d(
+            in_channels, out_channels,
             kernel_size=kernel_size,
-            padding=padding
-        ))
-    
+            stride=stride,
+            padding=padding,
+        )
+        nn.init.kaiming_normal_(_conv.weight)
+        if _conv.bias is not None:
+            nn.init.zeros_(_conv.bias)
+        self.conv = weight_norm(_conv)
+
     def forward(self, x):
-        x = self.conv(x)  # [B, C*u, T_in]
-        B, Cu, T = x.shape
-        C = Cu // self.factor
-        
-        # PixelShuffle 1D: Reshape channels into temporal frames
-        x = x.view(B, C, self.factor, T)         # [B, C, u, T_in]
-        x = x.permute(0, 1, 3, 2).contiguous()   # [B, C, T_in, u]
-        return x.view(B, C, T * self.factor)     # [B, C, T_out]
+        return self.conv(x)
 
 
 class LearnableHarmonicSource(nn.Module):
@@ -250,28 +263,22 @@ class LearnableHarmonicSource(nn.Module):
         self,
         sample_rate: int,
         hop_length: int = 480,
-        n_harmonics: int = 64,
+        n_harmonics: int = 8,
+        sine_amp: float = 0.1,
         add_noise_std: float = 0.003,
         random_init_phase: bool = False,
-        use_pchip: bool = True,
     ):
         super().__init__()
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.n_harmonics = n_harmonics
+        self.sine_amp = sine_amp
         self.noise_std = add_noise_std
         self.random_init_phase = random_init_phase
-        self.use_pchip = use_pchip
-        self._pchip_cache = {}
 
         # Pre-register k as buffer — avoid recreating every forward
         k = torch.arange(1, n_harmonics + 1, dtype=torch.float32).view(1, -1, 1)
         self.register_buffer("k", k)
-
-    def _get_pchip(self, hop):
-        if hop not in self._pchip_cache:
-            self._pchip_cache[hop] = PchipF0UpsamplerTorch(scale_factor=hop)
-        return self._pchip_cache[hop]
 
     def forward(self, f0: torch.Tensor, upsample_factor: Optional[int] = None):
         hop = upsample_factor if upsample_factor is not None else self.hop_length
@@ -307,7 +314,7 @@ class LearnableHarmonicSource(nn.Module):
             phase = raw_phase * (2.0 * math.pi)
             
             # ── Vectorized harmonics ──
-            harmonics = torch.sin(self.k * phase)       # [B, H, T]
+            harmonics = torch.sin(self.k * phase) * self.sine_amp  # [B, H, T]
             
             # Anti-aliasing + voiced masks (fused)
             nyquist = self.sample_rate / 2.0
@@ -354,8 +361,8 @@ class LearnableHarmonicSource(nn.Module):
 class HiFiGANPCPHHead(nn.Module):
     """
     HiFiGAN generator head with PCPH harmonic matrix injection
-    and SnakeBeta activations. Uses SubPixelConv1d for artifact-free
-    upsampling.
+    and SnakeBeta activations. Uses ConvTranspose1d (BigVGAN approach)
+    for upsampling.
     """
 
     def __init__(
@@ -370,7 +377,7 @@ class HiFiGANPCPHHead(nn.Module):
         sr: int = 48000,
         pre_conv_kernel_size: int = 7,
         post_conv_kernel_size: int = 7,
-        n_harmonics: int = 32,
+        n_harmonics: int = 8,
         checkpointing: bool = False,
     ):
         super().__init__()
@@ -405,11 +412,11 @@ class HiFiGANPCPHHead(nn.Module):
             )
 
             self.ups.append(
-                SubPixelConv1d(
+                UpsampleConvTranspose1d(
                     in_channels=upsample_initial_channel // (2 ** i),
                     out_channels=self.channels[i],
                     upsample_factor=u,
-                    kernel_size=k
+                    kernel_size=k,
                 )
             )
 
@@ -417,20 +424,18 @@ class HiFiGANPCPHHead(nn.Module):
             if stride > 1:
                 kernel = stride * 2 - stride % 2
                 pad = (kernel - stride) // 2
-                
-                self.har_convs.append(
-                    weight_norm(nn.Conv1d(
-                        n_harmonics + 1, self.channels[i],
-                        kernel_size=kernel, stride=stride, padding=pad
-                    ))
+                _har_conv = nn.Conv1d(
+                    n_harmonics + 1, self.channels[i],
+                    kernel_size=kernel, stride=stride, padding=pad
                 )
             else:
-                # stride=1: direct 1x1 mixing at full audio resolution
-                self.har_convs.append(
-                    weight_norm(nn.Conv1d(
-                        n_harmonics + 1, self.channels[i], kernel_size=1
-                    ))
+                _har_conv = nn.Conv1d(
+                    n_harmonics + 1, self.channels[i], kernel_size=1
                 )
+            nn.init.normal_(_har_conv.weight, std=0.01)
+            if _har_conv.bias is not None:
+                nn.init.zeros_(_har_conv.bias)
+            self.har_convs.append(weight_norm(_har_conv))
 
         self.resblocks = nn.ModuleList([
             ResBlock_SnakeBeta(self.channels[i], k, d, post_act=False)
@@ -442,17 +447,16 @@ class HiFiGANPCPHHead(nn.Module):
             self.channels[-1], alpha_trainable=True, alpha_logscale=True
         )
 
-        self.conv_post = weight_norm(nn.Conv1d(
+        # conv_post: small init for near-zero output at start (stability)
+        # Must init BEFORE weight_norm — parametrized .weight is read-only
+        _conv_post = nn.Conv1d(
             self.channels[-1], 1,
             post_conv_kernel_size, 1,
             padding=get_padding(post_conv_kernel_size),
-        ))
-
-        self.ups.apply(init_weights)
-        self.har_convs.apply(init_weights)
-        
-        nn.init.normal_(self.conv_post.weight, std=0.001)
-        nn.init.zeros_(self.conv_post.bias)
+        )
+        nn.init.normal_(_conv_post.weight, std=0.001)
+        nn.init.zeros_(_conv_post.bias)
+        self.conv_post = weight_norm(_conv_post)
 
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
@@ -497,32 +501,35 @@ class HiFiGANPCPHHead(nn.Module):
         return x
 
     def remove_weight_norm(self):
-        remove_parametrizations(self.conv_pre, "weight")
+        remove_weight_norm_legacy_safe(self.conv_pre)
         for l in self.ups:
-            remove_parametrizations(l.conv, "weight")
+            remove_weight_norm_legacy_safe(l.conv)
         for l in self.har_convs:
-            remove_parametrizations(l, "weight")
+            remove_weight_norm_legacy_safe(l)
         for l in self.resblocks:
             l.remove_weight_norm()
-        remove_parametrizations(self.conv_post, "weight")
+        remove_weight_norm_legacy_safe(self.conv_post)
 
 
 # ---------------------------------------------------------------------------
-# ChouwaGAN: Full Generator (ConvNeXt backbone + HiFiGAN-PCPH head)
+# ChouwaGAN: Full Generator
 # ---------------------------------------------------------------------------
 
 class ChouwaGANGenerator(nn.Module):
     """
-    ChouwaGAN with PCPH (Pseudo-Constant-Power Harmonic) source.
+    ChouwaGAN: HiFiGAN with SnakeBeta activations, ConvTranspose1d upsampling,
+    and band-limited harmonic source injection.
 
-    Architecture:
-      1. ConvNeXt backbone encodes VITS latent features into a deep representation
-      2. HiFiGAN head with PCPH harmonic injection synthesizes the audio waveform
-      3. f0 (pitch) drives a band-limited Dirichlet harmonic source (all harmonics
-         up to Nyquist) injected at each upsampling stage \u2014 eliminating aliasing
-         by construction, unlike the old NSF single-sine approach.
+    The multi-harmonic source (LearnableHarmonicSource) individually anti-aliases
+    each harmonic at Nyquist, then all harmonics are merged into a single channel
+    before injection -- preserving anti-aliasing quality while maintaining the same
+    information bottleneck as standard NSF. This forces the decoder to depend on
+    the VITS latent z for spectral detail, preventing KL mean collapse.
 
-    Interface: forward(x, f0, g=None) \u2014 same as HiFiGANNSFGenerator for RVC compatibility.
+    Optional ConvNeXt backbone can be enabled via use_backbone=True once KL
+    stability is confirmed.
+
+    Interface: forward(x, f0, g=None) -- same as HiFiGANNSFGenerator.
     """
 
     def __init__(
@@ -535,34 +542,60 @@ class ChouwaGANGenerator(nn.Module):
         upsample_kernel_sizes: list,
         gin_channels: int,
         sr: int,
-        backbone_depths: list = [2, 2, 5, 2],
+        n_harmonics: int = 8,
+        use_backbone: bool = False,
+        backbone_depths: list = [1, 1, 1, 1],
         backbone_dims: list = [192, 256, 384, 384],
         backbone_dilations: list = [
-            [1, 2],
-            [1, 2],
-            [1, 1, 2, 4, 8],
-            [1, 2]
+            [1],
+            [1],
+            [1],
+            [1]
         ],
-        backbone_kernel_size: int = 13,
+        backbone_kernel_size: int = 1,
         backbone_mlp_ratio: float = 3.0,
-        n_harmonics: int = 32,
         checkpointing: bool = False,
     ):
         super().__init__()
+        self.use_backbone = use_backbone
 
-        self.backbone = ConvNeXtEncoder(
-            input_channels=initial_channel,
-            depths=backbone_depths,
-            dims=backbone_dims,
-            dilations=backbone_dilations,
-            kernel_size=backbone_kernel_size,
-            mlp_ratio=backbone_mlp_ratio,
+        if use_backbone:
+            self.backbone = ConvNeXtEncoder(
+                input_channels=initial_channel,
+                depths=backbone_depths,
+                dims=backbone_dims,
+                dilations=backbone_dilations,
+                kernel_size=backbone_kernel_size,
+                mlp_ratio=backbone_mlp_ratio,
+            )
+            head_input_channels = backbone_dims[-1]
+        else:
+            head_input_channels = initial_channel
+
+        self.upp = math.prod(upsample_rates)
+
+        # Band-limited harmonic source: each harmonic individually anti-aliased
+        self.m_source = LearnableHarmonicSource(
+            sample_rate=sr,
+            hop_length=self.upp,
+            n_harmonics=n_harmonics,
         )
 
-        backbone_out_channels = backbone_dims[-1]
+        # Merge all harmonics + noise into 1 channel — LINEAR ONLY.
+        # A learnable linear combination of harmonics preserves the 1-channel
+        # information bottleneck: the merged signal contains energy ONLY at the
+        # input harmonic frequencies (f0 … n_harmonics*f0), so the decoder must
+        # rely on the VITS latent z for spectral detail above that range.
+        #
+        # NOTE: Do NOT add a nonlinearity (Tanh, etc.) after this conv.
+        # Any pointwise nonlinearity creates intermodulation products that fill
+        # the spectrum well beyond the input harmonics, defeating the bottleneck
+        # and causing KL collapse (the decoder no longer needs z).
+        self.harmonic_merge = weight_norm(nn.Conv1d(n_harmonics + 1, 1, 1))
 
+        # HiFiGAN-PCPH head: SnakeBeta + ConvTranspose1d + 1-channel harmonic injection
         self.head = HiFiGANPCPHHead(
-            input_channels=backbone_out_channels,
+            input_channels=head_input_channels,
             upsample_rates=upsample_rates,
             upsample_kernel_sizes=upsample_kernel_sizes,
             resblock_kernel_sizes=resblock_kernel_sizes,
@@ -570,42 +603,30 @@ class ChouwaGANGenerator(nn.Module):
             upsample_initial_channel=upsample_initial_channel,
             gin_channels=gin_channels,
             sr=sr,
-            n_harmonics=n_harmonics,
+            n_harmonics=0,  # 1 channel after merge
             checkpointing=checkpointing,
-        )
-
-        self.upp = math.prod(upsample_rates)
-        
-        self.m_source = LearnableHarmonicSource(
-            sample_rate=sr,
-            hop_length=self.upp,
-            n_harmonics=n_harmonics,
-            use_pchip=True,
         )
 
 
     def forward(
         self, x: torch.Tensor, f0: torch.Tensor, g: Optional[torch.Tensor] = None
     ):
-        """
-        Args:
-            x: VITS latent features [B, initial_channel, T]
-            f0: Fundamental frequency [B, T_f0]
-            g: Speaker embedding [B, gin_channels, 1]
-
-        Returns:
-            Audio waveform [B, 1, T_audio]
-        """
         if x.shape[-1] != f0.shape[-1]:
             raise ValueError(
                 f"Temporal dimension mismatch: x has {x.shape[-1]} frames, "
                 f"f0 has {f0.shape[-1]} frames. They must match."
             )
-        
-        har_source = self.m_source(f0, self.upp)
-        x = self.backbone(x)
+
+        # Generate anti-aliased harmonics and merge to single channel
+        har_source = self.m_source(f0, self.upp)       # [B, n_harmonics+1, T_audio]
+        har_source = self.harmonic_merge(har_source)    # [B, 1, T_audio]
+
+        if self.use_backbone:
+            x = self.backbone(x)
+
         x = self.head(x, har_source, g=g)
         return x
 
     def remove_weight_norm(self):
+        remove_weight_norm_legacy_safe(self.harmonic_merge)
         self.head.remove_weight_norm()

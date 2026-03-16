@@ -948,7 +948,7 @@ def run(
     if vocoder == "ChouwaGAN":
         from rvc.train.chouwa_gan_training import AdaptiveBalancer, HighFrequencyReconstructionLoss
         
-        chouwa_balancer = AdaptiveBalancer(ema_decay=0.99, skip_threshold=8.0, resume_threshold=3.0)
+        chouwa_balancer = AdaptiveBalancer(ema_decay=0.99, skip_threshold=4.0, resume_threshold=2.0)
         
         # Load balancer state if resuming from checkpoint
         if chouwa_balancer_state is not None:
@@ -1223,6 +1223,7 @@ def training_loop(
     }
     if vocoder == "ChouwaGAN":
         avg_rolling_cache["loss_hf"] = deque(maxlen=rolling_loss_steps)
+        avg_rolling_cache["loss_kl_raw"] = deque(maxlen=rolling_loss_steps)
     elif vocoder in ["RingFormer_v1", "RingFormer_v2"]:
         avg_rolling_cache["loss_sd"] = deque(maxlen=rolling_loss_steps)
 
@@ -1485,11 +1486,21 @@ def training_loop(
                         loss_mel = fn_spectral_loss(y_hat.float(), y.float()) * active_c_stft
 
                     # Feature Matching loss
-                    loss_fm = feature_loss(
-                        [[f.float() for f in fm] for fm in fmap_r],
-                        [[f.float() for f in fm] for fm in fmap_g],
-                        normalize=(vocoder == "ChouwaGAN"),
-                    ) / n_disc * c_fm
+                    if vocoder == "ChouwaGAN":
+                        # normalize=True already makes FM loss independent of
+                        # discriminator count (divides by total layer count).
+                        # Do NOT also divide by n_disc — that double-normalizes
+                        # and makes FM ~320× weaker than intended.
+                        loss_fm = feature_loss(
+                            [[f.float() for f in fm] for fm in fmap_r],
+                            [[f.float() for f in fm] for fm in fmap_g],
+                            normalize=True,
+                        ) * c_fm
+                    else:
+                        loss_fm = feature_loss(
+                            [[f.float() for f in fm] for fm in fmap_r],
+                            [[f.float() for f in fm] for fm in fmap_g],
+                        ) / n_disc * c_fm
 
                     # Generator loss
                     if adversarial_loss == "softplus":
@@ -1514,7 +1525,9 @@ def training_loop(
                         loss_adv = loss_adv * chouwa_balancer.adv_weight_scale()
 
                     # Kl annealing handler
-                    if use_kl_annealing:
+                    if vocoder == "ChouwaGAN":
+                        kl_beta = 1.0
+                    elif use_kl_annealing:
                         annealing_cycle_steps = len(train_loader) * kl_annealing_cycle_duration
                         kl_beta = 0.5 * (1 - math.cos((global_step % annealing_cycle_steps) * (math.pi / annealing_cycle_steps)))
                     else:
@@ -1529,18 +1542,34 @@ def training_loop(
                     # Total generator loss + kl ( encoders )
                     if not training_loop.encoders_frozen: # For when encoders aren't frozen yet
                         # KL loss — logger/exp in fp16 loses precision
-                        loss_kl = kl_loss_clamped(
-                            z_p.float(), logs_q.float(),
-                            m_p.float(), logs_p.float(),
-                            z_mask.float(),
-                        ) * config.train.c_kl # KL ( Kullback–Leibler divergence ) loss
                         if vocoder == "ChouwaGAN":
+                            # Standard KL with free bits (Kingma et al. 2016).
+                            # free_bits=0.1 nats/dim prevents KL collapse by
+                            # zeroing KL gradient for dimensions below the floor,
+                            # letting reconstruction drive the posterior.
+                            _kl_loss, _kl_raw = kl_loss_clamped(
+                                z_p.float(), logs_q.float(),
+                                m_p.float(), logs_p.float(),
+                                z_mask.float(),
+                                flow_logdet=flow_logdet,
+                                free_bits=0.1,
+                            )
+                            loss_kl = _kl_loss * config.train.c_kl
+                            loss_kl_raw = _kl_raw
+
                             loss_hf = hf_recon_loss(y_hat, y) * c_hf
                             loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta + loss_hf
-                        elif vocoder in ["RingFormer_v1", "RingFormer_v2"]:
-                            loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta + loss_sd
                         else:
-                            loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta
+                            _kl_loss, _ = kl_loss_clamped(
+                                z_p.float(), logs_q.float(),
+                                m_p.float(), logs_p.float(),
+                                z_mask.float(),
+                            )
+                            loss_kl = _kl_loss * config.train.c_kl
+                            if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
+                                loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta + loss_sd
+                            else:
+                                loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta
                     else:
                         loss_kl = torch.tensor(0.0, device=device) # KL loss dummy for logs
                         if vocoder == "ChouwaGAN":
@@ -1619,6 +1648,7 @@ def training_loop(
             avg_rolling_cache["loss_kl"].append(loss_kl.detach())
             if "loss_hf" in avg_rolling_cache:
                 avg_rolling_cache["loss_hf"].append(loss_hf.detach())
+                avg_rolling_cache["loss_kl_raw"].append(loss_kl_raw.detach() if not training_loop.encoders_frozen else torch.tensor(0.0))
             elif "loss_sd" in avg_rolling_cache:
                 avg_rolling_cache["loss_sd"].append(loss_sd.detach())
             
@@ -1627,10 +1657,34 @@ def training_loop(
             del y_d_hat_r_g, y_d_hat_g, fmap_r, fmap_g
             del loss_adv, loss_fm, loss_mel, loss_kl, loss_gen_total
             if vocoder == "ChouwaGAN":
-                del loss_hf
+                del loss_hf, loss_kl_raw
             elif vocoder in ["RingFormer_v1", "RingFormer_v2"]:
                 del loss_sd, loss_phase, loss_mag
 
+            # ── ChouwaGAN KL diagnostic (every rolling_loss_steps) ──
+            if vocoder == "ChouwaGAN" and rank == 0 and global_step % rolling_loss_steps == 0:
+                with torch.no_grad():
+                    # m_q std across batch → if → 0, mean collapse
+                    _mq_std = m_q.std(dim=0).mean().item()
+                    # m_p std across batch
+                    _mp_std = m_p.std(dim=0).mean().item()
+                    # logs_q and logs_p means
+                    _lq_mean = logs_q.mean().item()
+                    _lp_mean = logs_p.mean().item()
+                    # z_p variance — if very low, flow collapse
+                    _zp_std = z_p.std().item()
+                    # m_q - m_p distance (should be > 0 if encoder encodes info)
+                    _mq_mp_dist = ((m_q - m_p) ** 2 * z_mask).sum().sqrt().item() / max(z_mask.sum().item(), 1.0)
+
+                    diag = {
+                        "diag/m_q_std_batch": _mq_std,
+                        "diag/m_p_std_batch": _mp_std,
+                        "diag/logs_q_mean": _lq_mean,
+                        "diag/logs_p_mean": _lp_mean,
+                        "diag/z_p_std": _zp_std,
+                        "diag/m_q_m_p_rms_dist": _mq_mp_dist,
+                    }
+                    summarize(writer=writer, global_step=global_step, scalars=diag)
 
             if rank == 0 and global_step % rolling_loss_steps == 0:
                 scalar_dict_rolling = {}

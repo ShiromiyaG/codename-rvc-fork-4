@@ -20,7 +20,7 @@ import torch.nn.functional as F
 CHOUWA_GRAD_CLIP_D = 25.0       # Discriminator gradient clipping threshold (FIX #4)
 CHOUWA_GRAD_CLIP_G = 50.0       # Generator gradient clipping threshold (FIX #4)
 CHOUWA_C_FM = 1.0               # Feature matching loss weight (Lowered for stability)
-CHOUWA_C_HF = 1.0               # High-frequency reconstruction loss weight (Lowered for stability)
+CHOUWA_C_HF = 0.5               # High-frequency reconstruction loss weight
 CHOUWA_R1_GAMMA = 0.0           # R1 penalty coefficient (disabled by default)
 CHOUWA_R1_INTERVAL = 16         # R1 penalty application interval
 CHOUWA_D_REAL_LABEL = 0.9       # Real label value for discriminator
@@ -157,7 +157,7 @@ class AdaptiveBalancer:
     The monitoring data (d_real, d_fake, gap) is logged to TensorBoard.
     """
 
-    def __init__(self, ema_decay=0.99, skip_threshold=3.0, resume_threshold=1.5):
+    def __init__(self, ema_decay=0.99, skip_threshold=4.0, resume_threshold=1.5):
         """
         Args:
             ema_decay: Smoothing factor for score tracking
@@ -382,8 +382,12 @@ def get_chouwa_config(from_scratch: bool) -> dict:
         "grad_clip_d": CHOUWA_GRAD_CLIP_D,
         "c_fm": CHOUWA_C_FM,
         "c_hf": CHOUWA_C_HF,
-        "c_mel": 2.0,
-        "c_kl": 5.0,
+        # c_mel is lower than HiFi-GAN's 45 because ChouwaGAN's adversarial
+        # and feature-matching losses are divided by n_disc (~8). Without
+        # compensating, mel dominates ~8× more than intended, starving the
+        # adversarial signal that produces clean waveforms.
+        # 15 balances mel (~8) with KL (~7.5) while keeping adv+FM meaningful.
+        "c_mel": 15.0 if not from_scratch else 2.0,
         "c_stft": 2.0,
         "r1_gamma": CHOUWA_R1_GAMMA,
         "r1_interval": CHOUWA_R1_INTERVAL,
