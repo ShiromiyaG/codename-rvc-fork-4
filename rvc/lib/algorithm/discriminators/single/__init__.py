@@ -6,3 +6,4 @@ from .mpd_discriminator_fast import FastMPD
 from .univhd_discriminator import UniversalHarmonicDiscriminator
 from .combd_discriminator import CoMBD
 from .sbd_discriminator import SBD
+from .chouwa_gan_discriminator import ChouwaGANDiscriminator

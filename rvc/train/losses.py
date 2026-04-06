@@ -91,6 +91,34 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
     return loss
 
 
+def kl_loss_floored(z_p, logs_q, m_p, logs_p, z_mask, free_bits=1.0):
+    """
+    KL divergence with Free Bits floor (Kingma et al.).
+    Each latent dimension must carry at least `free_bits` nats of information.
+    Dimensions already above the floor are unaffected — zero overhead.
+    Prevents posterior collapse with strong decoders.
+
+    Args:
+        z_p (torch.Tensor): Sampled latent variable transformed by the flow [b, h, t_t].
+        logs_q (torch.Tensor): Log variance of the posterior distribution q [b, h, t_t].
+        m_p (torch.Tensor): Mean of the prior distribution p [b, h, t_t].
+        logs_p (torch.Tensor): Log variance of the prior distribution p [b, h, t_t].
+        z_mask (torch.Tensor): Mask for the latent variables [b, h, t_t].
+        free_bits (float): Minimum KL per dimension in nats.
+    """
+    # kl per element: [b, h, t]
+    kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
+    kl = kl * z_mask
+
+    # Average over batch and time per dimension: [h]
+    kl_per_dim = kl.sum(dim=(0, 2)) / z_mask.sum(dim=(0, 2)).clamp(min=1)
+
+    # Floor: each dimension contributes at least free_bits nats
+    kl_floored = torch.clamp(kl_per_dim, min=free_bits)
+
+    return kl_floored.mean()
+
+
 def discriminator_tprls_loss(disc_real_outputs, disc_generated_outputs):
     """
     TPRLS Discriminator Loss
@@ -177,6 +205,60 @@ class HingeAdversarialLoss(nn.Module):
     def _hinge_fake_loss(self, x: Tensor) -> Tensor:
         """Calculate hinge loss for fake samples."""
         return -torch.mean(torch.min(-x - 1, x.new_zeros(x.size())))
+
+
+class SoftHingeAdversarialLoss(nn.Module):
+    """Combined adversarial loss using softplus for the discriminator and
+    soft hinge for the generator:
+    - Discriminator: softplus (non-saturating logistic, no margin — D never
+      stops learning, every sample always contributes gradient)
+    - Generator: soft hinge (margin at 1, smoothed by softplus — strong push
+      when D(fake) < 1, gentle gradient when already fooling D)
+    """
+
+    def forward(
+        self, p_fakes: List[Tensor], p_reals: Optional[List[Tensor]] = None
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        if p_reals is None:
+            # Generator: soft hinge — margin-based, smooth
+            adv_loss = 0.0
+            for p_fake in p_fakes:
+                adv_loss += F.softplus(1 - p_fake).mean()
+            return adv_loss
+        else:
+            # Discriminator: softplus — non-saturating logistic, no margin
+            fake_loss, real_loss = 0.0, 0.0
+            for p_fake, p_real in zip(p_fakes, p_reals):
+                fake_loss += F.softplus(p_fake).mean()
+                real_loss += F.softplus(-p_real).mean()
+            return fake_loss, real_loss
+
+
+class LeCamRegularization(nn.Module):
+    """LeCam regularization for discriminator stability.
+    Prevents D from becoming too confident relative to its historical average,
+    keeping gradients flowing to G at reasonable magnitude.
+    Near-zero computational cost — operates on already-computed D outputs."""
+
+    def __init__(self, decay: float = 0.999):
+        super().__init__()
+        self.register_buffer("ema_real", torch.zeros(1))
+        self.register_buffer("ema_fake", torch.zeros(1))
+        self.decay = decay
+
+    @torch.no_grad()
+    def update_ema(self, d_real_outputs: List[Tensor], d_fake_outputs: List[Tensor]):
+        mean_real = torch.stack([d.detach().float().mean() for d in d_real_outputs]).mean()
+        mean_fake = torch.stack([d.detach().float().mean() for d in d_fake_outputs]).mean()
+        self.ema_real.lerp_(mean_real, 1 - self.decay)
+        self.ema_fake.lerp_(mean_fake, 1 - self.decay)
+
+    def forward(self, d_real_outputs: List[Tensor], d_fake_outputs: List[Tensor]) -> Tensor:
+        loss = 0.0
+        for d_real, d_fake in zip(d_real_outputs, d_fake_outputs):
+            loss += F.relu(d_real - self.ema_fake).mean()
+            loss += F.relu(self.ema_real - d_fake).mean()
+        return loss / len(d_real_outputs)
 
 
 def envelope_loss(y_real, y_fake, 

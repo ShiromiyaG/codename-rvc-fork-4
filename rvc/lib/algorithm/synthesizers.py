@@ -116,6 +116,20 @@ class Synthesizer(torch.nn.Module):
                     sr=sr,
                 )
                 print("    ██████  Vocoder: APEX-GAN")
+            elif vocoder == "ChouwaGAN":
+                from rvc.lib.algorithm.generators import ChouwaGANGenerator
+                self.dec = ChouwaGANGenerator(
+                    initial_channel=inter_channels,
+                    upsample_rates=upsample_rates,
+                    upsample_initial_channel=upsample_initial_channel,
+                    upsample_kernel_sizes=upsample_kernel_sizes,
+                    resblock_kernel_sizes=resblock_kernel_sizes,
+                    resblock_dilation_sizes=resblock_dilation_sizes,
+                    gin_channels=gin_channels,
+                    sr=sr,
+                    checkpointing=checkpointing,
+                )
+                print("    ██████  Vocoder: ChouwaGAN")
             else:  # vocoder == "HiFi-GAN"
                 from rvc.lib.algorithm.generators import HiFiGANNSFGenerator
                 self.dec = HiFiGANNSFGenerator(
@@ -131,7 +145,7 @@ class Synthesizer(torch.nn.Module):
                 )
                 print("    ██████  Vocoder: NSF-HiFi-GAN")
         else:
-            if vocoder in ["RefineGAN", "RingFormer_v1", "RingFormer_v2", "APEX-GAN"]:
+            if vocoder in ["RefineGAN", "RingFormer_v1", "RingFormer_v2", "APEX-GAN", "ChouwaGAN"]:
                 print(f"{vocoder} does not support training without pitch guidance.")
                 self.dec = None
             else: # vocoder == "HiFi-GAN"
@@ -146,6 +160,12 @@ class Synthesizer(torch.nn.Module):
                     gin_channels=gin_channels,
                     checkpointing=checkpointing,
                 )
+        # Scale-VAE: learnable per-dimension scaling for posterior latents.
+        # Scales z only for the decoder path, keeping KL on unscaled z.
+        # Prevents posterior collapse with strong decoders like ChouwaGAN.
+        if vocoder == "ChouwaGAN":
+            self.posterior_scale = torch.nn.Parameter(torch.ones(inter_channels))
+
         self.enc_q = PosteriorEncoder(
             spec_channels,
             inter_channels,
@@ -245,6 +265,15 @@ class Synthesizer(torch.nn.Module):
 
                 return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
 
+            elif self.vocoder == "ChouwaGAN":
+                # Scale-VAE: scale z for decoder, keep original z for KL
+                z_scaled = self.posterior_scale.view(1, -1, 1) * z
+                z_slice, ids_slice = rand_slice_segments(z_scaled, spec_lengths, self.segment_size)
+                pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
+                o = self.dec(z_slice, pitchf, g=g)
+
+                return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+
             else: # For HiFi-Gan training
                 z_slice, ids_slice = rand_slice_segments(z, spec_lengths, self.segment_size)
 
@@ -311,6 +340,9 @@ class Synthesizer(torch.nn.Module):
             o = (self.dec(z * x_mask, nsff0, g=g, return_intermediates=False) if self.use_f0 else self.dec(z * x_mask, g=g, return_intermediates=False))
         elif self.vocoder == "RefineGAN":
             o = (self.dec(z * x_mask, nsff0, g=g) if self.use_f0 else self.dec(z * x_mask, g=g))
+        elif self.vocoder == "ChouwaGAN":
+            z_scaled = self.posterior_scale.view(1, -1, 1) * z
+            o = self.dec(z_scaled * x_mask, nsff0, g=g)
         else: # HiFi-GAN
             o = (self.dec(z * x_mask, nsff0, g=g) if self.use_f0 else self.dec(z * x_mask, g=g))
 

@@ -21,6 +21,10 @@ VOCODER_INFO = textwrap.dedent("""\
     - **Arch overview:** Snake ResBlocks + GeoSaw (FGSS) excitation + per-stage antialiased injection.
     - **COMPATIBILITY:** Offline: This Fork. Streaming: None atm.
     
+    **ChouwaGAN:**
+    - **Arch overview:** SnakeBeta + PCPH Harmonics + FiLM conditioning + Anti-Aliased BigVGAN upsampling.
+    - **COMPATIBILITY:** Offline: This Fork. Streaming: None atm.
+    
     **NOTES:**
     **( Offline = Static inference/Covers, Streaming = Real-Time voice changers )**
     **( RingFormer Requires min. RTX 30 series [ At least Ampere microarchitecture ] )**

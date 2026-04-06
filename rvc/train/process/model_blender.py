@@ -9,7 +9,8 @@ def extract(ckpt):
     for key in a.keys():
         if "enc_q" in key:
             continue
-        opt["weight"][key] = a[key]
+        clean_key = key.replace("_orig_mod.", "") if key.startswith("_orig_mod.") else key
+        opt["weight"][clean_key] = a[key]
     print(f"[DEBUG] extract() returning keys: {list(opt['weight'].keys())}")
     return opt
 

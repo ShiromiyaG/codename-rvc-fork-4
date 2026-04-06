@@ -349,8 +349,8 @@ def train_tab():
                 )
                 adversarial_loss = gr.Radio(
                     label="Adversarial loss",
-                    info="Choose an adversarial loss used in training: \n  \n- **lsgan:** Default and one you should use.  \n- **hinge:** Margin-based. Provides stronger discriminator pressure early in training. \n ( Unstable on small and / or noisy datasets. Likely requires learning rate tweaking. ) \n- **tprls:** Relativistic regularizer on top of lsgan. Experimental. \n ( Might have use in outlier-heavy or very noisy / garbage datasets. )",
-                    choices=["lsgan", "hinge", "tprls"],
+                    info="Choose an adversarial loss used in training: \n  \n- **lsgan:** Default and one you should use.  \n- **hinge:** Margin-based. Provides stronger discriminator pressure early in training. \n ( Unstable on small and / or noisy datasets. Likely requires learning rate tweaking. ) \n- **soft_hinge:** Softplus-smoothed hinge. No dead gradient zones — always provides signal. Better for pretraining on large datasets. \n- **tprls:** Relativistic regularizer on top of lsgan. Experimental. \n ( Might have use in outlier-heavy or very noisy / garbage datasets. )",
+                    choices=["lsgan", "hinge", "soft_hinge", "tprls"],
                     value="lsgan",
                     interactive=True,
                     visible=True,
@@ -720,6 +720,13 @@ def train_tab():
                         interactive=True,
                         key='use_deterministic'
                     )
+                    use_torch_compile = gr.Checkbox(
+                        label="Use torch.compile",
+                        info="Compiles the model graphs for faster training. **Linux only, requires RTX 30xx+ (Ampere or newer).**",
+                        value=False,
+                        interactive=sys.platform == "linux" and microarchitecture_capability_checker(),
+                        key='use_torch_compile'
+                    )
                 with gr.Column(scale=0.7):
                     rolling_loss_steps = gr.Slider(
                         3,
@@ -1008,6 +1015,7 @@ def train_tab():
                     use_custom_lr,
                     custom_lr_g,
                     custom_lr_d,
+                    use_torch_compile,
                 ],
                 outputs=[train_output_info],
             )
@@ -1128,7 +1136,7 @@ def train_tab():
                             "value": "48000",
                         },
                         {
-                            "choices": ["RingFormer_v1", "RingFormer_v2", "APEX-GAN"],
+                            "choices": ["RingFormer_v1", "RingFormer_v2", "APEX-GAN", "ChouwaGAN"],
                             "__type__": "update",
                             "interactive": True,
                             "value": "APEX-GAN",
@@ -1177,6 +1185,16 @@ def train_tab():
                     return (
                         {
                             "choices": ["24000", "32000", "40000", "48000"],
+                            "__type__": "update",
+                            "value": "48000",
+                        },
+                        vocoder_arch_value,
+                    )
+                elif architecture == "Fork" and vocoder == "ChouwaGAN":
+                    vocoder_arch_value = "chouwa_gan"
+                    return (
+                        {
+                            "choices": ["32000", "40000", "48000"],
                             "__type__": "update",
                             "value": "48000",
                         },

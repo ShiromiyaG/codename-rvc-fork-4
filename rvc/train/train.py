@@ -75,8 +75,11 @@ from losses import (
     discriminator_tprls_loss,
     generator_tprls_loss,
     HingeAdversarialLoss,
+    SoftHingeAdversarialLoss,
+    LeCamRegularization,
     feature_loss,
     kl_loss,
+    kl_loss_floored,
     phase_loss
 )
 from mel_processing import (
@@ -85,7 +88,7 @@ from mel_processing import (
 )
 from rvc.train.process.extract_model import extract_model
 from rvc.lib.algorithm import commons
-from rvc.train.utils import replace_keys_in_dict
+from rvc.train.utils import replace_keys_in_dict, _unwrap_model, _strip_compile_prefix
 
 # Parse command line arguments start region ===========================
 
@@ -127,6 +130,8 @@ grad_clip_value_g_release, grad_clip_value_d_release = (int(sys.argv[34]), int(s
 use_custom_lr = strtobool(sys.argv[36])
 custom_lr_g, custom_lr_d = (float(sys.argv[37]), float(sys.argv[38])) if use_custom_lr else (None, None)
 assert not use_custom_lr or (custom_lr_g and custom_lr_d), "Invalid custom LR values."
+
+use_torch_compile = bool(strtobool(sys.argv[39])) if len(sys.argv) > 39 else False
 
 # Parse command line arguments end region ===========================
 
@@ -336,6 +341,15 @@ def get_d_model(config, vocoder, use_checkpointing):
             config.model.use_spectral_norm,
             use_checkpointing=use_checkpointing
         )
+    elif vocoder == "ChouwaGAN":
+        from rvc.lib.algorithm.discriminators.multi import ChouwaGAN_Combined
+        # MS-STFT + FastMPD + UnivHD ( unified ) - KazeFlow ChouwaGAN
+        return ChouwaGAN_Combined(
+            sample_rate=config.data.sample_rate,
+            use_spectral_norm=config.model.use_spectral_norm,
+            use_san=True,
+            use_checkpointing=use_checkpointing,
+        )
     else: # For NSF HiFi-GAN
         from rvc.lib.algorithm.discriminators.multi import MPD_MSD_Combined
         # MPD + MSD ( unified ) - Original RVC Setup
@@ -466,6 +480,14 @@ def setup_models_for_training(net_g, net_d, device, device_id, n_gpus):
         net_g = DDP(net_g, device_ids=[device_id]) # find_unused_parameters=True)
         net_d = DDP(net_d, device_ids=[device_id]) # find_unused_parameters=True)
 
+    if use_torch_compile and sys.platform == "linux":
+        try:
+            net_g = torch.compile(net_g, mode="max-autotune-no-cudagraphs")
+            net_d = torch.compile(net_d, mode="max-autotune-no-cudagraphs")
+            print("    ██████  torch.compile enabled for G and D (max-autotune-no-cudagraphs)")
+        except Exception as e:
+            print(f"    ██████  torch.compile failed, falling back to eager mode: {e}")
+
     return net_g, net_d
 
 def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkpointing, sample_rate, optimizer_choice, custom_lr_g, custom_lr_d, use_custom_lr, total_epoch_count, train_loader, device, device_id, n_gpus, rank):
@@ -531,7 +553,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
                 print(f"[ ] Loading pretrained (G) '{pretrainG}'")
             checkpoint = torch.load(pretrainG, map_location="cpu", weights_only=True)
             state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
-
+            state_dict = _strip_compile_prefix(state_dict)
             net_g.load_state_dict(state_dict, strict=True)
 
             if use_sid_swap and custom_sid != 0:
@@ -557,7 +579,7 @@ def load_models_and_optimizers(config, pretrainG, pretrainD, vocoder, use_checkp
                 print(f"[ ] Loading pretrained (D) '{pretrainD}'")
             checkpoint = torch.load(pretrainD, map_location="cpu", weights_only=True)
             state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
-
+            state_dict = _strip_compile_prefix(state_dict)
             net_d.load_state_dict(state_dict, strict=True)
 
         # Load the models and optionally wrap with DDP
@@ -822,8 +844,16 @@ def run(
         print("ERROR: Chosen spectral loss is undefined. Exiting.")
         sys.exit(1)
 
-    # Hinge adversarial loss
-    fn_hinge_loss = HingeAdversarialLoss() if adversarial_loss == "hinge" else None
+    # Hinge / Soft Hinge adversarial loss
+    if adversarial_loss == "hinge":
+        fn_hinge_loss = HingeAdversarialLoss()
+    elif adversarial_loss == "soft_hinge":
+        fn_hinge_loss = SoftHingeAdversarialLoss()
+    else:
+        fn_hinge_loss = None
+
+    # LeCam regularization for ChouwaGAN discriminator stability
+    fn_lecam = LeCamRegularization(decay=0.9999).to(device) if vocoder == "ChouwaGAN" else None
 
     # Loading of models and optims
     net_g, net_d, optim_g, optim_d, epoch_str, global_step, gradscaler_dict = load_models_and_optimizers(
@@ -926,6 +956,7 @@ def run(
             gradscaler,
             fn_hinge_loss,
             hann_window,
+            fn_lecam=fn_lecam,
             stopper=stopper,
             trajectory_tracker=trajectory_tracker
         )
@@ -976,6 +1007,7 @@ def training_loop(
     gradscaler,
     fn_hinge_loss=None,
     hann_window=None,
+    fn_lecam=None,
     stopper=None,
     trajectory_tracker=None
 ):
@@ -1132,9 +1164,14 @@ def training_loop(
                     loss_disc = discriminator_loss(y_d_hat_r, y_d_hat_g)
                 elif adversarial_loss == "tprls":
                     loss_disc = discriminator_tprls_loss(y_d_hat_r, y_d_hat_g)
-                elif adversarial_loss == "hinge":
+                elif adversarial_loss in ("hinge", "soft_hinge"):
                     loss_fake, loss_real = fn_hinge_loss(y_d_hat_g, y_d_hat_r)
                     loss_disc = loss_fake + loss_real
+
+                # LeCam regularization for ChouwaGAN
+                if fn_lecam is not None:
+                    loss_disc = loss_disc + 0.2 * fn_lecam(y_d_hat_r, y_d_hat_g)
+                    fn_lecam.update_ema(y_d_hat_r, y_d_hat_g)
 
 
             # Discriminator backward and update:
@@ -1181,8 +1218,14 @@ def training_loop(
                 elif adversarial_loss == "tprls":
                     y_d_hat_r_detached = [i.detach() for i in y_d_hat_r]
                     loss_adv = generator_tprls_loss(y_d_hat_r_detached, y_d_hat_g)
-                elif adversarial_loss == "hinge":
+                elif adversarial_loss in ("hinge", "soft_hinge"):
                     loss_adv = fn_hinge_loss(y_d_hat_g)
+
+                # Normalize adv + FM by number of sub-discriminators for ChouwaGAN
+                if vocoder == "ChouwaGAN":
+                    n_disc = len(y_d_hat_g)
+                    loss_adv = loss_adv / n_disc
+                    loss_fm = loss_fm / n_disc
 
                 # Kl annealing handler
                 if use_kl_annealing:
@@ -1199,7 +1242,10 @@ def training_loop(
 
                 # Total generator loss + kl ( encoders )
                 if not training_loop.encoders_frozen: # For when encoders aren't frozen yet
-                    loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl # KL ( Kullback–Leibler divergence ) loss
+                    if vocoder == "ChouwaGAN":
+                        loss_kl = kl_loss_floored(z_p, logs_q, m_p, logs_p, z_mask, free_bits=0.25) * config.train.c_kl
+                    else:
+                        loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl # KL ( Kullback–Leibler divergence ) loss
                     if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
                         loss_gen_total = loss_adv + loss_fm + loss_mel + loss_kl * kl_beta + loss_sd
                     else:
@@ -1502,7 +1548,7 @@ def training_loop(
             done = True
 
         if model_add:
-            ckpt = (net_g.module.state_dict() if hasattr(net_g, "module") else net_g.state_dict())
+            ckpt = _strip_compile_prefix(_unwrap_model(net_g).state_dict())
 
             for m in model_add:
                 if not os.path.exists(m):

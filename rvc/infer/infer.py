@@ -584,7 +584,9 @@ class VoiceConverter:
                 )
 
             del self.net_g.enc_q
-            self.net_g.load_state_dict(self.active_cpt["weight"], strict=False)
+            weight = self.active_cpt["weight"]
+            weight = {k.replace("_orig_mod.", ""): v for k, v in weight.items() if k.startswith("_orig_mod.")} if any(k.startswith("_orig_mod.") for k in weight) else weight
+            self.net_g.load_state_dict(weight, strict=False)
             self.net_g = self.net_g.to(self.config.device).float()
             self.net_g.eval()
 

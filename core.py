@@ -552,6 +552,7 @@ def run_train_script(
     use_custom_lr: bool = False,
     custom_lr_g: float = 1e-4,
     custom_lr_d: float = 1e-4,
+    use_torch_compile: bool = False,
     
 ):
     global training_process
@@ -611,7 +612,8 @@ def run_train_script(
                 grad_clip_value_d_release,
                 use_custom_lr,
                 custom_lr_g,
-                custom_lr_d
+                custom_lr_d,
+                use_torch_compile
             ],
         ),
     ]
@@ -1966,6 +1968,7 @@ def parse_arguments():
             "hifi_refine", # NSF-HiFi-GAN and RefineGAN ~ They share the same base config
             "ringformer",
             "apex_gan",
+            "chouwa_gan",
         ],
         default="hifi_refine",
     )
@@ -2007,7 +2010,7 @@ def parse_arguments():
         "--vocoder",
         type=str,
         help="Vocoder name",
-        choices=["HiFi-GAN", "APEX-GAN", "RefineGAN", "RingFormer_v1", "RingFormer_v2"],
+        choices=["HiFi-GAN", "APEX-GAN", "RefineGAN", "RingFormer_v1", "RingFormer_v2", "ChouwaGAN"],
         default="HiFi-GAN",
     )
     train_parser.add_argument(
@@ -2028,7 +2031,7 @@ def parse_arguments():
         "--adversarial_loss",
         type=str,
         help="Choose an optimizer used in training.",
-        choices=["lsgan", "hinge", "tprls"],
+        choices=["lsgan", "hinge", "soft_hinge", "tprls"],
         default="lsgan",
     )
     train_parser.add_argument(
@@ -2159,6 +2162,13 @@ def parse_arguments():
         type=lambda x: bool(strtobool(x)),
         choices=[True, False],
         help="Toggle deterministic mode for reproducibility at possible performance cost.",
+        default=False,
+    )
+    train_parser.add_argument(
+        "--use_torch_compile",
+        type=lambda x: bool(strtobool(x)),
+        choices=[True, False],
+        help="Compile model graphs with torch.compile for faster training. Linux only, requires Ampere+.",
         default=False,
     )
     train_parser.add_argument(
@@ -2607,6 +2617,7 @@ def main():
                 use_custom_lr=args.use_custom_lr,
                 custom_lr_g=args.custom_lr_g,
                 custom_lr_d=args.custom_lr_d,
+                use_torch_compile=args.use_torch_compile,
             )
         elif args.mode == "index":
             run_index_script(

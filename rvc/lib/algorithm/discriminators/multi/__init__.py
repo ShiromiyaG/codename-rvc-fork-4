@@ -8,3 +8,6 @@ from .mpd_msd_mrd_univhd_combined import MPD_MSD_MRD_UnivHD_Combined
 
 # Avocodo core based
 from .combd_sbd_univhd_combined import CoMBD_SBD_UnivHD_Combined
+
+# KazeFlow ChouwaGAN
+from .chouwa_gan_combined import ChouwaGAN_Combined

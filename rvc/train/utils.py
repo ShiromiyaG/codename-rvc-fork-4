@@ -27,6 +27,24 @@ from utils_cdnm import check_optimizer_coverage, verify_optimizer_has_all_params
 from mel_processing import mel_spectrogram_torch
 from rvc.train.process.extract_model import extract_model
 
+
+def _unwrap_model(model):
+    """Unwrap DDP and torch.compile wrappers to get the raw model."""
+    if hasattr(model, "module"):  # DDP
+        model = model.module
+    if hasattr(model, "_orig_mod"):  # torch.compile
+        model = model._orig_mod
+    return model
+
+
+def _strip_compile_prefix(state_dict):
+    """Remove '_orig_mod.' prefix from state_dict keys (torch.compile artifact)."""
+    cleaned = OrderedDict()
+    for k, v in state_dict.items():
+        new_k = k.replace("_orig_mod.", "") if k.startswith("_orig_mod.") else k
+        cleaned[new_k] = v
+    return cleaned
+
 def replace_keys_in_dict(d, old_key_part, new_key_part):
     """
     Recursively replace parts of the keys in a dictionary.
@@ -53,8 +71,9 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True):
     assert os.path.isfile(checkpoint_path), f"Checkpoint not found: {checkpoint_path}"
     checkpoint_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
 
-    model_state = model.module if hasattr(model, "module") else model
-    model_state.load_state_dict(checkpoint_dict["model"], strict=strict_load)
+    saved_state = _strip_compile_prefix(checkpoint_dict["model"])
+    model_state = _unwrap_model(model)
+    model_state.load_state_dict(saved_state, strict=strict_load)
 
     if optimizer:
         opt_state = checkpoint_dict.get("optimizer")
@@ -78,7 +97,8 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict_load=True):
     )
 
 def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path, gradscaler=None):
-    state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+    state_dict = _unwrap_model(model).state_dict()
+    state_dict = _strip_compile_prefix(state_dict)
 
     checkpoint_data = {
         "model": state_dict,
