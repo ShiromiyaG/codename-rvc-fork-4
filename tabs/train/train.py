@@ -337,6 +337,14 @@ def train_tab():
                     interactive=True,
                     visible=True,
                 )
+                use_period_vits = gr.Checkbox(
+                    label="Enable Period VITS",
+                    info="Adds a Frame Pitch Predictor that regularizes the prior encoder to encode pitch info. Acts as a training-time regularizer; inference is unchanged.",
+                    value=False,
+                    interactive=True,
+                    visible=True,
+                    key='use_period_vits'
+                )
                 vocoder_arch = gr.State("hifi_refine")
                 optimizer = gr.Radio(
                     label="Optimizer",
@@ -1016,6 +1024,7 @@ def train_tab():
                     custom_lr_g,
                     custom_lr_d,
                     use_torch_compile,
+                    use_period_vits,
                 ],
                 outputs=[train_output_info],
             )
@@ -1231,6 +1240,7 @@ def train_tab():
                 d_pretrained_path, multiple_gpu, training_gpu, use_warmup,
                 warmup_duration, use_custom_lr, custom_lr_g,
                 custom_lr_d, use_kl_annealing, kl_annealing_cycle_duration, vits2_mode,
+                use_period_vits,
                 rolling_loss_steps, use_tstp, grad_clip_scheduling, grad_clip_steps_duration,
                 grad_clip_value_g_cap, grad_clip_value_d_cap, grad_clip_value_g_release,
                 grad_clip_value_d_release, index_algorithm

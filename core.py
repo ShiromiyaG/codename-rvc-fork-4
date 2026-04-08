@@ -553,6 +553,7 @@ def run_train_script(
     custom_lr_g: float = 1e-4,
     custom_lr_d: float = 1e-4,
     use_torch_compile: bool = False,
+    use_period_vits: bool = False,
     
 ):
     global training_process
@@ -613,7 +614,8 @@ def run_train_script(
                 use_custom_lr,
                 custom_lr_g,
                 custom_lr_d,
-                use_torch_compile
+                use_torch_compile,
+                use_period_vits
             ],
         ),
     ]
