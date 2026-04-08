@@ -509,7 +509,8 @@ def early_stopper(
     model_name,
     vocoder,
     vits2_mode,
-    n_gpus
+    n_gpus,
+    use_period_vits=False,
 ):
     if stopper is not None and stopper.stop_triggered:
         net_g, net_d = nets
@@ -542,7 +543,8 @@ def early_stopper(
                     hps=config, 
                     vocoder=vocoder, 
                     architecture=architecture, 
-                    vits2_mode=vits2_mode
+                    vits2_mode=vits2_mode,
+                    use_period_vits=use_period_vits,
                 )
                 print(f"[TRAINING] All finished .. You can ignore anything past this msg.")
         if n_gpus > 1:

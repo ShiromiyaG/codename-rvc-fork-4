@@ -261,6 +261,41 @@ class LeCamRegularization(nn.Module):
         return loss / len(d_real_outputs)
 
 
+def pitch_prediction_loss(log_f0_pred, vuv_pred, pitchf, x_mask):
+    """
+    Period VITS pitch prediction loss.
+    Supervises the Frame Pitch Predictor with ground-truth F0.
+
+    Args:
+        log_f0_pred: Predicted log-F0 [B, 1, T].
+        vuv_pred: Predicted voicing logits (pre-sigmoid) [B, 1, T].
+        pitchf: Ground-truth F0 in Hz [B, T].
+        x_mask: Sequence mask [B, 1, T].
+
+    Returns:
+        loss_f0: MSE on log-F0 for voiced frames.
+        loss_vuv: BCE on voicing flags.
+    """
+    # Ground truth voicing: voiced if F0 > 0
+    vuv_gt = (pitchf > 0).float().unsqueeze(1)  # [B, 1, T]
+
+    # Log-F0 ground truth (clamp to avoid log(0))
+    log_f0_gt = torch.log(pitchf.clamp(min=1e-5)).unsqueeze(1)  # [B, 1, T]
+
+    # F0 MSE loss — only for voiced frames
+    voiced_mask = vuv_gt * x_mask  # [B, 1, T]
+    n_voiced = voiced_mask.sum().clamp(min=1)
+    loss_f0 = ((log_f0_pred - log_f0_gt) ** 2 * voiced_mask).sum() / n_voiced
+
+    # V/UV BCE loss — all frames
+    n_frames = x_mask.sum().clamp(min=1)
+    loss_vuv = F.binary_cross_entropy_with_logits(
+        vuv_pred * x_mask, vuv_gt * x_mask, reduction="sum"
+    ) / n_frames
+
+    return loss_f0, loss_vuv
+
+
 def envelope_loss(y_real, y_fake, 
                   pool=nn.MaxPool1d(kernel_size=5, stride=3), 
                   criterion=nn.L1Loss()):

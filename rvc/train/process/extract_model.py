@@ -37,6 +37,7 @@ def extract_model(
     pitch_guidance=True,
     version="v2",
     vits2_mode=False,
+    use_period_vits=False,
 ):
     try:
         model_dir = os.path.dirname(model_path)
@@ -105,6 +106,7 @@ def extract_model(
         opt["vocoder"] = vocoder
         opt["vocoder_architecture"] = vocoder_architecture
         opt["vits2_mode"] = vits2_mode
+        opt["use_period_vits"] = use_period_vits
 
         if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
             opt["ringformer_istft"] = [

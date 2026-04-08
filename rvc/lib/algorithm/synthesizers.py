@@ -7,6 +7,7 @@ from rvc.lib.algorithm.normalizing_flows import ResidualCouplingBlock, ResidualC
 from rvc.lib.algorithm.encoders import PosteriorEncoder # Posterior encoder, shared between Vits1 and Vits2
 from rvc.lib.algorithm.encoders_vits2 import TextEncoder_VITS2
 from rvc.lib.algorithm.encoders import TextEncoder as TextEncoder_VITS1
+from rvc.lib.algorithm.period_vits import FramePitchPredictor
 
 
 debug_shapes = False
@@ -39,6 +40,8 @@ class Synthesizer(torch.nn.Module):
         checkpointing: bool = False,
         # Other
         vits2_mode: bool = False,
+        # Period VITS
+        use_period_vits: bool = False,
         # RingFormer
         gen_istft_n_fft: int = 120,
         gen_istft_hop_size: int = 30,
@@ -49,6 +52,7 @@ class Synthesizer(torch.nn.Module):
         self.use_f0 = use_f0
         self.vocoder = vocoder
         self.vits2_mode = vits2_mode
+        self.use_period_vits = use_period_vits
 
         if vits2_mode:
             self.enc_p = TextEncoder_VITS2(
@@ -196,6 +200,18 @@ class Synthesizer(torch.nn.Module):
 
         self.emb_g = torch.nn.Embedding(spk_embed_dim, gin_channels)
 
+        # Period VITS: Frame Pitch Predictor — forces the prior encoder to
+        # carry continuous pitch information, preventing KL collapse.
+        if use_period_vits:
+            self.pitch_predictor = FramePitchPredictor(
+                in_channels=inter_channels,
+                hidden_channels=inter_channels,
+                n_layers=4,
+                kernel_size=5,
+                p_dropout=p_dropout,
+            )
+            print("    ██████  Period VITS: Frame Pitch Predictor enabled")
+
     def _remove_weight_norm_from(self, module):
         """Utility to remove weight normalization from a module."""
         for hook in module._forward_pre_hooks.values():
@@ -240,6 +256,12 @@ class Synthesizer(torch.nn.Module):
         else:
             m_p, logs_p, x_mask = self.enc_p(phone=phone, pitch=pitch, lengths=phone_lengths)
 
+        # Period VITS: predict pitch from prior mean (training only)
+        pitch_pred = None
+        if self.use_period_vits:
+            log_f0_pred, vuv_pred = self.pitch_predictor(m_p, x_mask)
+            pitch_pred = (log_f0_pred, vuv_pred)
+
         if spec is not None:
             z, m_q, logs_q, spec_mask = self.enc_q(spec, spec_lengths, g=g)
             z_p = self.flow(z, spec_mask, g=g)
@@ -249,21 +271,21 @@ class Synthesizer(torch.nn.Module):
                 pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
                 o, spec, phase = self.dec(z_slice, pitchf, g=g)
 
-                return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q), (spec, phase)
+                return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q), (spec, phase), pitch_pred
 
             elif self.vocoder == "APEX-GAN":
                 z_slice, ids_slice = rand_slice_segments(z, spec_lengths, self.segment_size)
                 pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
                 o = self.dec(z_slice, pitchf, g=g, return_intermediates=True)
 
-                return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+                return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q), pitch_pred
 
             elif self.vocoder == "RefineGAN":
                 z_slice, ids_slice = rand_slice_segments(z, spec_lengths, self.segment_size)
                 pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
                 o = self.dec(z_slice, pitchf, g=g)
 
-                return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+                return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q), pitch_pred
 
             elif self.vocoder == "ChouwaGAN":
                 # Scale-VAE: scale z for decoder, keep original z for KL
@@ -272,7 +294,7 @@ class Synthesizer(torch.nn.Module):
                 pitchf = slice_segments(pitchf, ids_slice, self.segment_size, 2)
                 o = self.dec(z_slice, pitchf, g=g)
 
-                return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+                return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q), pitch_pred
 
             else: # For HiFi-Gan training
                 z_slice, ids_slice = rand_slice_segments(z, spec_lengths, self.segment_size)
@@ -283,10 +305,10 @@ class Synthesizer(torch.nn.Module):
                 else:
                     o = self.dec(z_slice, g=g)
 
-                return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+                return o, ids_slice, x_mask, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q), pitch_pred
         else:
             print(" NONE SPEC ")
-            return None, None, x_mask, None, (None, None, m_p, logs_p, None, None)
+            return None, None, x_mask, None, (None, None, m_p, logs_p, None, None), pitch_pred
 
     @torch.jit.export
     def infer(

@@ -80,7 +80,8 @@ from losses import (
     feature_loss,
     kl_loss,
     kl_loss_floored,
-    phase_loss
+    phase_loss,
+    pitch_prediction_loss,
 )
 from mel_processing import (
     spec_to_mel_torch,
@@ -132,6 +133,7 @@ custom_lr_g, custom_lr_d = (float(sys.argv[37]), float(sys.argv[38])) if use_cus
 assert not use_custom_lr or (custom_lr_g and custom_lr_d), "Invalid custom LR values."
 
 use_torch_compile = bool(strtobool(sys.argv[39])) if len(sys.argv) > 39 else False
+use_period_vits = bool(strtobool(sys.argv[40])) if len(sys.argv) > 40 else False
 
 # Parse command line arguments end region ===========================
 
@@ -314,6 +316,7 @@ def get_g_model(config, sample_rate, vocoder, use_checkpointing):
         vocoder = vocoder,
         checkpointing = use_checkpointing,
         vits2_mode = vits2_mode,
+        use_period_vits = use_period_vits,
     )
 
 def get_d_model(config, vocoder, use_checkpointing):
@@ -1070,6 +1073,8 @@ def training_loop(
             tensor_count = 7
         else:
             tensor_count = 6
+        if use_period_vits:
+            tensor_count += 1  # Extra slot for pitch loss
         epoch_loss_tensor = torch.zeros(tensor_count, device=device)
         num_batches_in_epoch = 0
 
@@ -1085,6 +1090,8 @@ def training_loop(
     }
     if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
         avg_rolling_cache["loss_sd"] = deque(maxlen=rolling_loss_steps)
+    if use_period_vits:
+        avg_rolling_cache["loss_pitch"] = deque(maxlen=rolling_loss_steps)
 
     use_amp = config.train.fp16_run and device.type == "cuda"
 
@@ -1131,13 +1138,13 @@ def training_loop(
 
                 # Generator unpacking:
                 if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
-                    y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q), (mag, _) = (model_output)
+                    y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q), (mag, _), pitch_pred = (model_output)
                 elif vocoder == "APEX-GAN":
                     # y_hat_list = list of [coarse, mid, full] intermediates.
-                    y_hat_list, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q) = (model_output)
+                    y_hat_list, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q), pitch_pred = (model_output)
                     y_hat = y_hat_list[-1] # final full-res waveform
                 else:
-                    y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q) = (model_output)
+                    y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q), pitch_pred = (model_output)
 
                 # Slice the original waveform ( y ) to match the generated slice:
                 y = commons.slice_segments(y, ids_slice * config.data.hop_length, config.train.segment_size, dim=3)
@@ -1257,6 +1264,14 @@ def training_loop(
                     else:
                         loss_gen_total = loss_adv + loss_fm + loss_mel
 
+                # Period VITS: pitch prediction loss
+                loss_pitch = torch.tensor(0.0, device=device)
+                if use_period_vits and pitch_pred is not None:
+                    log_f0_pred, vuv_pred = pitch_pred
+                    loss_f0, loss_vuv = pitch_prediction_loss(log_f0_pred, vuv_pred, pitchf, x_mask)
+                    loss_pitch = loss_f0 + loss_vuv
+                    loss_gen_total = loss_gen_total + loss_pitch
+
             # Generator backward and update:
             optim_g.zero_grad(set_to_none=True)
             if train_dtype == torch.float16:
@@ -1290,6 +1305,9 @@ def training_loop(
                 if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
                     epoch_loss_tensor[6].add_(loss_sd.detach())
 
+                if use_period_vits:
+                    epoch_loss_tensor[-1].add_(loss_pitch.detach())
+
             # Loss accumulation for rolling-avg
             # Grads:
             if torch.isfinite(grad_norm_d):
@@ -1313,6 +1331,8 @@ def training_loop(
                 avg_rolling_cache["loss_sd"].append(loss_sd.detach())
             if "loss_env" in avg_rolling_cache:
                 avg_rolling_cache["loss_env"].append(loss_env.detach())
+            if "loss_pitch" in avg_rolling_cache:
+                avg_rolling_cache["loss_pitch"].append(loss_pitch.detach())
 
 
             if rank == 0 and global_step % rolling_loss_steps == 0:
@@ -1358,7 +1378,8 @@ def training_loop(
                 stopper, rank, global_step, epoch, architecture, 
                 [net_g, net_d], [optim_g, optim_d], config, 
                 experiment_dir, gradscaler, save_weight_models,
-                model_name, vocoder, vits2_mode, n_gpus
+                model_name, vocoder, vits2_mode, n_gpus,
+                use_period_vits=use_period_vits,
             ):
                 return True
 
@@ -1457,6 +1478,8 @@ def training_loop(
             }
             if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
                 scalar_dict_avg.update({"loss_avg/loss_sd": avg_epoch_loss[6].item()})
+            if use_period_vits:
+                scalar_dict_avg.update({"loss_avg/loss_pitch": avg_epoch_loss[-1].item()})
 
             summarize(writer=writer, global_step=global_step, scalars=scalar_dict_avg)
             flush_writer(writer, rank)
@@ -1563,6 +1586,7 @@ def training_loop(
                         vocoder=vocoder,
                         architecture=architecture,
                         vits2_mode=vits2_mode,
+                        use_period_vits=use_period_vits,
                     )
         if done:
             # Clean-up process IDs from memory
