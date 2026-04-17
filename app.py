@@ -42,6 +42,7 @@ from tabs.download.download import download_tab
 from tabs.tts.tts import tts_tab
 from tabs.voice_blender.voice_blender import voice_blender_tab
 from tabs.settings.settings import settings_tab
+from tabs.train.pretrain_tab import pretrain_tab
 
 # Run prerequisites
 from core import run_prerequisites_script
@@ -79,6 +80,9 @@ with gr.Blocks(
 
     with gr.Tab("Training"):
         train_tab()
+
+    with gr.Tab("Pretrain"):
+        pretrain_tab()
 
     with gr.Tab("TTS"):
         tts_tab()

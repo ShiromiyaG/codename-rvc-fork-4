@@ -703,6 +703,146 @@ def early_save_stop(model_name):
         return "No active training process to early stop."
 
 
+# Pretrain Pipeline (3-Phase)
+pretrain_process = None
+
+def run_pretrain_script(
+    model_name: str,
+    phase: int,
+    vocoder: str = "ChouwaGAN",
+    architecture: str = "Fork",
+    sample_rate: int = 48000,
+    batch_size: int = 8,
+    total_epochs: int = 100,
+    save_every: int = 10,
+    gpu: str = "0",
+    lr_g: float = 1e-4,
+    lr_d: float = 1e-4,
+    optimizer: str = "AdamW",
+    fp16: bool = True,
+    use_tf32: bool = True,
+    use_checkpointing: bool = False,
+    spectral_loss: str = "L1 Mel Loss",
+    adversarial_loss: str = "lsgan",
+    kl_anneal_steps: int = 50000,
+    kl_free_bits: float = 0.25,
+    decoder_freeze_steps: int = 10000,
+    phase1_ckpt_g: str = "",
+    phase1_ckpt_d: str = "",
+    phase2_ckpt_g: str = "",
+    phase2_ckpt_d: str = "",
+    grad_clip_g: float = 1000.0,
+    grad_clip_d: float = 1000.0,
+    rolling_loss_steps: int = 50,
+    preview_interval: int = 500,
+    save_only_latest: bool = True,
+    cleanup: bool = False,
+    use_torch_compile: bool = False,
+):
+    global pretrain_process
+
+    pretrain_script_path = os.path.join("rvc", "train", "pretrain.py")
+    command = [
+        python,
+        pretrain_script_path,
+        "--phase", str(phase),
+        "--model_name", str(model_name),
+        "--vocoder", str(vocoder),
+        "--architecture", str(architecture),
+        "--sample_rate", str(sample_rate),
+        "--batch_size", str(batch_size),
+        "--total_epochs", str(total_epochs),
+        "--save_every", str(save_every),
+        "--gpu", str(gpu),
+        "--lr_g", str(lr_g),
+        "--lr_d", str(lr_d),
+        "--optimizer", str(optimizer),
+        "--spectral_loss", str(spectral_loss),
+        "--adversarial_loss", str(adversarial_loss),
+        "--kl_anneal_steps", str(kl_anneal_steps),
+        "--kl_free_bits", str(kl_free_bits),
+        "--decoder_freeze_steps", str(decoder_freeze_steps),
+        "--grad_clip_g", str(grad_clip_g),
+        "--grad_clip_d", str(grad_clip_d),
+        "--rolling_loss_steps", str(rolling_loss_steps),
+        "--preview_interval", str(preview_interval),
+    ]
+
+    if fp16:
+        command.append("--fp16")
+    else:
+        command.append("--no_fp16")
+
+    if use_tf32:
+        command.append("--use_tf32")
+    if use_checkpointing:
+        command.append("--use_checkpointing")
+    if save_only_latest:
+        command.append("--save_only_latest")
+    else:
+        command.append("--no_save_only_latest")
+    if cleanup:
+        command.append("--cleanup")
+    if use_torch_compile:
+        command.append("--use_torch_compile")
+
+    if phase1_ckpt_g:
+        command.extend(["--phase1_ckpt_g", str(phase1_ckpt_g)])
+    if phase1_ckpt_d:
+        command.extend(["--phase1_ckpt_d", str(phase1_ckpt_d)])
+    if phase2_ckpt_g:
+        command.extend(["--phase2_ckpt_g", str(phase2_ckpt_g)])
+    if phase2_ckpt_d:
+        command.extend(["--phase2_ckpt_d", str(phase2_ckpt_d)])
+
+    if platform.system() == "Windows":
+        pretrain_process = subprocess.Popen(
+            command,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+    else:
+        pretrain_process = subprocess.Popen(
+            command,
+            preexec_fn=os.setsid,
+        )
+
+    pretrain_process.wait()
+    return f"Pretrain Phase {phase} completed or stopped."
+
+
+def stop_pretrain_script():
+    global pretrain_process
+    if pretrain_process and pretrain_process.poll() is None:
+        try:
+            pid = pretrain_process.pid
+            parent = psutil.Process(pid)
+            for child in parent.children(recursive=True):
+                child.terminate()
+            parent.terminate()
+            return "Pretrain process stopped."
+        except Exception as e:
+            return f"Error stopping pretrain: {e}"
+    return "No active pretrain process."
+
+
+def early_save_stop_pretrain():
+    global pretrain_process
+    if pretrain_process and pretrain_process.poll() is None:
+        try:
+            if platform.system() == "Windows":
+                os.kill(pretrain_process.pid, signal.CTRL_BREAK_EVENT)
+            else:
+                os.kill(pretrain_process.pid, signal.SIGINT)
+            try:
+                pretrain_process.wait(timeout=15)
+                return "Pretrain early stop completed."
+            except subprocess.TimeoutExpired:
+                return stop_pretrain_script()
+        except Exception as e:
+            return f"Error: {e}"
+    return "No active pretrain process."
+
+
 # Index
 def run_index_script(model_name: str, index_algorithm: str):
     index_script_path = os.path.join("rvc", "train", "process", "extract_index.py")
