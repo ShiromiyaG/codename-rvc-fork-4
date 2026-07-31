@@ -118,11 +118,19 @@ def generate_filelist(
     mute_base_path = os.path.join(current_directory, "logs", mute_folder)
 
     sids = []
-    
-    vocoder_arch = vocoder_arch
 
     for gt_wavs_file, feature_file, f0_file, f0nsf_file in zip(gt_wavs_files, feature_files, f0_files, f0nsf_files, strict=True):
         sid = gt_wavs_file.split("_")[0]
+        try:
+            sid = int(sid)
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid speaker ID in sliced filename {gt_wavs_file!r}."
+            ) from error
+        if sid < 0:
+            raise ValueError(
+                f"Speaker IDs must be non-negative, got {sid} in {gt_wavs_file!r}."
+            )
         if sid not in sids:
             sids.append(sid)
         options.append(
@@ -188,7 +196,11 @@ def generate_filelist(
     else:
         data = {}
 
-    data["speakers_id"] = len(sids)
+    # Speaker IDs are used directly as embedding indices.  Counting unique
+    # IDs is unsafe when the IDs are sparse or when the highest ID is present:
+    # an ID range 0..109 requires 110 embedding rows.
+    speaker_count = max(sids, default=-1) + 1
+    data["speakers_id"] = speaker_count
     data["vocoder_architecture"] = vocoder_arch
 
     with open(file_path, "w") as f:
@@ -197,7 +209,7 @@ def generate_filelist(
     config_path = os.path.join(model_path, "config.json")
     with open(config_path, "r", encoding="utf-8") as handle:
         model_config = json.load(handle)
-    model_config["model"]["spk_embed_dim"] = max(1, len(sids))
+    model_config["model"]["spk_embed_dim"] = max(1, speaker_count)
     with open(config_path, "w", encoding="utf-8") as handle:
         json.dump(model_config, handle, indent=4)
 

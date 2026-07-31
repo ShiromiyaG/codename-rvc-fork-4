@@ -13,6 +13,7 @@ from typing import Any
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from rvc.lib.algorithm.pc_nsf_hifigan import PCNSFHiFiGAN
 
@@ -116,6 +117,7 @@ class RawNSFWaveformGAN(nn.Module):
         sample_rate: int = 44100,
         hop_size: int = 512,
         speaker_adversarial_weight: float = 0.1,
+        gradient_checkpointing: bool = True,
         **_: Any,
     ):
         super().__init__()
@@ -123,6 +125,7 @@ class RawNSFWaveformGAN(nn.Module):
         self.hop_size = int(hop_size)
         self.content_channels = int(content_channels)
         self.speaker_dim = int(speaker_dim)
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         self.emb_g = nn.Embedding(int(spk_embed_dim), self.speaker_dim)
         self.content_stem = _RawStem(self.content_channels, 1024)
         self.prosody_stem = _RawStem(1, 512)
@@ -228,11 +231,11 @@ class RawNSFWaveformGAN(nn.Module):
                 mode="linear",
                 align_corners=False,
             ).squeeze(1)
-        rendered = self.decoder(
-            encoded["condition"],
-            f0.detach(),
-            encoded["speaker"],
-        )
+        decoder_inputs = (encoded["condition"], f0.detach(), encoded["speaker"])
+        if self.training and self.gradient_checkpointing and torch.is_grad_enabled():
+            rendered = checkpoint(self.decoder, *decoder_inputs, use_reentrant=False)
+        else:
+            rendered = self.decoder(*decoder_inputs)
         rendered = rendered[..., : waveform.size(-1)]
         rendered = rendered[..., :original_length]
         encoded["waveform"] = rendered

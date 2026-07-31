@@ -46,7 +46,8 @@
         "sample_rate": 44100,
         "hop_size": 512,
         "decoder_config": "rvc/models/vocoders/config.json",
-        "speaker_adversarial_weight": 0.1
+        "speaker_adversarial_weight": 0.1,
+        "gradient_checkpointing": true
     },
     "discriminator": {
         "periods": [2, 3, 5, 7, 11],

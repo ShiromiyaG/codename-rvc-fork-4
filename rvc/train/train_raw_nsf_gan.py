@@ -223,15 +223,79 @@ def _split(entries, ratio):
     return entries[count:], entries[:count]
 
 
+def _speaker_count(entries):
+    """Return the embedding size required by the filelist speaker IDs."""
+    speaker_ids = []
+    for line_number, entry in enumerate(entries, start=1):
+        if len(entry) < 5:
+            raise ValueError(
+                f"Invalid filelist entry on line {line_number}: expected 5 fields."
+            )
+        try:
+            sid = int(entry[4])
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Invalid speaker ID on filelist line {line_number}: {entry[4]!r}."
+            ) from error
+        if sid < 0:
+            raise ValueError(
+                f"Speaker IDs must be non-negative, got {sid} on line {line_number}."
+            )
+        speaker_ids.append(sid)
+    if not speaker_ids:
+        raise ValueError("The training filelist does not contain any speaker IDs.")
+    return max(speaker_ids) + 1
+
+
+def _ensure_config():
+    """Install the Raw-NSF config when an experiment has an older config."""
+    recommended_path = ROOT / "rvc" / "configs" / "raw_nsf_gan" / "44100.json"
+    recommended = json.loads(recommended_path.read_text(encoding="utf-8"))
+    if not CONFIG.is_file():
+        CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(recommended_path, CONFIG)
+        print("[Raw-NSF-Waveform-GAN] Created the architecture config.")
+        return recommended
+
+    current = json.loads(CONFIG.read_text(encoding="utf-8"))
+    current_model = current.get("model", {})
+    needs_migration = (
+        current.get("architecture") != recommended["architecture"]
+        or "decoder_config" not in current_model
+    )
+    if not needs_migration:
+        return current
+
+    # A checkpoint/config from another architecture cannot be used to build
+    # this generator.  The speaker count is synchronized from filelist.txt
+    # immediately afterward, so the bundled default is only temporary.
+    migrated = json.loads(json.dumps(recommended))
+    for key in ("f0_min", "f0_max"):
+        if key in current.get("data", {}):
+            migrated["data"][key] = current["data"][key]
+    CONFIG.write_text(json.dumps(migrated, indent=4), encoding="utf-8")
+    print(
+        "[Raw-NSF-Waveform-GAN] Replaced the incompatible experiment config "
+        f"({current.get('architecture', 'unknown')})."
+    )
+    return migrated
+
+
 def main():
     if SAMPLE_RATE != 44100:
         raise ValueError("Raw-NSF-Waveform-GAN supports only 44100 Hz")
     EXPERIMENT.mkdir(parents=True, exist_ok=True)
-    if not CONFIG.is_file():
-        recommended = ROOT / "rvc" / "configs" / "raw_nsf_gan" / "44100.json"
-        CONFIG.write_text(recommended.read_text(encoding="utf-8"), encoding="utf-8")
-    config = json.loads(CONFIG.read_text(encoding="utf-8"))
+    config = _ensure_config()
     entries = load_filepaths_and_text(str(EXPERIMENT / "filelist.txt"))
+    speaker_count = _speaker_count(entries)
+    configured_speakers = int(config.setdefault("model", {}).get("spk_embed_dim", 1))
+    if configured_speakers != speaker_count:
+        config["model"]["spk_embed_dim"] = speaker_count
+        CONFIG.write_text(json.dumps(config, indent=4), encoding="utf-8")
+        print(
+            "[Raw-NSF-Waveform-GAN] Updated spk_embed_dim from "
+            f"{configured_speakers} to {speaker_count} based on filelist speaker IDs."
+        )
     train_entries, validation_entries = _split(entries, VALIDATION_RATIO)
     segment_size = int(config["train"]["segment_size"])
     train_loader = DataLoader(
@@ -307,21 +371,28 @@ def main():
                 if global_step < int(config["train"].get("teacher_f0_steps", 10000))
                 else None
             )
+
+            # The discriminator branch must not retain the generator graph.
+            # The generator is intentionally recomputed below for its own
+            # update; this trades a second forward for a much lower peak VRAM
+            # requirement.
             with autocast(device_type=device.type, enabled=FP16 and device.type == "cuda", dtype=torch.float16):
-                output = model(waveform, sid, teacher_f0)
-                fake = output["waveform"]
-                speaker = output["speaker"]
-                real_logits, _ = discriminator(waveform, speaker.detach())
-                fake_logits, _ = discriminator(fake.detach(), speaker.detach())
+                with torch.no_grad():
+                    output_d = model(waveform, sid, teacher_f0)
+                    fake_d = output_d["waveform"]
+                    speaker_d = output_d["speaker"]
+                real_logits, _ = discriminator(waveform, speaker_d)
+                fake_logits, _ = discriminator(fake_d, speaker_d)
                 d_loss = discriminator_hinge_loss(real_logits, fake_logits)
                 if do_conversion:
-                    converted_d = model(waveform, target_sid, teacher_f0)
-                    target_speaker = converted_d["speaker"]
+                    with torch.no_grad():
+                        converted_d = model(waveform, target_sid, teacher_f0)
+                    target_speaker_d = converted_d["speaker"]
                     target_real_logits, _ = discriminator(
-                        target_real, target_speaker.detach()
+                        target_real, target_speaker_d
                     )
                     converted_logits, _ = discriminator(
-                        converted_d["waveform"].detach(), target_speaker.detach()
+                        converted_d["waveform"], target_speaker_d
                     )
                     d_loss = 0.5 * (
                         d_loss
@@ -335,9 +406,16 @@ def main():
             torch.nn.utils.clip_grad_norm_(params_d, float(config["train"].get("gradient_clip", 5.0)))
             scaler.step(optimizer_d)
 
+            del output_d, fake_d, speaker_d, real_logits, fake_logits
+            if do_conversion:
+                del converted_d, target_speaker_d, target_real_logits, converted_logits
+
             for parameter in params_d:
                 parameter.requires_grad_(False)
             with autocast(device_type=device.type, enabled=FP16 and device.type == "cuda", dtype=torch.float16):
+                output = model(waveform, sid, teacher_f0)
+                fake = output["waveform"]
+                speaker = output["speaker"]
                 fake_logits, fake_features = discriminator(fake, speaker)
                 real_logits_g, real_features = discriminator(waveform, speaker)
                 loss_stft = stft_loss(fake, waveform)
