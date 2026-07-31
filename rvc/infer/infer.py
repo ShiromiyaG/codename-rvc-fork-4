@@ -557,10 +557,15 @@ class VoiceConverter:
         """
         if self.active_cpt is not None:
             architecture = self.active_cpt.get("architecture")
-            if architecture not in {"Mel-VITS", "Hybrid-FSQ"}:
+            if architecture not in {
+                "Mel-VITS",
+                "Hybrid-FSQ",
+                "Stochastic-Residual-Conformer-GAN",
+            }:
                 raise ValueError(
                     "Legacy RVC/vocoder checkpoints are not supported by this build. "
-                    "Train or load a Mel-VITS or Hybrid-FSQ checkpoint."
+                    "Train or load a Mel-VITS, Hybrid-FSQ or "
+                    "Stochastic-Residual-Conformer-GAN checkpoint."
                 )
             self.tgt_sr = 44100
             self.use_f0 = True
@@ -574,12 +579,28 @@ class VoiceConverter:
             if architecture == "Hybrid-FSQ":
                 from rvc.lib.algorithm.hybrid_fsq import HybridFSQSynthesizer
 
+                if int(model_config.get("hybrid_quality_patch", 0)) != 1:
+                    raise ValueError(
+                        "This Hybrid-FSQ v1 checkpoint predates the local-prior "
+                        "quality patch and is incompatible. Retrain and export "
+                        "it with the current Hybrid-FSQ configuration."
+                    )
                 self.net_g = HybridFSQSynthesizer(**model_config)
                 del self.net_g.global_posterior
                 del self.net_g.slow_posterior
                 del self.net_g.fast_posterior
                 del self.net_g.slow_prequant
                 del self.net_g.fast_prequant
+            elif architecture == "Stochastic-Residual-Conformer-GAN":
+                from rvc.lib.algorithm.stochastic_conformer_gan import (
+                    StochasticResidualConformerGAN,
+                )
+
+                self.net_g = StochasticResidualConformerGAN(**model_config)
+                del self.net_g.posterior_global
+                del self.net_g.posterior_local
+                del self.net_g.random_area_discriminator
+                del self.net_g.voicing_discriminator
             else:
                 self.net_g = Synthesizer(**model_config)
                 del self.net_g.enc_q

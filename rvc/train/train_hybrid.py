@@ -30,8 +30,11 @@ from rvc.train.data_utils import DistributedBucketSampler, TextAudioLoaderMultiN
 from rvc.train.hybrid_data import (
     HybridFSQCollate,
     HybridFSQDataset,
+    PackedLocalityBatchSampler,
     attach_evaluation_parents,
+    build_hybrid_packed_cache,
     build_hybrid_statistics,
+    load_hybrid_packed_cache,
     migrate_mel_caches_to_mmap,
     split_entries_by_source,
 )
@@ -89,6 +92,9 @@ EMA_IN_RAM = _arg(56, True, bool)
 EMA_INTERVAL = max(1, _arg(57, 10, int))
 VOCODER_VALIDATION = _arg(61, False, bool)
 VOCODER_VALIDATION_BATCHES = max(1, _arg(62, 1, int))
+# A small posterior-path validation probe makes the inference gap observable
+# without doubling the complete validation pass.
+POSTERIOR_DIAGNOSTIC_BATCHES = max(0, _arg(63, 4, int))
 
 EXPERIMENT = ROOT / "logs" / NAME
 CONFIG = EXPERIMENT / "config.json"
@@ -195,7 +201,19 @@ def _kl_global(distribution):
     mu_q, logs_q, mu_p, logs_p = (item.float() for item in distribution)
     variance_ratio = torch.exp(2 * (logs_q - logs_p))
     mean_term = (mu_q - mu_p).square() * torch.exp(-2 * logs_p)
-    return (logs_p - logs_q + 0.5 * (variance_ratio + mean_term - 1)).sum(-1).mean()
+    dimensions = (
+        logs_p - logs_q + 0.5 * (variance_ratio + mean_term - 1)
+    ).mean(0)
+    return dimensions.sum(), dimensions
+
+
+def _local_prior_mix_probability(step, train_config):
+    start = float(getattr(train_config, "local_prior_mix_start", 0.10))
+    end = float(getattr(train_config, "local_prior_mix_end", 0.50))
+    ramp = max(
+        1, int(getattr(train_config, "local_prior_mix_ramp_steps", 30000))
+    )
+    return start + (end - start) * min(1.0, step / ramp)
 
 
 def _save_validation_preview(
@@ -209,7 +227,9 @@ def _save_validation_preview(
     target_wave=None,
 ):
     """Save a small, fixed validation panel and optional waveform pair."""
-    preview_dir = EXPERIMENT / "validation_samples" / f"epoch_{epoch:04d}"
+    preview_dir = (
+        EXPERIMENT / "validation_samples_v1_quality" / f"epoch_{epoch:04d}"
+    )
     mel_dir = preview_dir / "mel"
     audio_dir = preview_dir / "audio"
     mel_dir.mkdir(parents=True, exist_ok=True)
@@ -322,29 +342,28 @@ def _losses(model, output, batch, controller, step, config, update_controller=Tr
     mask = output["mask"]
     residual_target = global_target + slow_target + fast_target
     residual_hat = output["global"] + output["slow"] + output["fast"]
-    pi, slow_logits, fast_logits = output["prior"]
     slow_ids, fast_ids = output["codes"][:2]
-    prior_nll, responsibilities = model.mixture_prior_loss(
-        pi, slow_logits, fast_logits, slow_ids, fast_ids
+    prior_nll = model.factorized_prior_loss(
+        output["prior"], output["codes"], mask
     )
-    geometry = model.prior_geometry(output["prior"], output["codes"], responsibilities)
-    kl = _kl_global(output["global_distribution"])
-    marginal_components = responsibilities.mean(0)
-    effective_components = torch.exp(
-        -(marginal_components * marginal_components.clamp_min(1e-8).log()).sum()
-    )
-    slow_histogram = torch.bincount(
-        slow_ids.detach().reshape(-1), minlength=512
-    ).float()
-    fast_histogram = torch.bincount(
-        fast_ids.detach().reshape(-1), minlength=125
-    ).float()
+    geometry = model.prior_geometry(output["prior"], output["codes"], mask)
+    kl, kl_dimensions = _kl_global(output["global_distribution"])
 
-    def effective_codes(histogram):
-        probability = histogram / histogram.sum().clamp_min(1)
-        return torch.exp(
-            -(probability * probability.clamp_min(1e-8).log()).sum()
-        )
+    def effective_levels(indices, level_count):
+        results = []
+        for dimension in range(indices.size(1)):
+            histogram = torch.bincount(
+                indices[:, dimension].detach().reshape(-1),
+                minlength=level_count,
+            ).float()
+            probability = histogram / histogram.sum().clamp_min(1)
+            results.append(
+                torch.exp(
+                    -(probability * probability.clamp_min(1e-8).log()).sum()
+                )
+            )
+        stacked = torch.stack(results)
+        return stacked.mean(), stacked
     if update_controller:
         beta, target_rate = controller.update(float(kl.detach()), step)
     else:
@@ -352,7 +371,15 @@ def _losses(model, output, batch, controller, step, config, update_controller=Tr
         fraction = min(1.0, step / max(1, controller.steps))
         target_rate = controller.start + (controller.end - controller.start) * fraction
     weights = config.loss
+    slow_effective, slow_effective_dimensions = effective_levels(
+        slow_ids, model.slow_fsq.level_count
+    )
+    fast_effective, fast_effective_dimensions = effective_levels(
+        fast_ids, model.fast_fsq.level_count
+    )
     values = {
+        # Preserve the v1 decomposition: the coarse path cannot make the
+        # global Gaussian or local residual streams unnecessary.
         "base": _mask_l1(output["base"], base_target, mask),
         "global": _mask_l1(output["global"], global_target, mask),
         "residual": _mask_l1(residual_hat, residual_target, mask),
@@ -365,14 +392,26 @@ def _losses(model, output, batch, controller, step, config, update_controller=Tr
             mel[..., 1:] - mel[..., :-1],
             mask[..., 1:],
         ),
+        "frequency_delta": _mask_l1(
+            output["mel"][:, 1:] - output["mel"][:, :-1],
+            mel[:, 1:] - mel[:, :-1],
+            mask,
+        ),
         "local_prior": prior_nll,
         "prior_geometry": geometry,
         "kl": kl,
-        "effective_components": effective_components,
-        "effective_slow_codes": effective_codes(slow_histogram),
-        "effective_fast_codes": effective_codes(fast_histogram),
+        "global_active_units": (kl_dimensions.detach() > 0.01).float().sum(),
+        "effective_slow_codes": slow_effective,
+        "effective_fast_codes": fast_effective,
+        "local_prior_fraction": output["local_prior_fraction"],
     }
-    total = sum(
+    for index, dimension_kl in enumerate(kl_dimensions):
+        values[f"kl_dim_{index}"] = dimension_kl
+    for index, effective in enumerate(slow_effective_dimensions):
+        values[f"slow_levels_dim_{index}"] = effective
+    for index, effective in enumerate(fast_effective_dimensions):
+        values[f"fast_levels_dim_{index}"] = effective
+    acoustic = sum(
         values[key] * float(getattr(weights, key))
         for key in (
             "base",
@@ -383,11 +422,30 @@ def _losses(model, output, batch, controller, step, config, update_controller=Tr
             "final",
             "multi_scale",
             "temporal_delta",
-            "local_prior",
-            "prior_geometry",
+            "frequency_delta",
         )
-    ) + kl * beta
-    values.update(total=total, beta=beta, target_rate=target_rate)
+    )
+    total = (
+        acoustic
+        + values["local_prior"] * float(weights.local_prior)
+        + values["prior_geometry"] * float(weights.prior_geometry)
+        + kl * beta
+    )
+    # This is the checkpoint-selection metric.  It is evaluated with the
+    # inference prior path and cannot be dominated by categorical entropy.
+    quality = (
+        values["final"]
+        + 0.5 * values["multi_scale"]
+        + 0.2 * values["temporal_delta"]
+        + 0.2 * values["frequency_delta"]
+    )
+    values.update(
+        total=total,
+        acoustic=acoustic,
+        quality=quality,
+        beta=beta,
+        target_rate=target_rate,
+    )
     return values
 
 
@@ -517,49 +575,111 @@ def _worker(rank, world_size, gpu_ids):
     train_entries, validation_entries = split_entries_by_source(
         entries, VALIDATION_RATIO, int(getattr(config.train, "seed", 1234))
     )
+    packed_enabled = bool(getattr(config.data, "packed_cache", True))
+    packed_cache = (
+        load_hybrid_packed_cache(entries, EXPERIMENT)
+        if packed_enabled
+        else None
+    )
     if rank == 0:
-        # Train-only statistics must not see validation data, but validation
-        # targets still require the same cached pc-NSF mel representation.
-        # Warm every cache before building/attaching either target set.
-        _warm_mel_cache(config, entries)
-        stats = build_hybrid_statistics(
-            train_entries, EXPERIMENT, config.data.n_mel_channels
-        )
-        if bool(getattr(config.data, "mmap_mel_cache", True)):
-            converted = migrate_mel_caches_to_mmap(
-                entries,
-                workers=int(getattr(config.data, "mmap_conversion_workers", 4)),
-                remove_legacy=bool(
-                    getattr(config.data, "remove_legacy_mel_cache", True)
-                ),
+        if packed_cache is None:
+            # Train-only statistics must not see validation data, but validation
+            # targets still require the same cached pc-NSF mel representation.
+            _warm_mel_cache(config, entries)
+            stats = build_hybrid_statistics(
+                train_entries, EXPERIMENT, config.data.n_mel_channels
             )
-            if converted:
-                print(
-                    f"[Hybrid-FSQ] Converted {converted} mel caches to "
-                    "crop-readable mmap format."
+            if validation_entries:
+                stats = attach_evaluation_parents(stats, validation_entries)
+                torch.save(stats, EXPERIMENT / "hybrid_stats.pt")
+            if packed_enabled:
+                packed_cache = build_hybrid_packed_cache(
+                    entries,
+                    EXPERIMENT,
+                    remove_individual_mels=bool(
+                        getattr(
+                            config.data,
+                            "remove_individual_mels_after_packing",
+                            True,
+                        )
+                    ),
                 )
+                print("[Hybrid-FSQ] Packed mmap cache is ready.")
+            elif bool(getattr(config.data, "mmap_mel_cache", True)):
+                converted = migrate_mel_caches_to_mmap(
+                    entries,
+                    workers=int(
+                        getattr(config.data, "mmap_conversion_workers", 4)
+                    ),
+                    remove_legacy=bool(
+                        getattr(config.data, "remove_legacy_mel_cache", True)
+                    ),
+                )
+                if converted:
+                    print(
+                        f"[Hybrid-FSQ] Converted {converted} mel caches to "
+                        "crop-readable mmap format."
+                    )
+        else:
+            stats = torch.load(
+                EXPERIMENT / "hybrid_stats.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
     if distributed:
         dist.barrier()
     if rank != 0:
         stats = torch.load(EXPERIMENT / "hybrid_stats.pt", map_location="cpu", weights_only=False)
-    if validation_entries:
+    if packed_enabled:
+        packed_cache = load_hybrid_packed_cache(entries, EXPERIMENT)
+    if validation_entries and packed_cache is None:
         stats = attach_evaluation_parents(stats, validation_entries)
 
     segment_frames = int(getattr(config.train, "segment_frames", 256))
     dataset = HybridFSQDataset(
         config.data, entries=train_entries, augment=True, stats=stats,
-        segment_frames=segment_frames, load_waveform=False
+        segment_frames=segment_frames, load_waveform=False,
+        packed_cache=packed_cache,
     )
-    sampler = DistributedBucketSampler(
-        dataset, BATCH, [32, 64, 128, 192, 256, 384, 512, 768, 1200],
-        num_replicas=world_size, rank=rank, shuffle=True
+    if packed_cache is not None:
+        sampler = PackedLocalityBatchSampler(
+            dataset,
+            BATCH,
+            num_replicas=world_size,
+            rank=rank,
+            locality_batches=int(
+                getattr(config.data, "packed_locality_batches", 64)
+            ),
+            seed=int(getattr(config.train, "seed", 1234)),
+        )
+    else:
+        sampler = DistributedBucketSampler(
+            dataset, BATCH, [32, 64, 128, 192, 256, 384, 512, 768, 1200],
+            num_replicas=world_size, rank=rank, shuffle=True
+        )
+    configured_workers = int(
+        getattr(
+            config.data,
+            "packed_loader_workers" if packed_cache is not None else "loader_workers",
+            2 if packed_cache is not None else 8,
+        )
     )
-    configured_workers = int(getattr(config.data, "loader_workers", 8))
     workers = min(
         max(1, configured_workers),
         max(1, (os.cpu_count() or 2) // world_size),
     )
-    prefetch_factor = max(1, int(getattr(config.data, "prefetch_factor", 4)))
+    prefetch_factor = max(
+        1,
+        int(
+            getattr(
+                config.data,
+                "packed_prefetch_factor"
+                if packed_cache is not None
+                else "prefetch_factor",
+                2 if packed_cache is not None else 4,
+            )
+        ),
+    )
     loader = DataLoader(
         dataset, batch_sampler=sampler, collate_fn=HybridFSQCollate(),
         num_workers=workers, pin_memory=device.type == "cuda",
@@ -572,6 +692,7 @@ def _worker(rank, world_size, gpu_ids):
             segment_frames=segment_frames,
             load_waveform=VOCODER_VALIDATION,
             waveform_items=VOCODER_VALIDATION_BATCHES * BATCH,
+            packed_cache=packed_cache,
         )
         validation_loader = DataLoader(
             validation_dataset, batch_size=BATCH, collate_fn=HybridFSQCollate(),
@@ -601,7 +722,23 @@ def _worker(rank, world_size, gpu_ids):
     start_epoch, global_step, best = 1, 0, math.inf
     resume = EXPERIMENT / "G_latest.pth"
     resume_payload = {}
+    configured_quality_patch = int(
+        getattr(config.model, "hybrid_quality_patch", 1)
+    )
+    resume_compatible = False
+    saved_quality_patch = 0
     if resume.is_file() and not CLEANUP:
+        checkpoint_header = torch.load(
+            resume, map_location="cpu", weights_only=True
+        )
+        saved_quality_patch = checkpoint_header.get("model", {}).get(
+            "hybrid_quality_patch", 0
+        )
+        if torch.is_tensor(saved_quality_patch):
+            saved_quality_patch = int(saved_quality_patch.item())
+        resume_compatible = saved_quality_patch == configured_quality_patch
+        del checkpoint_header
+    if resume.is_file() and not CLEANUP and resume_compatible:
         try:
             model, optimizer, _, saved_epoch, scaler_state, resume_payload = load_checkpoint(
                 str(resume), model, optimizer, strict_load=True, return_extra=True
@@ -612,8 +749,16 @@ def _worker(rank, world_size, gpu_ids):
             if scaler_state:
                 scaler.load_state_dict(scaler_state)
         except (RuntimeError, ValueError) as error:
-            print(f"[Hybrid-FSQ] Exact resume unavailable ({error}); loading compatible weights.")
-            _load_flexible(model, str(resume))
+            print(
+                "[Hybrid-FSQ] Exact quality-patch resume failed; starting "
+                f"from scratch. Details: {error}"
+            )
+    elif resume.is_file() and not CLEANUP:
+        print(
+            f"[Hybrid-FSQ] Ignoring v1 checkpoint quality patch "
+            f"{saved_quality_patch}; patch {configured_quality_patch} starts "
+            "from scratch. Derived caches and statistics are preserved."
+        )
     elif PRETRAIN and Path(PRETRAIN).is_file():
         _load_flexible(model, PRETRAIN)
     ema.load_state_dict(resume_payload.get("ema"))
@@ -632,12 +777,20 @@ def _worker(rank, world_size, gpu_ids):
             model, device_ids=[gpu_ids[rank]] if device.type == "cuda" else None,
             broadcast_buffers=False
         )
-    writer = SummaryWriter(str(EXPERIMENT)) if rank == 0 else None
+    writer = (
+        SummaryWriter(
+            str(EXPERIMENT / "tensorboard" / "hybrid_v1_quality")
+        )
+        if rank == 0
+        else None
+    )
     amp = FP16 and device.type == "cuda"
     if rank == 0:
         print(
             f"[Hybrid-FSQ] train={len(dataset)} validation={len(validation_entries)} "
-            f"segment={segment_frames} precision={'FP16' if amp else 'FP32'}"
+            f"segment={segment_frames} precision={'FP16' if amp else 'FP32'} "
+            f"loader={'packed-locality' if packed_cache is not None else 'files'} "
+            f"workers={workers} prefetch={prefetch_factor}"
         )
 
     optimizer.zero_grad(set_to_none=True)
@@ -664,7 +817,13 @@ def _worker(rank, world_size, gpu_ids):
                 with autocast(device_type=device.type, enabled=amp, dtype=torch.float16):
                     output = model(
                         phone, phone_lengths, pitch, pitchf, mel, mel_lengths, sid,
-                        slow_target, fast_target, global_coeff
+                        slow_target, fast_target, global_coeff,
+                        local_prior_mix=torch.tensor(
+                            _local_prior_mix_probability(
+                                global_step, config.train
+                            ),
+                            device=device,
+                        ),
                     )
                     module = model.module if hasattr(model, "module") else model
                     values = _losses(module, output, batch, controller, global_step, config)
@@ -687,7 +846,7 @@ def _worker(rank, world_size, gpu_ids):
                     "loss": f"{running / (batch_index + 1):.4f}",
                     "rate": f"{values['kl'].item():.2f}",
                     "beta": f"{values['beta']:.4f}",
-                    "modes": f"{values['effective_components'].item():.2f}",
+                    "prior": f"{values['local_prior_fraction'].item():.2f}",
                 }
                 if device.type == "cuda":
                     status["vram"] = f"{torch.cuda.memory_allocated(device)/2**30:.2f}G"
@@ -704,7 +863,11 @@ def _worker(rank, world_size, gpu_ids):
             if hasattr(optimizer, "eval"):
                 optimizer.eval()
             model.eval()
-            validation_total = 0.0
+            validation_sums = {}
+            validation_batches = 0
+            posterior_probe_sums = {}
+            prior_probe_sums = {}
+            posterior_probe_batches = 0
             validation_waveform = 0.0
             waveform_batches = 0
             validation_vocoder = None
@@ -721,7 +884,16 @@ def _worker(rank, world_size, gpu_ids):
             validation_module = (
                 model.module if hasattr(model, "module") else model
             )
-            with ema.apply(validation_module), torch.no_grad():
+            validation_weights = (
+                nullcontext()
+                if hasattr(optimizer, "eval")
+                else ema.apply(validation_module)
+            )
+            # Schedule-free optimizers already place their internally averaged
+            # parameters into the module in eval mode.  Applying a second EMA
+            # here used to overwrite those evaluation weights with an average
+            # of the noisier training iterate.
+            with validation_weights, torch.no_grad():
                 for validation_index, validation_batch in enumerate(validation_loader):
                     validation_batch = tuple(item.to(device, non_blocking=True) for item in validation_batch)
                     (
@@ -731,7 +903,11 @@ def _worker(rank, world_size, gpu_ids):
                     with autocast(device_type=device.type, enabled=amp, dtype=torch.float16):
                         output = model(
                             phone, phone_lengths, pitch, pitchf, mel, mel_lengths, sid,
-                            slow_target, fast_target, global_coeff
+                            slow_target,
+                            fast_target,
+                            global_coeff,
+                            local_prior_mix=torch.ones((), device=device),
+                            global_prior=True,
                         )
                         module = model.module if hasattr(model, "module") else model
                         values = _losses(
@@ -743,7 +919,69 @@ def _worker(rank, world_size, gpu_ids):
                             config,
                             update_controller=False,
                         )
-                    validation_total += float(values["total"])
+                    validation_batches += 1
+                    for key, value in values.items():
+                        scalar = (
+                            value
+                            if isinstance(value, float)
+                            else float(value.detach())
+                        )
+                        validation_sums[key] = (
+                            validation_sums.get(key, 0.0) + scalar
+                        )
+                    # The normal validation path is exactly the inference
+                    # path: global prior plus local prior.  On a fixed small
+                    # subset, also decode with posterior local codes.  The
+                    # difference isolates whether quality is constrained by
+                    # acoustic capacity or by local-prior prediction.
+                    if validation_index < POSTERIOR_DIAGNOSTIC_BATCHES:
+                        with autocast(
+                            device_type=device.type,
+                            enabled=amp,
+                            dtype=torch.float16,
+                        ):
+                            posterior_output = model(
+                                phone,
+                                phone_lengths,
+                                pitch,
+                                pitchf,
+                                mel,
+                                mel_lengths,
+                                sid,
+                                slow_target,
+                                fast_target,
+                                global_coeff,
+                                local_prior_mix=torch.zeros((), device=device),
+                                global_prior=True,
+                            )
+                            posterior_values = _losses(
+                                module,
+                                posterior_output,
+                                validation_batch,
+                                controller,
+                                global_step,
+                                config,
+                                update_controller=False,
+                            )
+                        posterior_probe_batches += 1
+                        for key, value in values.items():
+                            scalar = (
+                                value
+                                if isinstance(value, float)
+                                else float(value.detach())
+                            )
+                            prior_probe_sums[key] = (
+                                prior_probe_sums.get(key, 0.0) + scalar
+                            )
+                        for key, value in posterior_values.items():
+                            scalar = (
+                                value
+                                if isinstance(value, float)
+                                else float(value.detach())
+                            )
+                            posterior_probe_sums[key] = (
+                                posterior_probe_sums.get(key, 0.0) + scalar
+                            )
                     if (
                         rank == 0
                         and validation_index < VOCODER_VALIDATION_BATCHES
@@ -776,8 +1014,8 @@ def _worker(rank, world_size, gpu_ids):
                                 pitchf[:1],
                                 sid[:1],
                                 seed=1729 + validation_index,
-                                noise_scale=0.5,
-                                temperature=0.7,
+                                noise_scale=0.0,
+                                temperature=0.0,
                                 source_onset=source_onset,
                             )[0]
                         valid_frames = int(mel_lengths[0].item())
@@ -817,7 +1055,19 @@ def _worker(rank, world_size, gpu_ids):
                             predicted_wave,
                             target_wave,
                         )
-            validation_loss = validation_total / max(1, len(validation_loader))
+            validation_means = {
+                key: value / max(1, validation_batches)
+                for key, value in validation_sums.items()
+            }
+            validation_loss = validation_means["quality"]
+            posterior_probe_means = {
+                key: value / max(1, posterior_probe_batches)
+                for key, value in posterior_probe_sums.items()
+            }
+            prior_probe_means = {
+                key: value / max(1, posterior_probe_batches)
+                for key, value in prior_probe_sums.items()
+            }
             if validation_vocoder is not None:
                 del validation_vocoder, waveform_loss
                 if device.type == "cuda":
@@ -825,7 +1075,19 @@ def _worker(rank, world_size, gpu_ids):
                 if rank == 0:
                     print("[Hybrid-FSQ] Unloaded validation-only pc-NSF.")
             if rank == 0:
-                writer.add_scalar("validation/total", validation_loss, global_step)
+                for key, value in validation_means.items():
+                    writer.add_scalar(f"validation/{key}", value, global_step)
+                if posterior_probe_batches:
+                    for key, value in posterior_probe_means.items():
+                        writer.add_scalar(
+                            f"validation_posterior/{key}", value, global_step
+                        )
+                    for key in ("quality", "final", "multi_scale", "local_prior"):
+                        writer.add_scalar(
+                            f"validation/prior_gap_{key}",
+                            prior_probe_means[key] - posterior_probe_means[key],
+                            global_step,
+                        )
                 if waveform_batches:
                     writer.add_scalar(
                         "validation/waveform_stft",
@@ -833,7 +1095,8 @@ def _worker(rank, world_size, gpu_ids):
                         global_step,
                     )
                 print(
-                    f"epoch={epoch} validation={validation_loss:.4f} "
+                    f"epoch={epoch} quality={validation_loss:.4f} "
+                    f"total={validation_means['total']:.4f} "
                     f"wave={validation_waveform / max(1, waveform_batches):.4f}"
                 )
             if hasattr(optimizer, "train"):
@@ -863,12 +1126,19 @@ def _worker(rank, world_size, gpu_ids):
             if SAVE_WEIGHTS:
                 output_path = ROOT / "assets" / "weights" / f"{NAME}_{epoch}e_{global_step}s.pth"
                 output_path.parent.mkdir(parents=True, exist_ok=True)
-                with ema.apply(module):
+                if hasattr(optimizer, "eval"):
+                    optimizer.eval()
+                    export_weights = nullcontext()
+                else:
+                    export_weights = ema.apply(module)
+                with export_weights:
                     extract_model(
                         module.state_dict(), "44.1k", NAME, str(output_path), epoch,
                         global_step, config, "pc-NSF-HiFiGAN", "Hybrid-FSQ",
-                        version="hybrid-fsq-1"
+                        version="hybrid-fsq-1-quality"
                     )
+                if hasattr(optimizer, "train"):
+                    optimizer.train()
     if writer:
         writer.close()
     if distributed:
@@ -886,18 +1156,58 @@ def main():
     else:
         with open(CONFIG, "r", encoding="utf-8") as handle:
             current_config = json.load(handle)
-        if current_config.get("architecture") != "Hybrid-FSQ":
+        current_patch = current_config.get("model", {}).get(
+            "hybrid_quality_patch", 0
+        )
+        recommended_patch = recommended_config["model"][
+            "hybrid_quality_patch"
+        ]
+        # Keep the public Hybrid-FSQ revision unchanged, while ensuring an
+        # experiment that was configured before the local-quality correction
+        # cannot silently keep its undersized three-dimensional FSQ branches.
+        # The user requested a fresh run, so install the new local settings
+        # exactly as we do for a legacy architecture migration.
+        current_model = current_config.get("model", {})
+        recommended_model = recommended_config["model"]
+        current_train = current_config.get("train", {})
+        recommended_train = recommended_config["train"]
+        needs_local_quality_update = any(
+            current_model.get(key) != recommended_model[key]
+            for key in ("slow_fsq_levels", "fast_fsq_levels")
+        ) or any(
+            current_train.get(key) != recommended_train[key]
+            for key in (
+                "local_prior_mix_start",
+                "local_prior_mix_end",
+                "local_prior_mix_ramp_steps",
+            )
+        )
+        if (
+            current_config.get("architecture") != "Hybrid-FSQ"
+            or current_patch != recommended_patch
+            or needs_local_quality_update
+        ):
             hybrid_config = recommended_config
             if "model" in current_config and "spk_embed_dim" in current_config["model"]:
                 hybrid_config["model"]["spk_embed_dim"] = current_config["model"]["spk_embed_dim"]
             for key in ("f0_min", "f0_max"):
                 if key in current_config.get("data", {}):
                     hybrid_config["data"][key] = current_config["data"][key]
+            for key in (
+                "packed_cache",
+                "remove_individual_mels_after_packing",
+                "packed_loader_workers",
+                "packed_prefetch_factor",
+                "packed_locality_batches",
+            ):
+                if key in current_config.get("data", {}):
+                    hybrid_config["data"][key] = current_config["data"][key]
             with open(CONFIG, "w", encoding="utf-8") as handle:
                 json.dump(hybrid_config, handle, indent=4)
             print(
-                "[Hybrid-FSQ] Replaced the experiment acoustic config while "
-                "preserving speaker count and F0 limits."
+                "[Hybrid-FSQ] Installed the current local-quality settings; "
+                "speaker count, F0 limits and packed cache settings were "
+                "preserved."
             )
             current_config = hybrid_config
         else:

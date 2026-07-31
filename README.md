@@ -149,31 +149,63 @@ explicitly rejected.
 
 The training tab offers **Hybrid-FSQ** alongside **Mel-VITS**. Both predict the
 same 128-bin, 44.1 kHz / hop-512 mel representation rendered by the bundled
-pc-NSF-HiFiGAN. Hybrid-FSQ uses:
+pc-NSF-HiFiGAN. The quality-patched Hybrid-FSQ v1 uses:
 
-- an architecturally coarse deterministic mel path;
+- an architecturally coarse deterministic decoder, preserving the need for
+  the stochastic global and local paths;
 - an 8-dimensional rate-controlled global Gaussian latent constrained to a
   time-constant low-rank DCT correction;
-- parallel slow `[8, 8, 8]` and fast `[5, 5, 5]` FSQ paths;
-- a two-component crop-level mixture-of-products prior.
+- parallel slow `[8, 8, 8, 8]` and fast `[5, 5, 5, 5]` FSQ residual paths;
+- factorized, geometry-aware scalar priors with locally soft posterior
+  targets instead of unstable 512/125-way joint labels;
+- contextual TCN prior heads and progressive exposure of only the local
+  residual decoder to inference-prior values;
+- stronger final-mel, multiscale, temporal-delta and frequency-delta
+  supervision.
 
 Training is end-to-end in one phase and does not load the waveform vocoder.
+Earlier Hybrid-FSQ v1 checkpoints are incompatible with the factorized local
+prior; existing mel, feature, F0, statistics and packed caches remain reusable.
 The first run creates `hybrid_stats.pt` and `hybrid_manifest.json` in the
 experiment folder using only the training split. Exported inference `.pth`
 files retain the required normalization and residual-cap tensors while
 omitting all three training-only posterior networks.
 
-For large datasets, the first optimized run converts derived `.mel.pt` caches
-to crop-readable `.mel.npy` memory maps and removes the replaced `.mel.pt`
-files. This is a one-time I/O pass and does not alter source audio or extracted
-features. Subsequent epochs read only the requested 256-frame mel,
-ContentVec and F0 ranges; training does not decode source audio. Loader
-parallelism can be tuned with `data.loader_workers` and
-`data.prefetch_factor`.
+For large datasets, the first optimized run creates
+`hybrid_packed_cache/`: four indexed mmap files for mel, ContentVec, coarse F0
+and voiced F0. Packed training shuffles large blocks while keeping each batch
+physically sequential; this avoids scattered page faults in caches larger than
+RAM without fixing the order between epochs. Individual derived mel caches are
+removed only after the packed cache is committed atomically; source audio and
+extracted features remain untouched. Subsequent epochs read only the requested
+256-frame ranges and never decode source audio. Packed-cache parallelism and
+locality can be tuned with `data.packed_loader_workers`,
+`data.packed_prefetch_factor` and `data.packed_locality_batches`.
 
 CLI users should select `--vocoder_arch hybrid_fsq` during extraction and
 `--architecture Hybrid-FSQ` during training. The UI selects the matching
 configuration automatically.
+
+## Stochastic Residual Conformer-GAN acoustic alternative
+
+The training tab also offers **Stochastic-Residual-Conformer-GAN**. It uses a
+native PyTorch Conformer-Lite generator for the coarse mel structure and a
+small Gaussian global/local residual latent for stochastic texture. A random
+area mel discriminator and a voicing-aware mel discriminator are used only
+during training; exported checkpoints retain only the generator and its
+prior. pc-NSF-HiFiGAN remains a separate frozen renderer for validation and
+inference.
+
+The default configuration uses six 192-channel Conformer blocks, an 8-channel
+global latent and a 12-channel local latent at quarter mel resolution. The
+local prior is exposed progressively during the single training phase so the
+decoder sees the same stochastic path used at inference. `noise_scale`-style
+controls are available through the model's global/local stochastic scales,
+while a nonzero seed keeps conversion reproducible.
+
+CLI users should select `--vocoder_arch stochastic_conformer_gan` during
+extraction and `--architecture Stochastic-Residual-Conformer-GAN` during
+training. The UI selects the matching configuration automatically.
 
 ## Responsible use
 

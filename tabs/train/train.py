@@ -58,7 +58,11 @@ def get_pretrained_list(suffix):
         os.path.join(dirpath, filename)
         for dirpath, _, filenames in os.walk(pretraineds_custom_path_relative)
         for filename in filenames
-        if filename.endswith(".pth") and suffix in filename
+        if filename.endswith(".pth")
+        and (
+            suffix in filename
+            or (suffix == "G" and "D" not in filename)
+        )
     ]
 
 pretraineds_list_d = get_pretrained_list("D")
@@ -293,7 +297,11 @@ initial_sample_rate = "44100"
 
 initial_optimizer = "AdamW"
 initial_optimizer_choices = [("AdamW", "AdamW"), ("AdaBelief", "AdaBelief"), ("RAdam", "RAdam"), ("Ranger21", "Ranger21"), ("Sched-Free AdamW", "Sched-Free AdamW"), ("Sched-Free RAdam", "Sched-Free RAdam")]
-architecture_choices = ["Mel-VITS", "Hybrid-FSQ"]
+architecture_choices = [
+    "Mel-VITS",
+    "Hybrid-FSQ",
+    "Stochastic-Residual-Conformer-GAN",
+]
 
 
 # Train Tab
@@ -330,8 +338,8 @@ def train_tab():
                 architecture = gr.Radio(
                     label="Architecture",
                     info=(
-                        "Mel-VITS or the lighter stationary compositional "
-                        "ControlVAE + slow/fast FSQ model. Both render with pc-NSF."
+                        "Choose Mel-VITS, Hybrid-FSQ, or the stochastic "
+                        "Conformer-GAN residual model. All render with pc-NSF."
                     ),
                     choices=architecture_choices,
                     value="Mel-VITS",
@@ -1078,8 +1086,12 @@ def train_tab():
                                 key='g_pretrained_path'
                             )
                             d_pretrained_path = gr.Dropdown(
-                                label="Custom Pretrained D",
-                                info="Select the custom pretrained model for the discriminator.",
+                                label="Custom Pretrained D (optional)",
+                                info=(
+                                    "Optional legacy discriminator file. "
+                                    "Stochastic-Conformer-GAN normally uses one "
+                                    "acoustic checkpoint selected in Custom Pretrained G."
+                                ),
                                 choices=sorted(pretraineds_list_d),
                                 interactive=True,
                                 allow_custom_value=True,
@@ -1340,9 +1352,11 @@ def train_tab():
                 return {"visible": embedder_model == "custom", "__type__": "update"}
 
             def toggle_architecture(architecture, vocoder_arch=None):
-                config_arch = (
-                    "hybrid_fsq" if architecture == "Hybrid-FSQ" else "melvits"
-                )
+                config_arch = {
+                    "Mel-VITS": "melvits",
+                    "Hybrid-FSQ": "hybrid_fsq",
+                    "Stochastic-Residual-Conformer-GAN": "stochastic_conformer_gan",
+                }.get(architecture, "melvits")
                 return (
                     {"choices": ["44100"], "__type__": "update", "value": "44100"},
                     {
@@ -1354,9 +1368,14 @@ def train_tab():
                     config_arch,
                 )
             def fork_vocoder_handler(architecture, vocoder_arch, vocoder):
+                config_arch = {
+                    "Mel-VITS": "melvits",
+                    "Hybrid-FSQ": "hybrid_fsq",
+                    "Stochastic-Residual-Conformer-GAN": "stochastic_conformer_gan",
+                }.get(architecture, "melvits")
                 return (
                     {"choices": ["44100"], "__type__": "update", "value": "44100"},
-                    "hybrid_fsq" if architecture == "Hybrid-FSQ" else "melvits",
+                    config_arch,
                 )
 
             def update_noise_reduce_slider_visibility(noise_reduction):

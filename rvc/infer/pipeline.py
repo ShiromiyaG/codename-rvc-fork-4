@@ -198,6 +198,10 @@ class Pipeline:
         self.f0_mel_min = 1127 * np.log(1 + self.f0_min / 700)
         self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
         self.device = config.device
+        # Keep the precision flag locally; Pipeline historically copied the
+        # individual config fields and therefore has no ``self.config``
+        # attribute at inference time.
+        self.is_half = bool(getattr(config, "is_half", False))
         self.autotune = Autotune()
 
     def get_f0(
@@ -308,7 +312,7 @@ class Pipeline:
             seed: Seed for randomization of noise.
         """
 
-        amp_enabled = self.config.is_half and str(self.device).startswith("cuda")
+        amp_enabled = self.is_half and str(self.device).startswith("cuda")
         with torch.no_grad(), autocast(
             device_type="cuda",
             enabled=amp_enabled,
@@ -408,8 +412,25 @@ class Pipeline:
                 sid=sid,
                 seed=seed,
             )
-            if str(version).startswith("hybrid-fsq"):
+            version_name = str(version)
+            if version_name.startswith("hybrid-fsq"):
                 infer_kwargs["source_onset"] = source_onset
+            elif version_name.startswith("stochastic-conformer-gan"):
+                # The Conformer-GAN validation path uses the mel-derived
+                # onset and deterministic prior means.  The waveform-energy
+                # onset previously passed here was on a different scale and
+                # made voiced regions change timbre/noise at inference time.
+                # Keep the default tab path aligned with validation; users
+                # can opt into sampling explicitly without changing a model.
+                infer_kwargs["global_noise_scale"] = float(
+                    os.environ.get("RVC_STOCHASTIC_GLOBAL_NOISE", "0.0")
+                )
+                infer_kwargs["local_noise_scale"] = float(
+                    os.environ.get("RVC_STOCHASTIC_LOCAL_NOISE", "0.0")
+                )
+                infer_kwargs["stochastic_strength"] = float(
+                    os.environ.get("RVC_STOCHASTIC_STRENGTH", "1.0")
+                )
             audio1 = (
                 net_g.infer(**infer_kwargs)[0][0, 0]
                 .detach()

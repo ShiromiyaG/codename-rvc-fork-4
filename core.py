@@ -500,7 +500,13 @@ def run_extract_script(
 ):
     if architecture is not None:
         vocoder_arch = (
-            "hybrid_fsq" if architecture == "Hybrid-FSQ" else "melvits"
+            "hybrid_fsq"
+            if architecture == "Hybrid-FSQ"
+            else (
+                "stochastic_conformer_gan"
+                if architecture == "Stochastic-Residual-Conformer-GAN"
+                else "melvits"
+            )
         )
     model_path = os.path.join(logs_path, model_name)
     extract = os.path.join("rvc", "train", "extract", "extract.py")
@@ -2046,6 +2052,7 @@ def parse_arguments():
         choices=[
             "melvits",
             "hybrid_fsq",
+            "stochastic_conformer_gan",
         ],
         default="melvits",
     )
@@ -2103,7 +2110,11 @@ def parse_arguments():
         "--architecture",
         type=str,
         help="Choose the architecture. ( Only RVC is universal, others need their respective forks / frameworks.",
-        choices=["Mel-VITS", "Hybrid-FSQ"],
+        choices=[
+            "Mel-VITS",
+            "Hybrid-FSQ",
+            "Stochastic-Residual-Conformer-GAN",
+        ],
         default="Mel-VITS",
     )  
     train_parser.add_argument(

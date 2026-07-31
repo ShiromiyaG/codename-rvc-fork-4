@@ -63,6 +63,11 @@ def extract_model(
             "fast_posterior.",
             "slow_prequant.",
             "fast_prequant.",
+        ) if architecture == "Hybrid-FSQ" else (
+            "posterior_global.",
+            "posterior_local.",
+            "random_area_discriminator.",
+            "voicing_discriminator.",
         )
     )
     weights = OrderedDict(

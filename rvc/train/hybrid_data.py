@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import mmap
 import os
 import re
+import shutil
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -168,6 +171,186 @@ def migrate_mel_caches_to_mmap(
     return converted
 
 
+def _packed_fingerprint(entries) -> str:
+    digest = hashlib.sha256()
+    for entry in entries:
+        digest.update("\0".join(map(str, entry)).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def load_hybrid_packed_cache(entries, experiment_dir: str | Path):
+    cache_dir = Path(experiment_dir) / "hybrid_packed_cache"
+    manifest_path = cache_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if (
+        manifest.get("version") != 1
+        or manifest.get("fingerprint") != _packed_fingerprint(entries)
+    ):
+        return None
+    required = ("mel.bin", "phone.bin", "pitch.bin", "pitchf.bin")
+    if not all((cache_dir / name).is_file() for name in required):
+        return None
+    manifest["cache_dir"] = str(cache_dir)
+    return manifest
+
+
+def build_hybrid_packed_cache(
+    entries,
+    experiment_dir: str | Path,
+    remove_individual_mels: bool = True,
+):
+    """Pack random-access training tensors into four persistent mmap files."""
+    existing = load_hybrid_packed_cache(entries, experiment_dir)
+    if existing is not None:
+        return existing
+    experiment_dir = Path(experiment_dir)
+    final_dir = experiment_dir / "hybrid_packed_cache"
+    building_dir = experiment_dir / "hybrid_packed_cache.building"
+    if building_dir.exists():
+        shutil.rmtree(building_dir)
+    building_dir.mkdir(parents=True)
+    records = {}
+    mel_offset = phone_offset = pitch_offset = pitchf_offset = 0
+    mel_file = open(building_dir / "mel.bin", "wb")
+    phone_file = open(building_dir / "phone.bin", "wb")
+    pitch_file = open(building_dir / "pitch.bin", "wb")
+    pitchf_file = open(building_dir / "pitchf.bin", "wb")
+    try:
+        unique_entries = {}
+        for entry in entries:
+            unique_entries.setdefault(entry[0], entry)
+        for audio_path, entry in tqdm(
+            unique_entries.items(),
+            desc="Hybrid packed cache",
+            unit="file",
+        ):
+            mel = _load_cached_mel(audio_path).numpy().T
+            phone = np.load(entry[1], mmap_mode="r", allow_pickle=False)
+            pitch = np.load(entry[2], mmap_mode="r", allow_pickle=False)
+            pitchf = np.load(entry[3], mmap_mode="r", allow_pickle=False)
+            mel = np.ascontiguousarray(mel, dtype=np.float32)
+            phone = np.ascontiguousarray(phone, dtype=np.float16)
+            pitch = np.ascontiguousarray(pitch, dtype=np.uint8)
+            pitchf = np.ascontiguousarray(pitchf, dtype=np.float32)
+            mel.tofile(mel_file)
+            phone.tofile(phone_file)
+            pitch.tofile(pitch_file)
+            pitchf.tofile(pitchf_file)
+            records[audio_path] = [
+                mel_offset,
+                int(mel.shape[0]),
+                phone_offset,
+                int(phone.shape[0]),
+                pitch_offset,
+                int(pitch.shape[0]),
+                pitchf_offset,
+                int(pitchf.shape[0]),
+            ]
+            mel_offset += int(mel.size)
+            phone_offset += int(phone.shape[0])
+            pitch_offset += int(pitch.size)
+            pitchf_offset += int(pitchf.size)
+    finally:
+        mel_file.close()
+        phone_file.close()
+        pitch_file.close()
+        pitchf_file.close()
+    manifest = {
+        "version": 1,
+        "fingerprint": _packed_fingerprint(entries),
+        "mel_channels": 128,
+        "phone_channels": 768,
+        "records": records,
+    }
+    with open(building_dir / "manifest.json", "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle)
+    if final_dir.exists():
+        shutil.rmtree(final_dir)
+    os.replace(building_dir, final_dir)
+    if remove_individual_mels:
+        for audio_path in tqdm(
+            records, desc="Removing replaced mel files", unit="file"
+        ):
+            numpy_path, torch_path = _mel_cache_paths(audio_path)
+            numpy_path.unlink(missing_ok=True)
+            torch_path.unlink(missing_ok=True)
+    return load_hybrid_packed_cache(entries, experiment_dir)
+
+
+class PackedLocalityBatchSampler:
+    """Shuffle large physical blocks while keeping each batch sequential.
+
+    The packed files are much larger than RAM. Fully random sample order turns
+    every mmap access into an unrelated page fault; this sampler reduces that
+    to roughly one seek per locality block without fixing the epoch order.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        num_replicas: int = 1,
+        rank: int = 0,
+        locality_batches: int = 64,
+        seed: int = 1234,
+    ):
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.locality_batches = max(1, int(locality_batches))
+        self.seed = int(seed)
+        self.epoch = 0
+        records = (
+            dataset.packed_cache.get("records", {})
+            if getattr(dataset, "packed_cache", None) is not None
+            else {}
+        )
+        self.physical_order = sorted(
+            range(len(dataset)),
+            key=lambda index: records.get(
+                dataset.audiopaths_and_text[index][0],
+                (index,),
+            )[0],
+        )
+        global_batches = math.ceil(len(dataset) / max(1, self.batch_size))
+        self.batches_per_rank = math.ceil(global_batches / self.num_replicas)
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return self.batches_per_rank
+
+    def __iter__(self):
+        block_size = self.batch_size * self.locality_batches
+        blocks = [
+            self.physical_order[start : start + block_size]
+            for start in range(0, len(self.physical_order), block_size)
+        ]
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        order = torch.randperm(len(blocks), generator=generator).tolist()
+        batches = []
+        for block_index in order:
+            block = blocks[block_index]
+            for start in range(0, len(block), self.batch_size):
+                batch = block[start : start + self.batch_size]
+                if len(batch) < self.batch_size:
+                    needed = self.batch_size - len(batch)
+                    repeats = math.ceil(needed / max(1, len(block)))
+                    batch += (block * repeats)[:needed]
+                batches.append(batch)
+        required = self.batches_per_rank * self.num_replicas
+        if len(batches) < required:
+            batches += batches[: required - len(batches)]
+        return iter(batches[self.rank:required:self.num_replicas])
+
+
 def build_hybrid_statistics(
     entries,
     experiment_dir: str | Path,
@@ -328,12 +511,15 @@ class HybridFSQDataset(TextAudioLoaderMultiNSFsid):
         segment_frames: int = 256,
         load_waveform: bool = False,
         waveform_items: int = 0,
+        packed_cache=None,
         **kwargs,
     ):
         self.stats = stats
         self.segment_frames = segment_frames
         self.load_waveform = load_waveform
         self.waveform_items = max(0, int(waveform_items))
+        self.packed_cache = packed_cache
+        self._packed_arrays = None
         super().__init__(*args, **kwargs)
 
     def _filter(self):
@@ -343,12 +529,40 @@ class HybridFSQDataset(TextAudioLoaderMultiNSFsid):
         ]
         self.lengths = [self.segment_frames] * len(self.audiopaths_and_text)
 
+    def _open_packed_cache(self):
+        if self._packed_arrays is not None:
+            return self._packed_arrays
+        cache_dir = Path(self.packed_cache["cache_dir"])
+        self._packed_arrays = (
+            np.memmap(cache_dir / "mel.bin", mode="r", dtype=np.float32),
+            np.memmap(cache_dir / "phone.bin", mode="r", dtype=np.float16).reshape(
+                -1, int(self.packed_cache["phone_channels"])
+            ),
+            np.memmap(cache_dir / "pitch.bin", mode="r", dtype=np.uint8),
+            np.memmap(cache_dir / "pitchf.bin", mode="r", dtype=np.float32),
+        )
+        for mapped in self._packed_arrays:
+            try:
+                mapped._mmap.madvise(mmap.MADV_SEQUENTIAL)
+            except (AttributeError, OSError):
+                pass
+        return self._packed_arrays
+
     @staticmethod
-    def _condition_crop(entry, mel_frames, start, stop):
+    def _condition_crop(
+        entry,
+        mel_frames,
+        start,
+        stop,
+        phone_source=None,
+        pitch_source=None,
+        pitchf_source=None,
+    ):
         """Read only conditioning rows that contribute to the requested crop."""
-        phone_source = np.load(entry[1], mmap_mode="r", allow_pickle=False)
-        pitch_source = np.load(entry[2], mmap_mode="r", allow_pickle=False)
-        pitchf_source = np.load(entry[3], mmap_mode="r", allow_pickle=False)
+        if phone_source is None:
+            phone_source = np.load(entry[1], mmap_mode="r", allow_pickle=False)
+            pitch_source = np.load(entry[2], mmap_mode="r", allow_pickle=False)
+            pitchf_source = np.load(entry[3], mmap_mode="r", allow_pickle=False)
         source_frames = min(
             phone_source.shape[0] * 2,
             pitch_source.shape[0],
@@ -390,9 +604,16 @@ class HybridFSQDataset(TextAudioLoaderMultiNSFsid):
         # The Hybrid-FSQ objective is entirely mel-domain.  Calling the base
         # loader here used to decode every FLAC/WAV only to discard it in the
         # training loop, which dominated random I/O on large datasets.
+        record = (
+            self.packed_cache["records"].get(entry[0])
+            if self.packed_cache is not None
+            else None
+        )
         numpy_mel, torch_mel = _mel_cache_paths(entry[0])
         full_spec = None
-        if numpy_mel.is_file():
+        if record is not None:
+            mel_frames = int(record[1])
+        elif numpy_mel.is_file():
             mel_frames = int(
                 np.load(numpy_mel, mmap_mode="r", allow_pickle=False).shape[-1]
             )
@@ -410,14 +631,42 @@ class HybridFSQDataset(TextAudioLoaderMultiNSFsid):
             else 0
         )
         stop = start + wanted
-        spec = (
-            full_spec[:, start:stop]
-            if full_spec is not None
-            else _load_cached_mel(entry[0], start, stop)
-        )
-        phone, pitch, pitchf = self._condition_crop(
-            entry, mel_frames, start, stop
-        )
+        if record is not None:
+            mel_map, phone_map, pitch_map, pitchf_map = self._open_packed_cache()
+            mel_offset, _, phone_offset, phone_length, pitch_offset, pitch_length, pitchf_offset, pitchf_length = record
+            selected_mel = mel_map[
+                mel_offset + start * 128 : mel_offset + stop * 128
+            ].reshape(stop - start, 128)
+            spec = torch.from_numpy(
+                np.array(selected_mel.T, dtype=np.float32, copy=True)
+            )
+            phone_source = phone_map[
+                phone_offset : phone_offset + phone_length
+            ]
+            pitch_source = pitch_map[
+                pitch_offset : pitch_offset + pitch_length
+            ]
+            pitchf_source = pitchf_map[
+                pitchf_offset : pitchf_offset + pitchf_length
+            ]
+            phone, pitch, pitchf = self._condition_crop(
+                entry,
+                mel_frames,
+                start,
+                stop,
+                phone_source,
+                pitch_source,
+                pitchf_source,
+            )
+        else:
+            spec = (
+                full_spec[:, start:stop]
+                if full_spec is not None
+                else _load_cached_mel(entry[0], start, stop)
+            )
+            phone, pitch, pitchf = self._condition_crop(
+                entry, mel_frames, start, stop
+            )
         if load_waveform is None:
             load_waveform = self.load_waveform
         if load_waveform:

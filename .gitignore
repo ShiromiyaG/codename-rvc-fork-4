@@ -27,6 +27,7 @@ miniconda3.incomplete-*/
 utmos/
 ffprobe.exe
 ffmpeg.exe
+assets/weights/*
 assets/audios/
 assets/f0editor_userdata/base_f0/
 assets/f0editor_userdata/f0_presets/

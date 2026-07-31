@@ -99,26 +99,66 @@ class SDPA1D(nn.Module):
 class FSQ(nn.Module):
     def __init__(self, levels: tuple[int, ...]):
         super().__init__()
-        self.levels = tuple(levels)
-        vectors = torch.cartesian_prod(
-            *[torch.linspace(-1.0, 1.0, level) for level in levels]
+        self.levels = tuple(int(level) for level in levels)
+        if len(set(self.levels)) != 1:
+            raise ValueError("Each Hybrid-FSQ branch requires equal scalar levels")
+        self.dimensions = len(self.levels)
+        self.level_count = self.levels[0]
+        values = torch.linspace(-1.0, 1.0, self.level_count)
+        self.register_buffer(
+            "level_values",
+            values[None].expand(self.dimensions, -1).clone(),
+            persistent=True,
         )
-        self.register_buffer("vectors", vectors, persistent=True)
 
     def forward(self, value):
-        value = torch.tanh(value)
-        indices = []
-        quantized = []
-        joint = torch.zeros_like(value[:, 0], dtype=torch.long)
-        for dimension, levels in enumerate(self.levels):
-            scaled = (value[:, dimension] + 1.0) * (levels - 1) / 2.0
-            index = scaled.round().clamp(0, levels - 1).long()
-            q = index.float() * 2.0 / (levels - 1) - 1.0
-            quantized.append(value[:, dimension] + (q - value[:, dimension]).detach())
-            indices.append(index)
-            multiplier = math.prod(self.levels[dimension + 1 :])
-            joint += index * multiplier
-        return torch.stack(quantized, 1), joint
+        bounded = torch.tanh(value)
+        distance = (
+            bounded.unsqueeze(2) - self.level_values[None, :, :, None]
+        ).abs()
+        indices = distance.argmin(2)
+        quantized = self.values_from_ids(indices).to(bounded)
+        return bounded + (quantized - bounded).detach(), indices, bounded
+
+    def values_from_ids(self, indices):
+        levels = self.level_values[None, :, :, None].expand(
+            indices.size(0), -1, -1, indices.size(-1)
+        )
+        return levels.gather(2, indices.unsqueeze(2)).squeeze(2)
+
+    def soft_targets(self, bounded, temperature):
+        distance = (
+            bounded.detach().unsqueeze(2)
+            - self.level_values[None, :, :, None]
+        ).square()
+        return torch.softmax(-distance / max(1e-4, temperature), 2)
+
+    def expected(self, logits):
+        probability = torch.softmax(logits.float(), 2)
+        return (
+            probability
+            * self.level_values[None, :, :, None].to(probability)
+        ).sum(2).to(logits.dtype)
+
+    def sample(self, logits, temperature, top_k, noise_scale):
+        expected = self.expected(logits)
+        if temperature <= 0 or noise_scale <= 0:
+            return expected, logits.argmax(2)
+        scaled = logits.float() / max(1e-4, temperature)
+        if 0 < top_k < scaled.size(2):
+            values, level_ids = torch.topk(scaled, top_k, dim=2)
+            local = torch.distributions.Categorical(
+                logits=values.permute(0, 1, 3, 2)
+            ).sample()
+            indices = level_ids.permute(0, 1, 3, 2).gather(
+                -1, local.unsqueeze(-1)
+            ).squeeze(-1)
+        else:
+            indices = torch.distributions.Categorical(
+                logits=scaled.permute(0, 1, 3, 2)
+            ).sample()
+        sampled = self.values_from_ids(indices).to(expected)
+        return expected + float(noise_scale) * (sampled - expected), indices
 
 
 class PreQuantProjection(nn.Module):
@@ -139,11 +179,20 @@ class PreQuantProjection(nn.Module):
 
 
 class ResidualPathDecoder(nn.Module):
-    def __init__(self, input_channels, output_channels, checkpointing):
+    def __init__(
+        self,
+        input_channels,
+        output_channels,
+        checkpointing,
+        hidden_channels=160,
+        layers=4,
+    ):
         super().__init__()
-        self.pre = nn.Conv1d(input_channels, 128, 1)
-        self.tcn = ResidualTCN(128, 3, 0.05, checkpointing)
-        self.out = nn.Conv1d(128, output_channels, 3, padding=1)
+        self.pre = nn.Conv1d(input_channels, hidden_channels, 1)
+        self.tcn = ResidualTCN(
+            hidden_channels, layers, 0.05, checkpointing
+        )
+        self.out = nn.Conv1d(hidden_channels, output_channels, 3, padding=1)
 
     def forward(self, value, mask):
         return self.out(self.tcn(self.pre(value) * mask, mask)) * mask
@@ -163,16 +212,19 @@ class HybridFSQSynthesizer(nn.Module):
         tcn_blocks=6,
         attention_heads=4,
         checkpointing=False,
-        local_prior_components=2,
         global_latent_channels=8,
+        slow_fsq_levels=(8, 8, 8, 8),
+        fast_fsq_levels=(5, 5, 5, 5),
+        prior_soft_target_temperature=0.08,
+        hybrid_quality_patch=1,
         **_,
     ):
         super().__init__()
         self.checkpointing = checkpointing
         self.mel_channels = mel_channels
         self.hidden_channels = hidden_channels
-        self.components = local_prior_components
         self.global_latent_channels = global_latent_channels
+        self.prior_soft_target_temperature = prior_soft_target_temperature
         self.emb_g = nn.Embedding(spk_embed_dim, gin_channels)
         self.pitch = nn.Embedding(256, hidden_channels)
         self.phone = nn.Linear(text_enc_hidden_dim, hidden_channels)
@@ -202,34 +254,52 @@ class HybridFSQSynthesizer(nn.Module):
             nn.Linear(global_latent_channels, 32), nn.SiLU(), nn.Linear(32, 8)
         )
 
+        # Local texture is the quality-limiting path at inference.  Keep it
+        # fully independent from the global Gaussian, but give both the
+        # posterior and decoder enough bandwidth to retain consonants and
+        # high-band detail after FSQ quantization.
+        local_channels = 128
         self.slow_posterior = nn.Sequential(
-            nn.Conv1d(mel_channels + 128, 96, 5, stride=2, padding=2),
+            nn.Conv1d(mel_channels + 128, local_channels, 5, stride=2, padding=2),
             nn.SiLU(),
-            nn.Conv1d(96, 96, 5, stride=2, padding=2),
+            nn.Conv1d(local_channels, local_channels, 5, stride=2, padding=2),
             nn.SiLU(),
         )
-        self.slow_prequant = PreQuantProjection(96, 3)
+        self.slow_prequant = PreQuantProjection(
+            local_channels, len(slow_fsq_levels)
+        )
         self.fast_posterior = nn.Sequential(
-            nn.Conv1d(mel_channels + 128, 96, 5, stride=2, padding=2),
+            nn.Conv1d(mel_channels + 128, local_channels, 5, stride=2, padding=2),
             nn.SiLU(),
-            nn.Conv1d(96, 96, 3, padding=1),
+            nn.Conv1d(local_channels, local_channels, 3, padding=1),
             nn.SiLU(),
         )
-        self.fast_prequant = PreQuantProjection(96, 3)
-        self.slow_fsq = FSQ((8, 8, 8))
-        self.fast_fsq = FSQ((5, 5, 5))
-        self.pi_head = nn.Linear(128, local_prior_components)
+        self.fast_prequant = PreQuantProjection(
+            local_channels, len(fast_fsq_levels)
+        )
+        self.slow_fsq = FSQ(tuple(slow_fsq_levels))
+        self.fast_fsq = FSQ(tuple(fast_fsq_levels))
+        self.slow_prior_context = ResidualTCN(128, 4, 0.05, checkpointing)
+        self.fast_prior_context = ResidualTCN(128, 4, 0.05, checkpointing)
         self.slow_prior = nn.Conv1d(
-            128, local_prior_components * 512, 1
+            128, self.slow_fsq.dimensions * self.slow_fsq.level_count, 1
         )
         self.fast_prior = nn.Conv1d(
-            128, local_prior_components * 125, 1
+            128, self.fast_fsq.dimensions * self.fast_fsq.level_count, 1
         )
         self.slow_decoder = ResidualPathDecoder(
-            hidden_channels + 3, mel_channels, checkpointing
+            hidden_channels + self.slow_fsq.dimensions,
+            mel_channels,
+            checkpointing,
+            hidden_channels=192,
+            layers=5,
         )
         self.fast_decoder = ResidualPathDecoder(
-            hidden_channels + 3, mel_channels, checkpointing
+            hidden_channels + self.fast_fsq.dimensions,
+            mel_channels,
+            checkpointing,
+            hidden_channels=192,
+            layers=5,
         )
         basis = orthonormal_dct(mel_channels, 8)
         self.register_buffer("dct_basis", basis)
@@ -238,6 +308,10 @@ class HybridFSQSynthesizer(nn.Module):
         self.register_buffer("global_cap", torch.ones(mel_channels))
         self.register_buffer("slow_cap", torch.ones(mel_channels))
         self.register_buffer("fast_cap", torch.ones(mel_channels))
+        self.register_buffer(
+            "hybrid_quality_patch",
+            torch.tensor(int(hybrid_quality_patch), dtype=torch.int32),
+        )
         self.pc_vocoder = None
 
     def set_statistics(self, stats):
@@ -300,14 +374,21 @@ class HybridFSQSynthesizer(nn.Module):
         hidden = F.interpolate(hidden, size=condition.size(-1), mode="linear", align_corners=False)
         return self.base_out(hidden) * mask
 
-    def _prior_logits(self, latent, length):
+    def _prior_logits(self, latent, length, mask):
         slow = F.interpolate(latent, size=math.ceil(length / 4), mode="linear", align_corners=False)
         fast = F.interpolate(latent, size=math.ceil(length / 2), mode="linear", align_corners=False)
+        slow_mask = F.interpolate(mask, size=slow.size(-1), mode="nearest")
+        fast_mask = F.interpolate(mask, size=fast.size(-1), mode="nearest")
+        slow = self.slow_prior_context(slow * slow_mask, slow_mask)
+        fast = self.fast_prior_context(fast * fast_mask, fast_mask)
         b = latent.size(0)
-        slow_logits = self.slow_prior(slow).view(b, self.components, 512, -1)
-        fast_logits = self.fast_prior(fast).view(b, self.components, 125, -1)
-        pooled = latent.mean(-1)
-        return self.pi_head(pooled), slow_logits, fast_logits
+        slow_logits = self.slow_prior(slow).view(
+            b, self.slow_fsq.dimensions, self.slow_fsq.level_count, -1
+        )
+        fast_logits = self.fast_prior(fast).view(
+            b, self.fast_fsq.dimensions, self.fast_fsq.level_count, -1
+        )
+        return slow_logits, fast_logits
 
     @staticmethod
     def _gaussian(parameters):
@@ -326,6 +407,8 @@ class HybridFSQSynthesizer(nn.Module):
         slow_target,
         fast_target,
         global_coeff,
+        local_prior_mix: float = 0.0,
+        global_prior: bool = False,
     ):
         mel_energy = spec.float().mean(1)
         mel_onset = F.relu(
@@ -341,7 +424,10 @@ class HybridFSQSynthesizer(nn.Module):
         mu_q, logs_q = self._gaussian(
             self.global_posterior(torch.cat((pooled, global_coeff), -1))
         )
-        z = mu_q + torch.randn_like(mu_q) * torch.exp(logs_q)
+        if global_prior:
+            z = mu_p
+        else:
+            z = mu_q + torch.randn_like(mu_q) * torch.exp(logs_q)
         global_coeff_hat = self.global_decoder(z)
         global_delta = (global_coeff_hat @ self.dct_basis.T).unsqueeze(-1)
         global_delta = (
@@ -356,10 +442,30 @@ class HybridFSQSynthesizer(nn.Module):
         fast_pre = self.fast_prequant(
             self.fast_posterior(torch.cat((fast_target, fast_condition), 1))
         )
-        slow_q, slow_ids = self.slow_fsq(slow_pre)
-        fast_q, fast_ids = self.fast_fsq(fast_pre)
-        slow_up = F.interpolate(slow_q, size=spec.size(-1), mode="nearest")
-        fast_up = F.interpolate(fast_q, size=spec.size(-1), mode="nearest")
+        slow_q, slow_ids, slow_bounded = self.slow_fsq(slow_pre)
+        fast_q, fast_ids, fast_bounded = self.fast_fsq(fast_pre)
+        slow_soft = self.slow_fsq.soft_targets(
+            slow_bounded, self.prior_soft_target_temperature
+        )
+        fast_soft = self.fast_fsq.soft_targets(
+            fast_bounded, self.prior_soft_target_temperature
+        )
+        slow_logits, fast_logits = self._prior_logits(
+            latent, spec.size(-1), mask
+        )
+        slow_prior = self.slow_fsq.expected(slow_logits)
+        fast_prior = self.fast_fsq.expected(fast_logits)
+        local_prior_mix = torch.as_tensor(
+            local_prior_mix, device=spec.device, dtype=torch.float32
+        ).clamp(0, 1)
+        use_prior = (
+            torch.rand(spec.size(0), 1, 1, device=spec.device)
+            < local_prior_mix
+        )
+        slow_used = torch.where(use_prior, slow_prior, slow_q)
+        fast_used = torch.where(use_prior, fast_prior, fast_q)
+        slow_up = F.interpolate(slow_used, size=spec.size(-1), mode="nearest")
+        fast_up = F.interpolate(fast_used, size=spec.size(-1), mode="nearest")
         slow_raw = self.slow_decoder(torch.cat((condition, slow_up), 1), mask)
         fast_raw = self.fast_decoder(torch.cat((condition, fast_up), 1), mask)
         slow_delta = temporal_lowpass(slow_raw, 5)
@@ -370,7 +476,6 @@ class HybridFSQSynthesizer(nn.Module):
         slow_delta = self.slow_cap[None, :, None] * torch.tanh(slow_delta)
         fast_delta = fast_raw - temporal_lowpass(fast_raw, 5)
         fast_delta = self.fast_cap[None, :, None] * torch.tanh(fast_delta)
-        pi, slow_logits, fast_logits = self._prior_logits(latent, spec.size(-1))
         final = (base + global_delta + slow_delta + fast_delta) * mask
         return {
             "mel": final,
@@ -380,45 +485,58 @@ class HybridFSQSynthesizer(nn.Module):
             "fast": fast_delta,
             "mask": mask,
             "global_distribution": (mu_q, logs_q, mu_p, logs_p),
-            "prior": (pi, slow_logits, fast_logits),
-            "codes": (slow_ids, fast_ids, slow_q, fast_q),
+            "prior": (slow_logits, fast_logits),
+            "codes": (
+                slow_ids,
+                fast_ids,
+                slow_q,
+                fast_q,
+                slow_soft,
+                fast_soft,
+            ),
+            "local_prior_fraction": use_prior.float().mean(),
         }
 
     @staticmethod
-    def mixture_prior_loss(pi, slow_logits, fast_logits, slow_ids, fast_ids):
-        slow_logp = F.log_softmax(slow_logits.float(), 2)
-        fast_logp = F.log_softmax(fast_logits.float(), 2)
-        slow_target = slow_ids[:, None, None].expand(-1, pi.size(1), 1, -1)
-        fast_target = fast_ids[:, None, None].expand(-1, pi.size(1), 1, -1)
-        slow_score = slow_logp.gather(2, slow_target).squeeze(2).sum(-1)
-        fast_score = fast_logp.gather(2, fast_target).squeeze(2).sum(-1)
-        score = F.log_softmax(pi.float(), -1) + slow_score + fast_score
-        token_count = max(1, slow_ids.size(-1) + fast_ids.size(-1))
-        nll = -torch.logsumexp(score, -1).mean() / token_count
-        responsibilities = torch.softmax(score, -1).detach()
+    def factorized_prior_loss(prior, codes, mask):
+        slow_logits, fast_logits = prior
+        slow_soft, fast_soft = codes[4:6]
 
-        # Geometry is returned separately by ``prior_geometry`` to keep this
-        # exact mixture NLL free of reductions before logsumexp.
-        return nll, responsibilities
+        def cross_entropy(logits, target):
+            loss = -(target.float() * F.log_softmax(logits.float(), 2)).sum(2)
+            local_mask = F.interpolate(
+                mask.float(), size=loss.size(-1), mode="nearest"
+            )
+            return (loss * local_mask).sum() / (
+                local_mask.sum() * loss.size(1)
+            ).clamp_min(1)
 
-    def prior_geometry(self, prior, codes, responsibilities):
-        _, slow_logits, fast_logits = prior
-        _, _, slow_q, fast_q = codes
-        slow_expected = torch.einsum(
-            "bkct,cd->bkdt", torch.softmax(slow_logits.float(), 2), self.slow_fsq.vectors
+        return 0.5 * (
+            cross_entropy(slow_logits, slow_soft)
+            + cross_entropy(fast_logits, fast_soft)
         )
-        fast_expected = torch.einsum(
-            "bkct,cd->bkdt", torch.softmax(fast_logits.float(), 2), self.fast_fsq.vectors
+
+    def prior_geometry(self, prior, codes, mask):
+        slow_logits, fast_logits = prior
+        slow_q, fast_q = codes[2:4]
+
+        def geometry(prediction, target):
+            error = F.smooth_l1_loss(
+                prediction.float(),
+                target.detach().float(),
+                reduction="none",
+            )
+            local_mask = F.interpolate(
+                mask.float(), size=error.size(-1), mode="nearest"
+            )
+            return (error * local_mask).sum() / (
+                local_mask.sum() * error.size(1)
+            ).clamp_min(1)
+
+        return 0.5 * (
+            geometry(self.slow_fsq.expected(slow_logits), slow_q)
+            + geometry(self.fast_fsq.expected(fast_logits), fast_q)
         )
-        slow_target = slow_q.detach()[:, None]
-        fast_target = fast_q.detach()[:, None]
-        slow_error = F.smooth_l1_loss(
-            slow_expected, slow_target.expand_as(slow_expected), reduction="none"
-        ).mean((2, 3))
-        fast_error = F.smooth_l1_loss(
-            fast_expected, fast_target.expand_as(fast_expected), reduction="none"
-        ).mean((2, 3))
-        return ((slow_error + fast_error) * responsibilities).sum(-1).mean()
 
     @torch.jit.export
     def infer(
@@ -429,8 +547,8 @@ class HybridFSQSynthesizer(nn.Module):
         nsff0,
         sid,
         seed: int = 0,
-        noise_scale: float = 0.5,
-        temperature: float = 0.7,
+        noise_scale: float = 0.35,
+        temperature: float = 0.65,
         source_onset: Optional[torch.Tensor] = None,
     ):
         if seed:
@@ -446,35 +564,21 @@ class HybridFSQSynthesizer(nn.Module):
         z = mu + torch.randn_like(mu) * torch.exp(logs) * noise_scale
         global_delta = (self.global_decoder(z) @ self.dct_basis.T).unsqueeze(-1)
         global_delta = self.global_cap[None, :, None] * torch.tanh(global_delta)
-        pi, slow_logits, fast_logits = self._prior_logits(latent, phone.size(1))
-        component = (
-            pi.argmax(-1)
-            if temperature <= 0
-            else torch.distributions.Categorical(logits=pi / temperature).sample()
+        slow_logits, fast_logits = self._prior_logits(
+            latent, phone.size(1), mask
         )
-        batch = torch.arange(phone.size(0), device=phone.device)
-        slow_selected = slow_logits[batch, component]
-        fast_selected = fast_logits[batch, component]
-
-        def sample(logits, top_k):
-            if temperature <= 0:
-                return logits.argmax(1)
-            if 0 < top_k < logits.size(1):
-                values, indices = torch.topk(logits, top_k, dim=1)
-                selected = torch.distributions.Categorical(
-                    logits=values.permute(0, 2, 1) / temperature
-                ).sample()
-                return indices.permute(0, 2, 1).gather(
-                    -1, selected.unsqueeze(-1)
-                ).squeeze(-1)
-            return torch.distributions.Categorical(
-                logits=logits.permute(0, 2, 1) / temperature
-            ).sample()
-
-        slow_ids = sample(slow_selected, 4)
-        fast_ids = sample(fast_selected, 3)
-        slow_q = self.slow_fsq.vectors[slow_ids].permute(0, 2, 1)
-        fast_q = self.fast_fsq.vectors[fast_ids].permute(0, 2, 1)
+        slow_q, slow_ids = self.slow_fsq.sample(
+            slow_logits,
+            temperature,
+            min(4, self.slow_fsq.level_count),
+            noise_scale,
+        )
+        fast_q, fast_ids = self.fast_fsq.sample(
+            fast_logits,
+            temperature,
+            min(3, self.fast_fsq.level_count),
+            noise_scale,
+        )
         slow_q = F.interpolate(slow_q, size=phone.size(1), mode="nearest")
         fast_q = F.interpolate(fast_q, size=phone.size(1), mode="nearest")
         slow_raw = self.slow_decoder(torch.cat((condition, slow_q), 1), mask)
@@ -487,4 +591,4 @@ class HybridFSQSynthesizer(nn.Module):
         normalized = (base + global_delta + slow + fast) * mask
         mel = normalized * self.mel_std[None, :, None] + self.mel_mean[None, :, None]
         output = self.pc_vocoder(mel, nsff0) if self.pc_vocoder is not None else mel
-        return output, mask, (z, component, slow_ids, fast_ids)
+        return output, mask, (z, slow_ids, fast_ids)

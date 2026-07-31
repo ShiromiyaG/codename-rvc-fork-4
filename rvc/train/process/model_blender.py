@@ -25,7 +25,7 @@ def model_blender(name, path1, path2, ratio):
         first = torch.load(path1, map_location="cpu", weights_only=True)
         second = torch.load(path2, map_location="cpu", weights_only=True)
         architecture = first.get("architecture")
-        if architecture not in {"Mel-VITS", "Hybrid-FSQ"} or second.get("architecture") != architecture:
+        if architecture not in {"Mel-VITS", "Hybrid-FSQ", "Stochastic-Residual-Conformer-GAN"} or second.get("architecture") != architecture:
             return "Both checkpoints must use the same supported architecture.", None
         if first.get("model_config") != second.get("model_config"):
             return f"{architecture} model configurations differ.", None

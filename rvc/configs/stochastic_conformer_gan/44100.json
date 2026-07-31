@@ -1,8 +1,9 @@
 {
-    "architecture": "Hybrid-FSQ",
+    "architecture": "Stochastic-Residual-Conformer-GAN",
     "train": {
         "seed": 1234,
         "learning_rate_g": 0.0001,
+        "learning_rate_d": 0.0001,
         "fp16_run": true,
         "segment_size": 131072,
         "gradient_accumulation_steps": 1,
@@ -11,17 +12,19 @@
         "ema_in_ram": true,
         "ema_update_interval": 10,
         "segment_frames": 256,
-        "global_rate_start_nats": 0.5,
-        "global_rate_end_nats": 2.0,
-        "global_rate_ramp_steps": 30000,
-        "control_beta_initial": 0.01,
-        "control_beta_min": 0.0001,
-        "control_beta_max": 0.1,
-        "control_kp": 0.001,
-        "control_ki": 0.00001,
         "local_prior_mix_start": 0.2,
         "local_prior_mix_end": 0.75,
-        "local_prior_mix_ramp_steps": 12000
+        "local_prior_mix_ramp_steps": 3000,
+        "global_kl_weight": 0.001,
+        "local_kl_weight": 0.001,
+        "kl_warmup_steps": 3000,
+        "global_free_bits": 0.15,
+        "local_free_bits": 0.25,
+        "generator_adversarial_weight": 0.05,
+        "feature_matching_weight": 1.0,
+        "random_area_patch_weight": 1.0,
+        "voicing_discriminator_weight": 1.0,
+        "gradient_clip": 5.0
     },
     "data": {
         "max_wav_value": 32768.0,
@@ -48,32 +51,27 @@
         "packed_locality_batches": 64
     },
     "model": {
-        "hybrid_quality_patch": 1,
         "hidden_channels": 192,
         "text_enc_hidden_dim": 768,
         "spk_embed_dim": 109,
         "gin_channels": 128,
-        "tcn_blocks": 6,
-        "attention_blocks": 1,
+        "conformer_blocks": 6,
         "attention_heads": 4,
         "attention_window_size": 256,
+        "ffn_expansion": 2,
+        "convolution_kernel": 15,
         "global_latent_channels": 8,
-        "slow_fsq_levels": [8, 8, 8, 8],
-        "fast_fsq_levels": [5, 5, 5, 5],
-        "prior_soft_target_temperature": 0.08
+        "local_latent_channels": 12,
+        "local_downsample": 4,
+        "residual_decoder_blocks": 4,
+        "residual_cap": 1.5
     },
     "loss": {
         "base": 0.5,
-        "global": 0.5,
-        "residual": 1.0,
-        "slow": 0.2,
-        "fast": 0.2,
-        "final": 0.75,
-        "multi_scale": 0.75,
-        "temporal_delta": 0.25,
-        "frequency_delta": 0.2,
-        "local_prior": 0.25,
-        "prior_geometry": 0.05
+        "final": 1.0,
+        "multi_scale": 0.5,
+        "temporal_delta": 0.2,
+        "frequency_delta": 0.2
     },
     "vocoder": {
         "type": "pc-nsf-hifigan",

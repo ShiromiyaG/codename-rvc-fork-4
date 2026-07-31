@@ -5,6 +5,9 @@ import json
 arch_config_paths = {
     "melvits": [os.path.join("melvits", "44100.json")],
     "hybrid_fsq": [os.path.join("hybrid_fsq", "44100.json")],
+    "stochastic_conformer_gan": [
+        os.path.join("stochastic_conformer_gan", "44100.json")
+    ],
 }
 
 def singleton(cls):

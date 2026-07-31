@@ -2,12 +2,22 @@ import os
 
 
 def pretrained_selector(vocoder, sample_rate):
-    base_path = os.path.join("rvc", "models", "pretraineds", f"{vocoder.lower()}")
+    root = os.path.join("rvc", "models", "pretraineds")
+    filename_g = f"f0G{str(sample_rate)[:2]}k.pth"
+    filename_d = f"f0D{str(sample_rate)[:2]}k.pth"
+    normalized = str(vocoder).lower().replace("_", "-")
+    folders = [normalized]
+    # Older installations store the standard RVC pretrain pair under
+    # `hifi-gan`, while the UI now names the external vocoder pc-NSF-HiFiGAN.
+    if normalized in {"pc-nsf-hifigan", "pc-nsf-hifi-gan"}:
+        folders.append("hifi-gan")
+    folders.append("")
 
-    path_g = os.path.join(base_path, f"f0G{str(sample_rate)[:2]}k.pth")
-    path_d = os.path.join(base_path, f"f0D{str(sample_rate)[:2]}k.pth")
+    def find(filename):
+        for folder in folders:
+            candidate = os.path.join(root, folder, filename)
+            if os.path.exists(candidate):
+                return candidate
+        return ""
 
-    return (
-        path_g if os.path.exists(path_g) else "",
-        path_d if os.path.exists(path_d) else "",
-    )
+    return find(filename_g), find(filename_d)

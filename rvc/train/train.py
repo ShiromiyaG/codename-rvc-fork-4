@@ -1224,5 +1224,9 @@ if __name__ == "__main__":
         from rvc.train.train_hybrid import main as hybrid_main
 
         hybrid_main()
+    elif _LEGACY_ARCH == "Stochastic-Residual-Conformer-GAN":
+        from rvc.train.train_conformer_gan import main as conformer_gan_main
+
+        conformer_gan_main()
     else:
         main()
