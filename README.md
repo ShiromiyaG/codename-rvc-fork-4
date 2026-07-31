@@ -207,6 +207,23 @@ CLI users should select `--vocoder_arch stochastic_conformer_gan` during
 extraction and `--architecture Stochastic-Residual-Conformer-GAN` during
 training. The UI selects the matching configuration automatically.
 
+## Raw-NSF-Waveform-GAN architecture
+
+The training tab also offers **Raw-NSF-Waveform-GAN**, a fourth experimental
+architecture that performs waveform-to-waveform conversion without VITS,
+Conformer or an external content encoder at inference. A raw waveform encoder
+produces a constrained content representation, a separate prosody stem
+predicts F0/voicing/energy, and the trainable full NSF-HiFiGAN decoder renders
+the target speaker. Multi-period and multi-resolution waveform discriminators
+are used during training; exported checkpoints contain only the generator.
+
+The architecture is initialized from the bundled pc-NSF-HiFiGAN decoder when
+available. Its raw encoder and new speaker-conditioning layers are trained
+from scratch, while the full NSF source path is enabled for the waveform GAN.
+Training still uses mel and multiresolution STFT as auxiliary objectives, but
+inference accepts only source waveform and target speaker ID (an optional F0
+override is retained for the pitch-guidance controls).
+
 ## Responsible use
 
 Only use voices and recordings for which you have permission, and clearly

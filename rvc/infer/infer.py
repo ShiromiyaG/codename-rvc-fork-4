@@ -14,6 +14,7 @@ import faiss
 import zstandard as zstd
 import io
 import platform
+import json
 
 from pedalboard import (
     Pedalboard,
@@ -36,6 +37,7 @@ from rvc.infer.pipeline import Pipeline as VC
 from rvc.lib.utils import load_audio_infer, load_embedding
 from rvc.lib.tools.split_audio import process_audio, merge_audio
 from rvc.lib.algorithm.synthesizers import Synthesizer
+from rvc.lib.algorithm.raw_nsf_gan import RawNSFWaveformGAN
 from rvc.lib.algorithm.pc_nsf_hifigan import PCNSFHiFiGAN
 from rvc.configs.config import Config
 
@@ -561,11 +563,11 @@ class VoiceConverter:
                 "Mel-VITS",
                 "Hybrid-FSQ",
                 "Stochastic-Residual-Conformer-GAN",
+                "Raw-NSF-Waveform-GAN",
             }:
                 raise ValueError(
                     "Legacy RVC/vocoder checkpoints are not supported by this build. "
-                    "Train or load a Mel-VITS, Hybrid-FSQ or "
-                    "Stochastic-Residual-Conformer-GAN checkpoint."
+                    "Train or load a supported acoustic checkpoint."
                 )
             self.tgt_sr = 44100
             self.use_f0 = True
@@ -576,7 +578,19 @@ class VoiceConverter:
             model_config["spk_embed_dim"] = self.active_cpt["weight"][
                 "emb_g.weight"
             ].shape[0]
-            if architecture == "Hybrid-FSQ":
+            if architecture == "Raw-NSF-Waveform-GAN":
+                decoder_path = model_config.get(
+                    "decoder_config", "rvc/models/vocoders/config.json"
+                )
+                with open(decoder_path, "r", encoding="utf-8") as handle:
+                    decoder_config = json.load(handle)
+                raw_kwargs = dict(model_config)
+                raw_kwargs.pop("decoder_config", None)
+                self.net_g = RawNSFWaveformGAN(
+                    decoder_config=decoder_config,
+                    **raw_kwargs,
+                )
+            elif architecture == "Hybrid-FSQ":
                 from rvc.lib.algorithm.hybrid_fsq import HybridFSQSynthesizer
 
                 if int(model_config.get("hybrid_quality_patch", 0)) != 1:
@@ -618,10 +632,11 @@ class VoiceConverter:
                 "RVC_PC_NSF_CONFIG",
                 vocoder_config.get("config", "rvc/models/vocoders/config.json"),
             )
-            self.pc_vocoder = PCNSFHiFiGAN.from_export(
-                checkpoint_path, config_path, map_location="cpu"
-            )
-            self.net_g.set_vocoder(self.pc_vocoder)
+            if architecture != "Raw-NSF-Waveform-GAN":
+                self.pc_vocoder = PCNSFHiFiGAN.from_export(
+                    checkpoint_path, config_path, map_location="cpu"
+                )
+                self.net_g.set_vocoder(self.pc_vocoder)
             self.net_g = self.net_g.to(self.config.device).float()
             self.net_g.eval()
             if (

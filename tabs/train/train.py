@@ -301,6 +301,7 @@ architecture_choices = [
     "Mel-VITS",
     "Hybrid-FSQ",
     "Stochastic-Residual-Conformer-GAN",
+    "Raw-NSF-Waveform-GAN",
 ]
 
 
@@ -338,8 +339,7 @@ def train_tab():
                 architecture = gr.Radio(
                     label="Architecture",
                     info=(
-                        "Choose Mel-VITS, Hybrid-FSQ, or the stochastic "
-                        "Conformer-GAN residual model. All render with pc-NSF."
+                        "Choose one of the registered acoustic architectures."
                     ),
                     choices=architecture_choices,
                     value="Mel-VITS",
@@ -377,7 +377,7 @@ def train_tab():
                 )
                 vocoder = gr.Radio(
                     label="Vocoder",
-                    info="Shared frozen pc-NSF-HiFiGAN renderer.",
+                    info="pc-NSF-HiFiGAN renderer or trainable waveform decoder, depending on architecture.",
                     choices=["pc-NSF-HiFiGAN"],
                     value="pc-NSF-HiFiGAN",
                     interactive=False,
@@ -1356,6 +1356,7 @@ def train_tab():
                     "Mel-VITS": "melvits",
                     "Hybrid-FSQ": "hybrid_fsq",
                     "Stochastic-Residual-Conformer-GAN": "stochastic_conformer_gan",
+                    "Raw-NSF-Waveform-GAN": "raw_nsf_gan",
                 }.get(architecture, "melvits")
                 return (
                     {"choices": ["44100"], "__type__": "update", "value": "44100"},
@@ -1372,6 +1373,7 @@ def train_tab():
                     "Mel-VITS": "melvits",
                     "Hybrid-FSQ": "hybrid_fsq",
                     "Stochastic-Residual-Conformer-GAN": "stochastic_conformer_gan",
+                    "Raw-NSF-Waveform-GAN": "raw_nsf_gan",
                 }.get(architecture, "melvits")
                 return (
                     {"choices": ["44100"], "__type__": "update", "value": "44100"},

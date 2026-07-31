@@ -1,0 +1,59 @@
+{
+    "architecture": "Raw-NSF-Waveform-GAN",
+    "train": {
+        "seed": 1234,
+        "learning_rate_g": 0.0001,
+        "learning_rate_d": 0.0001,
+        "fp16_run": true,
+        "segment_size": 131072,
+        "gradient_accumulation_steps": 1,
+        "validation_ratio": 0.05,
+        "ema_decay": 0.999,
+        "ema_in_ram": true,
+        "ema_update_interval": 10,
+        "warmup_steps": 5000,
+        "teacher_f0_steps": 10000,
+        "adversarial_weight_start": 0.0,
+        "adversarial_weight_end": 1.0,
+        "adversarial_ramp_steps": 30000,
+        "feature_matching_weight": 2.0,
+        "stft_weight": 5.0,
+        "mel_weight": 10.0,
+        "pitch_weight": 2.0,
+        "uv_weight": 1.0,
+        "energy_weight": 0.5,
+        "content_weight": 1.0,
+        "content_speaker_weight": 0.1,
+        "conversion_probability": 0.25,
+        "gradient_clip": 5.0,
+        "loader_workers": 2
+    },
+    "data": {
+        "sample_rate": 44100,
+        "hop_length": 512,
+        "n_mel_channels": 128,
+        "filter_length": 2048,
+        "win_length": 2048,
+        "mel_fmin": 40.0,
+        "mel_fmax": 16000.0,
+        "f0_min": 30.0,
+        "f0_max": 1600.0
+    },
+    "model": {
+        "spk_embed_dim": 109,
+        "speaker_dim": 192,
+        "content_channels": 96,
+        "sample_rate": 44100,
+        "hop_size": 512,
+        "decoder_config": "rvc/models/vocoders/config.json",
+        "speaker_adversarial_weight": 0.1
+    },
+    "discriminator": {
+        "periods": [2, 3, 5, 7, 11],
+        "resolutions": [[1024, 256, 1024], [2048, 512, 2048], [4096, 1024, 4096]]
+    },
+    "vocoder": {
+        "checkpoint": "rvc/models/vocoders/pc_nsf_hifigan_44.1k_hop512_128bin.pth",
+        "config": "rvc/models/vocoders/config.json"
+    }
+}

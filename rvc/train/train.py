@@ -1228,5 +1228,9 @@ if __name__ == "__main__":
         from rvc.train.train_conformer_gan import main as conformer_gan_main
 
         conformer_gan_main()
+    elif _LEGACY_ARCH == "Raw-NSF-Waveform-GAN":
+        from rvc.train.train_raw_nsf_gan import main as raw_nsf_main
+
+        raw_nsf_main()
     else:
         main()

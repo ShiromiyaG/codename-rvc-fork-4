@@ -505,7 +505,11 @@ def run_extract_script(
             else (
                 "stochastic_conformer_gan"
                 if architecture == "Stochastic-Residual-Conformer-GAN"
-                else "melvits"
+                else (
+                    "raw_nsf_gan"
+                    if architecture == "Raw-NSF-Waveform-GAN"
+                    else "melvits"
+                )
             )
         )
     model_path = os.path.join(logs_path, model_name)
@@ -2053,6 +2057,7 @@ def parse_arguments():
             "melvits",
             "hybrid_fsq",
             "stochastic_conformer_gan",
+            "raw_nsf_gan",
         ],
         default="melvits",
     )
@@ -2114,6 +2119,7 @@ def parse_arguments():
             "Mel-VITS",
             "Hybrid-FSQ",
             "Stochastic-Residual-Conformer-GAN",
+            "Raw-NSF-Waveform-GAN",
         ],
         default="Mel-VITS",
     )  

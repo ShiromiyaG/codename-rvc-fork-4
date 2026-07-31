@@ -1,4 +1,4 @@
-"""Export compact mel-VITS acoustic checkpoints."""
+"""Export compact acoustic checkpoints for all registered architectures."""
 
 from __future__ import annotations
 
@@ -68,6 +68,8 @@ def extract_model(
             "posterior_local.",
             "random_area_discriminator.",
             "voicing_discriminator.",
+        ) if architecture == "Stochastic-Residual-Conformer-GAN" else (
+            "content_speaker_classifier.",
         )
     )
     weights = OrderedDict(
@@ -103,6 +105,12 @@ def extract_model(
                 hps.model.spk_embed_dim,
                 hps.model.gin_channels,
                 hps.data.sample_rate,
+            ] if architecture != "Raw-NSF-Waveform-GAN" else [
+                hps.data.sample_rate,
+                hps.data.hop_length,
+                hps.model.spk_embed_dim,
+                hps.model.speaker_dim,
+                hps.model.content_channels,
             ]
         ),
         epoch=epoch,

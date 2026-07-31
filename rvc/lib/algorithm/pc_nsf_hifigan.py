@@ -1,8 +1,11 @@
-"""Inference-only pc-NSF-HiFiGAN used by the mel-VITS pipeline.
+"""pc-NSF-HiFiGAN renderer and trainable waveform decoder.
 
 The implementation follows SingingVocoders' exported generator format.  The
 vocoder is intentionally kept outside the acoustic model checkpoint: it is a
-fixed renderer shared by every voice model.
+fixed renderer shared by every voice model.  The optional speaker conditioning
+path is zero-initialized so existing exported checkpoints retain their
+original behaviour while the raw waveform GAN can reuse the decoder as its
+waveform generator.
 """
 
 from __future__ import annotations
@@ -134,6 +137,7 @@ class PCNSFHiFiGAN(nn.Module):
             raise ValueError("Only SingingVocoders ResBlock1 exports are supported")
         self.mini_nsf = bool(config.get("mini_nsf", False))
         self.noise_sigma = float(config.get("noise_sigma", 0.0))
+        self.speaker_dim = int(config.get("speaker_dim", 0))
         if int(np.prod(self.upsample_rates)) != self.hop_size:
             raise ValueError("pc-NSF upsample_rates product must equal hop_size")
 
@@ -141,6 +145,7 @@ class PCNSFHiFiGAN(nn.Module):
         self.conv_pre = weight_norm(nn.Conv1d(self.num_mels, initial, 7, padding=3))
         self.ups = nn.ModuleList()
         self.resblocks = nn.ModuleList()
+        self.speaker_film = nn.ModuleList()
         if self.mini_nsf:
             self.source_sr = self.sample_rate / int(np.prod(self.upsample_rates[2:]))
             self.upp = int(np.prod(self.upsample_rates[:2]))
@@ -182,6 +187,11 @@ class PCNSFHiFiGAN(nn.Module):
                     self.noise_convs.append(nn.Conv1d(1, out_channels, 1))
             elif index == 1:
                 self.source_conv = nn.Conv1d(1, out_channels, 1)
+            if self.speaker_dim > 0:
+                film = nn.Linear(self.speaker_dim, out_channels * 2)
+                nn.init.zeros_(film.weight)
+                nn.init.zeros_(film.bias)
+                self.speaker_film.append(film)
             for block_kernel, dilations in zip(
                 config["resblock_kernel_sizes"],
                 config["resblock_dilation_sizes"],
@@ -204,7 +214,13 @@ class PCNSFHiFiGAN(nn.Module):
         phase = phase + F.pad(accumulated[:, :-1], (0, 0, 1, 0))
         return torch.sin(2 * np.pi * phase.reshape(f0.shape[0], 1, -1))
 
-    def forward(self, mel: torch.Tensor, f0: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        mel: torch.Tensor,
+        f0: torch.Tensor,
+        speaker: torch.Tensor | None = None,
+        return_features: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         if mel.ndim != 3 or mel.shape[1] != self.num_mels:
             raise ValueError(
                 f"Expected mel [B, {self.num_mels}, T], got {tuple(mel.shape)}"
@@ -225,6 +241,10 @@ class PCNSFHiFiGAN(nn.Module):
             x = x + self.noise_sigma * torch.randn_like(x)
         for index, upsample in enumerate(self.ups):
             x = upsample(F.leaky_relu(x, LRELU_SLOPE))
+            if self.speaker_dim > 0 and speaker is not None:
+                scale, bias = self.speaker_film[index](speaker).chunk(2, dim=-1)
+                x = x * (1.0 + 0.1 * torch.tanh(scale).unsqueeze(-1))
+                x = x + 0.1 * bias.unsqueeze(-1)
             source_at_scale = None
             if not self.mini_nsf:
                 source_at_scale = self.noise_convs[index](source)
@@ -238,7 +258,10 @@ class PCNSFHiFiGAN(nn.Module):
             for block in self.resblocks[offset : offset + self.num_kernels]:
                 merged = merged + block(x)
             x = merged / self.num_kernels
-        return torch.tanh(self.conv_post(F.leaky_relu(x, LRELU_SLOPE)))
+        output = torch.tanh(self.conv_post(F.leaky_relu(x, LRELU_SLOPE)))
+        if return_features:
+            return output, [x]
+        return output
 
     def remove_weight_norm(self) -> None:
         remove_weight_norm(self.conv_pre)

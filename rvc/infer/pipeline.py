@@ -318,6 +318,31 @@ class Pipeline:
             enabled=amp_enabled,
             dtype=torch.float16,
         ):
+            if str(version).startswith("raw-nsf"):
+                # Raw-NSF owns its content and pitch analysis.  The legacy
+                # pipeline supplies 16 kHz chunks, while the decoder operates
+                # at the repository's 44.1 kHz / hop-512 clock.
+                source = np.asarray(audio0, dtype=np.float32)
+                if source.ndim == 2:
+                    source = source.mean(axis=1)
+                source = signal.resample_poly(source, 44100, self.sample_rate)
+                source_tensor = torch.from_numpy(source.copy()).to(self.device)
+                f0_override = None
+                if pitchf is not None and os.environ.get(
+                    "RVC_RAW_NSF_USE_F0_OVERRIDE", "0"
+                ).lower() in {"1", "true", "yes"}:
+                    target_frames = max(1, int(round(source.shape[0] / 512)))
+                    f0_override = F.interpolate(
+                        pitchf.float().unsqueeze(1),
+                        size=target_frames,
+                        mode="linear",
+                        align_corners=False,
+                    ).squeeze(1)
+                converted = net_g.infer(
+                    source_tensor.unsqueeze(0), sid, f0_override
+                )
+                return converted[0, 0].float().cpu().numpy()
+
             pitch_guidance = pitch != None and pitchf != None
 
             # prepare source audio

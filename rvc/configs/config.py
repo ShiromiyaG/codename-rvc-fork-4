@@ -8,6 +8,7 @@ arch_config_paths = {
     "stochastic_conformer_gan": [
         os.path.join("stochastic_conformer_gan", "44100.json")
     ],
+    "raw_nsf_gan": [os.path.join("raw_nsf_gan", "44100.json")],
 }
 
 def singleton(cls):

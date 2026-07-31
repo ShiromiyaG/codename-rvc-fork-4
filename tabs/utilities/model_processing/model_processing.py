@@ -50,6 +50,13 @@ def extract_small_model(
                 "fast_posterior.",
                 "slow_prequant.",
                 "fast_prequant.",
+            ) if architecture == "Hybrid-FSQ" else (
+                "content_speaker_classifier.",
+            ) if architecture == "Raw-NSF-Waveform-GAN" else (
+                "posterior_global.",
+                "posterior_local.",
+                "random_area_discriminator.",
+                "voicing_discriminator.",
             )
         )
         opt = OrderedDict(
@@ -80,6 +87,8 @@ def extract_small_model(
                 "version": (
                     "hybrid-fsq-1"
                     if architecture == "Hybrid-FSQ"
+                    else "raw-nsf-waveform-gan-1"
+                    if architecture == "Raw-NSF-Waveform-GAN"
                     else "mel-vits-1"
                 ),
                 "architecture": architecture,
