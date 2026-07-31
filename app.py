@@ -47,10 +47,10 @@ from tabs.settings.settings import settings_tab
 from core import run_prerequisites_script
 
 run_prerequisites_script(
-    pretraineds_hifigan=True,
+    pretraineds_hifigan=False,
     models=True,
     exe=True,
-    smartcutter=True,
+    smartcutter=False,
 )
 
 # Check installation

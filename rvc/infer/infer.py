@@ -13,6 +13,7 @@ import noisereduce as nr
 import faiss
 import zstandard as zstd
 import io
+import platform
 
 from pedalboard import (
     Pedalboard,
@@ -35,6 +36,7 @@ from rvc.infer.pipeline import Pipeline as VC
 from rvc.lib.utils import load_audio_infer, load_embedding
 from rvc.lib.tools.split_audio import process_audio, merge_audio
 from rvc.lib.algorithm.synthesizers import Synthesizer
+from rvc.lib.algorithm.pc_nsf_hifigan import PCNSFHiFiGAN
 from rvc.configs.config import Config
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -58,6 +60,7 @@ class VoiceConverter:
         self.last_embedder_model = None  # Last used embedder model
         self.tgt_sr = None  # Target sampling rate for the output audio
         self.net_g = None  # Generator network for voice conversion
+        self.pc_vocoder = None
         self.vc = None  # Voice conversion pipeline instance
         self.cpt = None  # Checkpoint for loading model weights
         self.active_cpt = None # Active checkpoint for the selected speaker
@@ -553,39 +556,60 @@ class VoiceConverter:
         Sets up the network configuration based on the loaded checkpoint.
         """
         if self.active_cpt is not None:
-            self.tgt_sr = self.active_cpt["config"][-1]
-            self.active_cpt["config"][-3] = self.active_cpt["weight"]["emb_g.weight"].shape[0]
-            self.use_f0 = self.active_cpt.get("f0", 1)
+            architecture = self.active_cpt.get("architecture")
+            if architecture not in {"Mel-VITS", "Hybrid-FSQ"}:
+                raise ValueError(
+                    "Legacy RVC/vocoder checkpoints are not supported by this build. "
+                    "Train or load a Mel-VITS or Hybrid-FSQ checkpoint."
+                )
+            self.tgt_sr = 44100
+            self.use_f0 = True
+            self.version = self.active_cpt.get("version", "mel-vits-1")
+            self.vocoder = "pc-NSF-HiFiGAN"
 
-            self.version = self.active_cpt.get("version", "v1")
-            self.text_enc_hidden_dim = 768 if self.version == "v2" else 256
-            self.vocoder = self.active_cpt.get("vocoder", "HiFi-GAN")
+            model_config = dict(self.active_cpt["model_config"])
+            model_config["spk_embed_dim"] = self.active_cpt["weight"][
+                "emb_g.weight"
+            ].shape[0]
+            if architecture == "Hybrid-FSQ":
+                from rvc.lib.algorithm.hybrid_fsq import HybridFSQSynthesizer
 
-            synth_kwargs = {
-                "use_f0": self.use_f0,
-                "text_enc_hidden_dim": self.text_enc_hidden_dim,
-                "vocoder": self.vocoder,
-            }
-
-            # RingFormer and APEX-GAN require istft params
-            if self.vocoder in ["RingFormer_v1", "RingFormer_v2"]:
-                ringformer_istft = self.active_cpt.get("ringformer_istft", [None, None])
-                synth_kwargs["gen_istft_n_fft"] = ringformer_istft[0]
-                synth_kwargs["gen_istft_hop_size"] = ringformer_istft[1]
-
-            if self.vocoder == "APEX-GAN":
-                apex_gan_istft = self.active_cpt.get("apex_gan_istft", [None, None])
-                synth_kwargs["gen_istft_n_fft"] = apex_gan_istft[0]
-                synth_kwargs["gen_istft_hop_size"] = apex_gan_istft[1]
-
-            # Model init
-            self.net_g = Synthesizer(*self.active_cpt["config"], **synth_kwargs)
-
-            del self.net_g.enc_q # Posterior encoder is training-only
-
+                self.net_g = HybridFSQSynthesizer(**model_config)
+                del self.net_g.global_posterior
+                del self.net_g.slow_posterior
+                del self.net_g.fast_posterior
+                del self.net_g.slow_prequant
+                del self.net_g.fast_prequant
+            else:
+                self.net_g = Synthesizer(**model_config)
+                del self.net_g.enc_q
             self.net_g.load_state_dict(self.active_cpt["weight"], strict=False)
+
+            vocoder_config = self.active_cpt.get("vocoder_config", {})
+            checkpoint_path = os.environ.get(
+                "RVC_PC_NSF_CHECKPOINT",
+                vocoder_config.get(
+                    "checkpoint",
+                    "rvc/models/vocoders/pc_nsf_hifigan_44.1k_hop512_128bin.pth",
+                ),
+            )
+            config_path = os.environ.get(
+                "RVC_PC_NSF_CONFIG",
+                vocoder_config.get("config", "rvc/models/vocoders/config.json"),
+            )
+            self.pc_vocoder = PCNSFHiFiGAN.from_export(
+                checkpoint_path, config_path, map_location="cpu"
+            )
+            self.net_g.set_vocoder(self.pc_vocoder)
             self.net_g = self.net_g.to(self.config.device).float()
             self.net_g.eval()
+            if (
+                platform.system() == "Linux"
+                and os.environ.get("RVC_TORCH_COMPILE", "0").lower()
+                in {"1", "true", "yes"}
+            ):
+                self.net_g.compile(mode="reduce-overhead", dynamic=True)
+                print(f"[Infer] torch.compile enabled for {architecture} + pc-NSF.")
 
     def setup_vc_instance(self):
         """
@@ -593,4 +617,4 @@ class VoiceConverter:
         """
         if self.active_cpt is not None:
             self.vc = VC(self.tgt_sr, self.config)
-            self.n_spk = self.active_cpt["config"][-3]
+            self.n_spk = self.active_cpt["weight"]["emb_g.weight"].shape[0]

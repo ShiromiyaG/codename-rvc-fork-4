@@ -3,33 +3,8 @@ import os
 import json
 
 arch_config_paths = {
-    "hifi": [
-        os.path.join("hifi", "48000.json"),
-        os.path.join("hifi", "40000.json"),
-        os.path.join("hifi", "32000.json"),
-    ],
-    "refine": [
-        os.path.join("refine", "48000.json"),
-        os.path.join("refine", "40000.json"),
-        os.path.join("refine", "32000.json"),
-    ],
-    "ringformer_v1": [
-        os.path.join("ringformer_v1", "48000.json"),
-        os.path.join("ringformer_v1", "40000.json"),
-        os.path.join("ringformer_v1", "32000.json"),
-        os.path.join("ringformer_v1", "24000.json"),
-    ],
-    "ringformer_v2": [
-        os.path.join("ringformer_v2", "48000.json"),
-        os.path.join("ringformer_v2", "40000.json"),
-        os.path.join("ringformer_v2", "32000.json"),
-        os.path.join("ringformer_v2", "24000.json"),
-    ],
-    "apex_gan": [
-        os.path.join("apex_gan", "48000.json"),
-        os.path.join("apex_gan", "40000.json"),
-        os.path.join("apex_gan", "32000.json"),
-    ],
+    "melvits": [os.path.join("melvits", "44100.json")],
+    "hybrid_fsq": [os.path.join("hybrid_fsq", "44100.json")],
 }
 
 def singleton(cls):
@@ -47,26 +22,30 @@ class Config:
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
         initial_precision = self.get_precision()
+        self.requested_precision = initial_precision
 
         if self.device == "cpu":
             self.is_half = False
-            print("[CONFIG] Running on CPU, forcing fp32 precision.")
+            print(
+                "[CONFIG] FP16 is configured by default; using FP32 at runtime "
+                "because CUDA is unavailable."
+            )
         else:
             self.is_half = initial_precision == "fp16"
-            print(f"[CONFIG] Running on CUDA, training-only precision loaded from config: {initial_precision}")
+            print(f"[CONFIG] Runtime precision loaded from config: {initial_precision}")
         self.gpu_name = (
             torch.cuda.get_device_name(int(self.device.split(":")[-1]))
             if self.device.startswith("cuda")
             else None
         )
 
-        self.json_config = self.load_config_json("hifi")
+        self.json_config = self.load_config_json("melvits")
         self.gpu_mem = None
         self.x_pad, self.x_query, self.x_center, self.x_max = self.device_config()
 
-    def load_config_json(self, vocoder_arch="hifi"):
+    def load_config_json(self, vocoder_arch="melvits"):
         configs = {}
-        for config_file in arch_config_paths.get(vocoder_arch, arch_config_paths["hifi"]):
+        for config_file in arch_config_paths.get(vocoder_arch, arch_config_paths["melvits"]):
             config_path = os.path.join("rvc", "configs", config_file)
             with open(config_path, "r") as f:
                 configs[config_file] = json.load(f)
@@ -79,9 +58,12 @@ class Config:
 
         fp16_run_value = precision == "fp16"
 
-        self.is_half = fp16_run_value 
+        self.requested_precision = precision
+        self.is_half = fp16_run_value and self.device.startswith("cuda")
 
-        for config_path in arch_config_paths["hifi"]:
+        for config_path in {
+            path for paths in arch_config_paths.values() for path in paths
+        }:
             full_config_path = os.path.join("rvc", "configs", config_path)
             try:
                 with open(full_config_path, "r") as f:
@@ -92,58 +74,18 @@ class Config:
             except FileNotFoundError:
                 print(f"File not found: {full_config_path}")
 
-        for config_path in arch_config_paths["refine"]:
-            full_config_path = os.path.join("rvc", "configs", config_path)
-            try:
-                with open(full_config_path, "r") as f:
-                    config = json.load(f)
-                config["train"]["fp16_run"] = fp16_run_value
-                with open(full_config_path, "w") as f:
-                    json.dump(config, f, indent=4)
-            except FileNotFoundError:
-                print(f"File not found: {full_config_path}")
-
-        for config_path in arch_config_paths["ringformer_v1"]:
-            full_config_path = os.path.join("rvc", "configs", config_path)
-            try:
-                with open(full_config_path, "r") as f:
-                    config = json.load(f)
-                config["train"]["fp16_run"] = fp16_run_value
-                with open(full_config_path, "w") as f:
-                    json.dump(config, f, indent=4)
-            except FileNotFoundError:
-                print(f"File not found: {full_config_path}")
-
-        for config_path in arch_config_paths["ringformer_v2"]:
-            full_config_path = os.path.join("rvc", "configs", config_path)
-            try:
-                with open(full_config_path, "r") as f:
-                    config = json.load(f)
-                config["train"]["fp16_run"] = fp16_run_value
-                with open(full_config_path, "w") as f:
-                    json.dump(config, f, indent=4)
-            except FileNotFoundError:
-                print(f"File not found: {full_config_path}")
-
-        for config_path in arch_config_paths["apex_gan"]:
-            full_config_path = os.path.join("rvc", "configs", config_path)
-            try:
-                with open(full_config_path, "r") as f:
-                    config = json.load(f)
-                config["train"]["fp16_run"] = fp16_run_value
-                with open(full_config_path, "w") as f:
-                    json.dump(config, f, indent=4)
-            except FileNotFoundError:
-                print(f"File not found: {full_config_path}")
-
-        return f"Precision set to: {precision}."
+        runtime_precision = "fp16" if self.is_half else "fp32"
+        return (
+            f"Default precision set to: {precision}. "
+            f"Current runtime precision: {runtime_precision}."
+        )
 
 
     def get_precision(self):
         if not arch_config_paths:
             raise FileNotFoundError("No configuration paths provided.")
 
-        full_config_path = os.path.join("rvc", "configs", arch_config_paths["hifi"][0])
+        full_config_path = os.path.join("rvc", "configs", arch_config_paths["melvits"][0])
         try:
             with open(full_config_path, "r") as f:
                 config = json.load(f)
@@ -164,7 +106,7 @@ class Config:
         if not arch_config_paths:
             raise FileNotFoundError("No configuration paths provided.")
 
-        full_config_path = os.path.join("rvc", "configs", arch_config_paths["hifi"][0])
+        full_config_path = os.path.join("rvc", "configs", arch_config_paths["melvits"][0])
         try:
             with open(full_config_path, "r") as f:
                 config = json.load(f)
@@ -196,7 +138,6 @@ class Config:
         else:
             self.device = "cpu"
             self.is_half = False
-            self.set_precision("fp32")
 
         # Configuration for 6GB GPU memory
         x_pad, x_query, x_center, x_max = (
@@ -221,7 +162,6 @@ class Config:
                 print(f"[CONFIG WARNING] Your GPU ({self.gpu_name}) does NOT support FP16 precision.")
                 print("[CONFIG] Forcing precision to FP32.")
             self.is_half = False
-            self.set_precision("fp32")
 
         self.gpu_mem = torch.cuda.get_device_properties(i_device).total_memory // (1024 ** 3)
 

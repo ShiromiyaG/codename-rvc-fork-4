@@ -1,38 +1,12 @@
 import textwrap
 
 
-VOCODER_INFO_FORK = textwrap.dedent("""\
-    **Vocoder for audio synthesis:**
-    
-    **RefineGAN:**
-    - **Arch overview:** ParallelResBlocks + AdaIN + Hn-NSF
-    - **COMPATIBILITY:** Offline: This Fork or Applio, Streaming: not 100% sure.
-    
-    **RingFormer:**
-    - **Arch overview:** A hybrid Resblocks+Conformer-Based Vocoder + RingAttention + Hn-NSF.
-    - **COMPATIBILITY:** Offline: This Fork. Streaming: None.
-    ⚠ This architecture is under a big question mark atm. ⚠
-    
-    **APEX-GAN:**
-    - **Arch overview:** Pitch-Conditioned Snake ResBlocks + Conv-iSTFT Hybrid architecture.
-    - **COMPATIBILITY:** Offline: This Fork. Streaming: None atm.
-    
-    **NOTES:**
-    **( Offline = Static inference/Covers, Streaming = Real-Time voice changers )**
-    **( Each Vocoder and its supported sample rates require appropriate pretrained models )**
-""")
+VOCODER_INFO_FORK = VOCODER_INFO_RVC = textwrap.dedent("""\
+    **pc-NSF-HiFiGAN**
 
-
-VOCODER_INFO_RVC = textwrap.dedent("""\
-    **Vocoder for audio synthesis:**
-    
-    **HiFi-GAN:**
-    - **Arch overview:** HiFi-GAN + Hn-NSF. ( RVC's og vocoder )
-    - **COMPATIBILITY:** Offline: RVC, Fork, Applio. Streaming: W-okada, Vonovox
-    
-    **NOTES:**
-    **( Offline = Static inference/Covers, Streaming = Real-Time voice changers )**
-    **( Each Vocoder and its supported sample rates require appropriate pretrained models )**
+    Mel-VITS predicts log-mels at 44.1 kHz with 128 bins and a hop length of
+    512. A single frozen pc-NSF-HiFiGAN converts mel + F0 into a waveform.
+    The vocoder is not part of the optimizer or voice checkpoints.
 """)
 
 
@@ -182,11 +156,9 @@ Smaller batch size:
 
 
 SPECTRAL_LOSS_INFO = textwrap.dedent("""\
-- **L1 Mel Loss:** L1 loss using mel spec - **Safe default.**
-- **Multi-Scale Mel Loss:** Multi-scale L1 mel spec loss.
-- **Hybrid:** L1 or Multi-Scale Mel + Multi-res. A-Weighted log-STFT spec loss.
-
-**NOTE:** Hybrid in "L1" version is likely more stable but it varies per-case.
+Training uses log-mel L1, temporal-delta consistency, VITS KL, and a
+non-parallel conversion cycle. This option is kept only for compatibility
+with legacy presets.
 """)
 
 
@@ -222,4 +194,3 @@ Choose an optimizer used in training:
 - **RAdam:** Rectified Adam. ( **Can help** with early instability - **Most likely slower convergence** )
 - **Ranger21:** AdamW + LookAhead and few more extras. ( **Most likely unstable** )
 """)
-

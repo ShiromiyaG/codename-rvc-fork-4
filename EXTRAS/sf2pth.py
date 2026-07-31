@@ -18,7 +18,7 @@ def convert():
         save_file(state_dict, output_path)
         print("Done!")
 
-    else file_ext.lower() == ".safetensors":
+    elif file_ext.lower() == ".safetensors":
         output_path = file_name + ".pth"
         print(f"Converting {input_path} to {output_path}...")
 

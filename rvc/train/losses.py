@@ -1,226 +1,81 @@
+"""Losses used by the Mel-VITS acoustic model."""
+
+from __future__ import annotations
+
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.nn import functional as F
-from torch import Tensor
-from typing import Tuple
-
-def phase_loss(x_fft: torch.Tensor, g_fft: torch.Tensor, reduction: str = 'mean') -> torch.Tensor:
-    x_norm = x_fft / (x_fft.abs() + 1e-9)
-    g_norm = g_fft / (g_fft.abs() + 1e-9)
-
-    phase_similarity = (x_norm * g_norm.conj()).real
-    loss = 1.0 - phase_similarity
-
-    if reduction == 'mean':
-        return loss.mean()
-    elif reduction == 'sum':
-        return loss.sum()
-    elif reduction == 'none':
-        return loss
-    else:
-        raise ValueError(f"Unsupported reduction mode: {reduction}")
 
 
-def feature_loss(fmap_r, fmap_g):
-    """
-    Compute the feature loss between reference and generated feature maps.
-
-    Args:
-        fmap_r (list of torch.Tensor): List of reference feature maps.
-        fmap_g (list of torch.Tensor): List of generated feature maps.
-    """
-    return sum(
-        torch.mean(torch.abs(rl - gl))
-        for dr, dg in zip(fmap_r, fmap_g)
-        for rl, gl in zip(dr, dg)
-    )
-
-
-def discriminator_loss(disc_real_outputs, disc_generated_outputs):
-    """
-    Compute the discriminator loss for real and generated outputs.
-
-    Returns:
-        Tuple of (total_loss, real_loss_sum, fake_loss_sum) aggregated across
-        all sub-discriminator heads (MPD periods, MSD scales, MRD resolutions).
-    """
-    loss = 0
-    loss_real = 0
-    loss_fake = 0
-    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
-        r_loss = torch.mean((1 - dr.float()) ** 2)
-        g_loss = torch.mean(dg.float() ** 2)
-        loss += r_loss + g_loss
-        loss_real += r_loss
-        loss_fake += g_loss
-
-    return loss, loss_real, loss_fake
-
-
-def generator_loss(disc_outputs):
-    """
-    LSGAN Generator Loss:
-    """
-    loss = 0
-    #gen_losses = []
-    for dg in disc_outputs:
-        l = torch.mean((1 - dg.float()) ** 2)
-        # gen_losses.append(l.item())
-        loss += l
-
-    return loss #, gen_losses
-
-
-def envelope_loss(y, y_hat):
-    # stride < kernel_size ensures overlapping coverage so no spikes are missed
-    m = torch.nn.MaxPool1d(kernel_size=5, stride=3)
-
-    # Positive envelope  (peaks )
-    y_env = m(y)
-    y_hat_env = m(y_hat)
-
-    # Negative envelope ( troughs )
-    y_rev_env = m(-y)
-    y_hat_rev_env = m(-y_hat)
-
-    return torch.nn.functional.l1_loss(y_env, y_hat_env) + \
-           torch.nn.functional.l1_loss(y_rev_env, y_hat_rev_env)
-
-
-
-def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
-    """
-    Compute the Kullback-Leibler divergence loss.
-
-    Args:
-        z_p (torch.Tensor): Sampled latent variable transformed by the flow [b, h, t_t].
-        logs_q (torch.Tensor): Log variance of the posterior distribution q [b, h, t_t].
-        m_p (torch.Tensor): Mean of the prior distribution p [b, h, t_t].
-        logs_p (torch.Tensor): Log variance of the prior distribution p [b, h, t_t].
-        z_mask (torch.Tensor): Mask for the latent variables [b, h, t_t].
-    """
-    kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
-    kl = (kl * z_mask).sum()
-    loss = kl / z_mask.sum()
-
-    return loss
-
-
-
-def kl_loss_fb(z_p, logs_q, m_p, logs_p, z_mask, z_p2=None, free_bits=0.0):
-    """
-    Compute the Kullback-Leibler divergence loss.
-    Supports 2-sample estimation when z_p2 is provided.
-    Free bits floor prevents posterior collapse (per-dimension, Kingma et al. 2016).
-
-    Args:
-        z_p (torch.Tensor): Sampled latent variable transformed by the flow [b, h, t_t].
-        logs_q (torch.Tensor): Log variance of the posterior distribution q [b, h, t_t].
-        m_p (torch.Tensor): Mean of the prior distribution p [b, h, t_t].
-        logs_p (torch.Tensor): Log variance of the prior distribution p [b, h, t_t].
-        z_mask (torch.Tensor): Mask for the latent variables [b, 1, t_t] or [b, h, t_t].
-        z_p2 (torch.Tensor, optional): Second independent sample through flow.
-        free_bits (float): Total KL floor in nats (divided across dims internally).
-                           e.g. free_bits=1.0 with 192 dims -> 0.0052 nats/dim minimum.
-    """
-    def _term(zp):
-        return logs_p - logs_q - 0.5 + 0.5 * ((zp - m_p) ** 2) * torch.exp(-2 * logs_p)
-
+def kl_loss_fb(
+    z_p: torch.Tensor,
+    logs_q: torch.Tensor,
+    m_p: torch.Tensor,
+    logs_p: torch.Tensor,
+    z_mask: torch.Tensor,
+    z_p2: torch.Tensor | None = None,
+    free_bits: float = 0.0,
+) -> torch.Tensor:
+    """Flow-aware KL with optional two-sample variance reduction/free bits."""
+    z_p = z_p.float()
+    logs_q = logs_q.float()
+    m_p = m_p.float()
+    logs_p = logs_p.float()
+    z_mask = z_mask.float()
     if z_p2 is not None:
-        kl = (_term(z_p) + _term(z_p2)) * 0.5
-    else:
-        kl = _term(z_p)
+        z_p2 = z_p2.float()
 
-    # kl: [b, h, t_t], z_mask: [b, 1, t_t] or [b, h, t_t]
-    kl = kl * z_mask
-
-    # Per-dim KL: sum over batch and time, average over valid elements per dim
-    # [b, h, t_t] -> [h]
-    n_dims = z_p.size(1)
-    kl_per_dim = kl.sum(dim=(0, 2))
-    mask_per_dim = z_mask.sum(dim=(0, 2)).clamp(min=1)
-    kl_per_dim = kl_per_dim / mask_per_dim
-
-    # Apply free bits floor (total floor divided across dims)
-    per_dim_floor = free_bits / n_dims
-    kl_per_dim = kl_per_dim.clamp(min=per_dim_floor)
-
-    # Sum over dims (matches old kl_loss scale: old divided by z_mask.sum()=b*t, not b*h*t)
-    loss = kl_per_dim.sum()
-
-    return loss
-
-
-class MultiScaleSTFTLoss(nn.Module):
-    """
-    Multi-scale STFT loss for audio reconstruction.
-
-    Computes spectral convergence and log magnitude loss
-    at multiple STFT resolutions.
-    """
-
-    def __init__(
-        self,
-        fft_sizes: Tuple[int, ...] = (512, 1024, 2048),
-        hop_sizes: Tuple[int, ...] = (128, 256, 512),
-        win_sizes: Tuple[int, ...] = (512, 1024, 2048),
-    ):
-        super().__init__()
-        self.fft_sizes = fft_sizes
-        self.hop_sizes = hop_sizes
-        self.win_sizes = win_sizes
-
-    def _stft(self, x: torch.Tensor, fft_size: int, hop_size: int, win_size: int) -> torch.Tensor:
-        """Compute STFT magnitude."""
-
-        # [B, C, T] -> [B, T]
-        x = x.squeeze(1) 
-
-        # Pad to avoid edge effects
-        x = F.pad(x, (win_size // 2, win_size // 2), mode='reflect')
-
-        window = torch.hann_window(win_size, device=x.device, dtype=x.dtype)
-        stft = torch.stft(
-            x, fft_size, hop_size, win_size, window,
-            return_complex=True, center=False
+    def term(sample: torch.Tensor) -> torch.Tensor:
+        return (
+            logs_p
+            - logs_q
+            - 0.5
+            + 0.5 * ((sample - m_p) ** 2) * torch.exp(-2 * logs_p)
         )
-        return stft.abs()
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Compute multi-scale STFT loss.
+    kl = term(z_p)
+    if z_p2 is not None:
+        kl = (kl + term(z_p2)) * 0.5
+    kl = kl * z_mask
+    valid = z_mask.sum(dim=(0, 2)).clamp_min(1.0)
+    per_dimension = kl.sum(dim=(0, 2)) / valid
+    return per_dimension.clamp_min(free_bits / z_p.size(1)).sum()
 
-        Per-sample spectral convergence with silence masking —
-        mute samples (||X||_F ≈ 0) are excluded since SC is undefined for zero-energy.
 
-        Args:
-            pred: (B, T) predicted audio
-            target: (B, T) target audio
-        """
-        sc_loss = 0.0
-        mag_loss = 0.0
+class MultiResolutionSTFTLoss(nn.Module):
+    """Stable waveform-domain loss used through the frozen pc-NSF vocoder."""
 
-        for fft_size, hop_size, win_size in zip(self.fft_sizes, self.hop_sizes, self.win_sizes):
-            pred_mag = self._stft(pred, fft_size, hop_size, win_size)      # [B, F, T]
-            target_mag = self._stft(target, fft_size, hop_size, win_size)  # [B, F, T]
+    def __init__(self, resolutions=None):
+        super().__init__()
+        self.resolutions = resolutions or (
+            (1024, 256, 1024),
+            (2048, 512, 2048),
+            (4096, 1024, 4096),
+        )
 
-            # Per-sample Frobenius norms
-            flat_target = target_mag.reshape(target_mag.size(0), -1)           # [B, F*T]
-            flat_diff = (target_mag - pred_mag).reshape(target_mag.size(0), -1)
-            target_nrg = torch.norm(flat_target, p=2, dim=1)                # [B]
-            diff_nrg = torch.norm(flat_diff, p=2, dim=1)                    # [B]
+    @staticmethod
+    def _magnitude(waveform, n_fft, hop, win):
+        window = torch.hann_window(win, device=waveform.device, dtype=torch.float32)
+        spectrum = torch.stft(
+            waveform.float(),
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=win,
+            window=window,
+            return_complex=True,
+            center=True,
+        )
+        return spectrum.abs().clamp_min(1e-7)
 
-            # Mask out silent samples (SC is undefined for zero-energy)
-            mask = target_nrg > 1e-4
-            if mask.any():
-                sc_loss += (diff_nrg[mask] / target_nrg[mask]).mean()
-
-            # Log magnitude loss — safe for all samples (clamp avoids -inf)
-            mag_loss += F.l1_loss(
-                torch.log(pred_mag.clamp(min=1e-5)),
-                torch.log(target_mag.clamp(min=1e-5)),
-            )
-
-        sc_loss = sc_loss / len(self.fft_sizes) if sc_loss != 0.0 else 0.0
-        mag_loss = mag_loss / len(self.fft_sizes)
-        return sc_loss + mag_loss
+    def forward(self, predicted: torch.Tensor, target: torch.Tensor):
+        predicted = predicted.reshape(-1, predicted.shape[-1])
+        target = target.reshape(-1, target.shape[-1])
+        total = predicted.new_zeros((), dtype=torch.float32)
+        for n_fft, hop, win in self.resolutions:
+            pred_mag = self._magnitude(predicted, n_fft, hop, win)
+            target_mag = self._magnitude(target, n_fft, hop, win)
+            difference = torch.linalg.vector_norm(target_mag - pred_mag)
+            convergence = difference / torch.linalg.vector_norm(target_mag).clamp_min(1e-7)
+            log_magnitude = F.l1_loss(pred_mag.log(), target_mag.log())
+            total = total + convergence + log_magnitude
+        return total / len(self.resolutions)

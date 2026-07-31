@@ -7,6 +7,7 @@ from rvc.lib.algorithm.commons import fused_add_tanh_sigmoid_multiply
 
 from torch.nn.utils.parametrizations import weight_norm
 from torch.nn.utils import remove_weight_norm
+from torch.utils.checkpoint import checkpoint
 
 class WaveNet(torch.nn.Module):
     def __init__(
@@ -17,6 +18,7 @@ class WaveNet(torch.nn.Module):
         n_layers: int,
         gin_channels: int = 0,
         p_dropout: int = 0,
+        checkpointing: bool = False,
     ):
         super(WaveNet, self).__init__()
         assert kernel_size % 2 == 1, "Kernel size must be odd for proper padding."
@@ -27,6 +29,7 @@ class WaveNet(torch.nn.Module):
         self.n_layers = n_layers
         self.gin_channels = gin_channels
         self.p_dropout = float(p_dropout)
+        self.checkpointing = checkpointing
 
         self.in_layers = torch.nn.ModuleList()
         self.res_skip_layers = torch.nn.ModuleList()
@@ -73,23 +76,49 @@ class WaveNet(torch.nn.Module):
         for i, (in_layer, res_skip_layer) in enumerate(
             zip(self.in_layers, self.res_skip_layers)
         ):
-            x_in = in_layer(x)
             if g is not None:
                 cond_offset = i * 2 * self.hidden_channels
                 g_l = g[:, cond_offset : cond_offset + 2 * self.hidden_channels, :]
             else:
-                g_l = torch.zeros_like(x_in)
+                g_l = torch.zeros(
+                    x.size(0),
+                    2 * self.hidden_channels,
+                    x.size(2),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
 
-            acts = fused_add_tanh_sigmoid_multiply(x_in, g_l, n_channels_tensor)
-            acts = self.drop(acts)
+            def layer(
+                value,
+                accumulated,
+                condition,
+                mask,
+                input_layer=in_layer,
+                skip_layer=res_skip_layer,
+                layer_index=i,
+            ):
+                value_in = input_layer(value)
+                acts = fused_add_tanh_sigmoid_multiply(
+                    value_in, condition, n_channels_tensor
+                )
+                acts = self.drop(acts)
+                res_skip = skip_layer(acts)
+                if layer_index < self.n_layers - 1:
+                    residual = res_skip[:, : self.hidden_channels, :]
+                    value = (value + residual) * mask
+                    accumulated = (
+                        accumulated + res_skip[:, self.hidden_channels :, :]
+                    )
+                else:
+                    accumulated = accumulated + res_skip
+                return value, accumulated
 
-            res_skip_acts = res_skip_layer(acts)
-            if i < self.n_layers - 1:
-                res_acts = res_skip_acts[:, : self.hidden_channels, :]
-                x = (x + res_acts) * x_mask
-                output = output + res_skip_acts[:, self.hidden_channels :, :]
+            if self.checkpointing and self.training:
+                x, output = checkpoint(
+                    layer, x, output, g_l, x_mask, use_reentrant=False
+                )
             else:
-                output = output + res_skip_acts
+                x, output = layer(x, output, g_l, x_mask)
         return output * x_mask
 
     def remove_weight_norm(self):

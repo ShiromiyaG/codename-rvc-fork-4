@@ -1,118 +1,137 @@
-@echo off
-setlocal enabledelayedexpansion
-title Codename-RVC-Fork Installer
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-echo Welcome to the Codename-RVC-Fork Installer!
-echo.
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+MINICONDA_DIR="${PROJECT_DIR}/miniconda3"
+CONDA_EXE="${MINICONDA_DIR}/bin/conda"
+ENV_DIR="${PROJECT_DIR}/env"
+PYTHON_VERSION="${PYTHON_VERSION:-3.10.18}"
+TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
+MINICONDA_VERSION="${MINICONDA_VERSION:-latest}"
+CONDA_PKGS_DIRS="${PROJECT_DIR}/.conda-pkgs"
+export CONDA_PKGS_DIRS
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-set "INSTALL_DIR=%cd%"
-set "MINICONDA_DIR=%UserProfile%\Miniconda3"
-set "ENV_DIR=%INSTALL_DIR%\env"
-set "MINICONDA_URL=https://repo.anaconda.com/miniconda/Miniconda3-py310_24.7.1-0-Windows-x86_64.exe"
-set "CONDA_EXE=%MINICONDA_DIR%\Scripts\conda.exe"
+if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "This installer is intended for Linux." >&2
+    exit 1
+fi
 
-set "startTime=%TIME%"
-set "startHour=%TIME:~0,2%"
-set "startMin=%TIME:~3,2%"
-set "startSec=%TIME:~6,2%"
-set /a startHour=1%startHour% - 100
-set /a startMin=1%startMin% - 100
-set /a startSec=1%startSec% - 100
-set /a startTotal = startHour*3600 + startMin*60 + startSec
+case "$(uname -m)" in
+    x86_64|amd64)
+        MINICONDA_ARCH="x86_64"
+        ;;
+    aarch64|arm64)
+        MINICONDA_ARCH="aarch64"
+        ;;
+    *)
+        echo "Unsupported Linux architecture: $(uname -m)" >&2
+        exit 1
+        ;;
+esac
 
-call :cleanup
-call :install_miniconda
-call :create_conda_env
-call :install_dependencies
+cd "${PROJECT_DIR}"
 
-set "endTime=%TIME%"
-set "endHour=%TIME:~0,2%"
-set "endMin=%TIME:~3,2%"
-set "endSec=%TIME:~6,2%"
-set /a endHour=1%endHour% - 100
-set /a endMin=1%endMin% - 100
-set /a endSec=1%endSec% - 100
-set /a endTotal = endHour*3600 + endMin*60 + endSec
-set /a elapsed = endTotal - startTotal
-if %elapsed% lss 0 set /a elapsed += 86400
-set /a hours = elapsed / 3600
-set /a minutes = (elapsed %% 3600) / 60
-set /a seconds = elapsed %% 60
+backup_directory() {
+    local source_dir="$1"
+    local label="$2"
+    local backup_dir="${source_dir}.${label}-$(date +%Y%m%d-%H%M%S)-$$"
+    mv -- "${source_dir}" "${backup_dir}"
+    echo "Incompatible environment preserved at: ${backup_dir}"
+}
 
-echo Installation time: %hours% hours, %minutes% minutes, %seconds% seconds.
-echo.
+install_miniconda() {
+    local installer
+    local url
+    installer="$(mktemp --tmpdir codename-miniconda-XXXXXX.sh)"
+    if [[ "${MINICONDA_VERSION}" == "latest" ]]; then
+        url="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-${MINICONDA_ARCH}.sh"
+    else
+        url="https://repo.anaconda.com/miniconda/Miniconda3-${MINICONDA_VERSION}-Linux-${MINICONDA_ARCH}.sh"
+    fi
 
-echo Codename-RVC-Fork has been installed successfully!
-echo To start Codename-RVC-Fork, please run 'run-fork.bat'.
-echo.
-pause
-exit /b 0
+    echo "Downloading Miniconda for ${MINICONDA_ARCH}..."
+    if command -v curl >/dev/null 2>&1; then
+        curl --fail --location --retry 3 --output "${installer}" "${url}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --tries=3 --output-document="${installer}" "${url}"
+    else
+        echo "Install curl or wget to download Miniconda." >&2
+        exit 1
+    fi
 
-:cleanup
-echo Cleaning up unnecessary files...
-for %%F in (Makefile Dockerfile docker-compose.yaml *.sh) do if exist "%%F" del "%%F"
-echo Cleanup complete.
-echo.
-exit /b 0
+    bash "${installer}" -b -p "${MINICONDA_DIR}"
+    rm -f -- "${installer}"
+}
 
-:install_miniconda
-if exist "%CONDA_EXE%" (
-    echo Miniconda already installed. Skipping installation.
-    exit /b 0
-)
+if [[ -d "${MINICONDA_DIR}" && ! -x "${CONDA_EXE}" ]]; then
+    backup_directory "${MINICONDA_DIR}" "incomplete"
+fi
+if [[ ! -x "${CONDA_EXE}" ]]; then
+    install_miniconda
+fi
 
-echo Miniconda not found. Starting download and installation...
-powershell -Command "& {Invoke-WebRequest -Uri '%MINICONDA_URL%' -OutFile 'miniconda.exe'}"
-if not exist "miniconda.exe" goto :download_error
+environment_is_compatible=false
+if [[ -x "${ENV_DIR}/bin/python" && -f "${ENV_DIR}/conda-meta/history" ]]; then
+    if "${ENV_DIR}/bin/python" -c \
+        'import sys; raise SystemExit(sys.version_info[:2] != (3, 10))'
+    then
+        environment_is_compatible=true
+    fi
+fi
 
-start /wait "" miniconda.exe /InstallationType=JustMe /RegisterPython=0 /S /D=%MINICONDA_DIR%
-if errorlevel 1 goto :install_error
+if [[ "${environment_is_compatible}" != true && -e "${ENV_DIR}" ]]; then
+    backup_directory "${ENV_DIR}" "python-incompatible"
+fi
 
-del miniconda.exe
-echo Miniconda installation complete.
-echo.
-exit /b 0
+if [[ ! -x "${ENV_DIR}/bin/python" ]]; then
+    echo "Creating a local Conda environment with Python ${PYTHON_VERSION}..."
+    "${CONDA_EXE}" create \
+        --yes \
+        --prefix "${ENV_DIR}" \
+        --override-channels \
+        --channel conda-forge \
+        "python=${PYTHON_VERSION}" \
+        pip
+fi
 
-:create_conda_env
-echo Creating Conda environment...
-call "%MINICONDA_DIR%\_conda.exe" create --no-shortcuts -y -k --prefix "%ENV_DIR%" python=3.10.18
-if errorlevel 1 goto :error
-echo Conda environment created successfully.
-echo.
+ENV_PYTHON="${ENV_DIR}/bin/python"
+ENV_UV="${ENV_DIR}/bin/uv"
 
-if exist "%ENV_DIR%\python.exe" (
-    echo Installing uv package installer...
-    "%ENV_DIR%\python.exe" -m pip install uv
-    if errorlevel 1 goto :error
-    echo uv installation complete.
-    echo.
-)
-exit /b 0
+"${CONDA_EXE}" run --no-capture-output --prefix "${ENV_DIR}" \
+    python -m pip install --upgrade pip uv
 
-:install_dependencies
-echo Installing dependencies...
-call "%MINICONDA_DIR%\condabin\conda.bat" activate "%ENV_DIR%" || goto :error
+"${ENV_UV}" pip install \
+    --python "${ENV_PYTHON}" \
+    --upgrade \
+    torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
+    --index-url "${TORCH_INDEX_URL}"
 
-echo Installing pip packages...
-uv pip install --upgrade setuptools || goto :error
-uv pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --upgrade --index-url https://download.pytorch.org/whl/cu128 || goto :error
-uv pip install -r "%INSTALL_DIR%\requirements.txt" || goto :error
+"${ENV_UV}" pip install \
+    --python "${ENV_PYTHON}" \
+    -r "${PROJECT_DIR}/requirements.txt"
 
-call "%MINICONDA_DIR%\condabin\conda.bat" deactivate
-echo Dependencies installation complete.
-echo.
-exit /b 0
+"${ENV_PYTHON}" - <<'PY'
+import sys
+if sys.version_info[:2] != (3, 10):
+    raise SystemExit(f"Unexpected Python version in the environment: {sys.version}")
+import torch
+print(f"Python: {sys.version.split()[0]}")
+print(f"PyTorch: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+PY
 
+mkdir -p "${PROJECT_DIR}/rvc/models/vocoders"
+VOCODER="${PROJECT_DIR}/rvc/models/vocoders/pc_nsf_hifigan_44.1k_hop512_128bin.pth"
+if [[ ! -f "${VOCODER}" ]]; then
+    echo
+    echo "Dependencies installed. The pc-NSF-HiFiGAN checkpoint is not present yet:"
+    echo "  ${VOCODER}"
+    echo "It will be downloaded automatically when the interface starts."
+fi
 
-:download_error
-echo Download failed. Please check your internet connection and try again.
-goto :error
-
-:install_error
-echo Miniconda installation failed.
-goto :error
-
-:error
-echo An error occurred during installation. Please check the output above for details.
-pause
-exit /b 1
+echo
+echo "Installation complete using the local Miniconda:"
+echo "  ${MINICONDA_DIR}"
+echo "Run: ./run-fork.bat"
+echo "With torch.compile: RVC_TORCH_COMPILE=1 ./run-fork.bat"

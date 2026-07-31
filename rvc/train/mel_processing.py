@@ -89,7 +89,9 @@ def spectrogram_torch(y, n_fft, hop_size, win_size, center=False):
         return_complex=True,
     )
 
-    spec = torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + 1e-6)
+    # Match SingingVocoders exactly: epsilon is applied after the mel
+    # projection, not to every linear-frequency bin.
+    spec = spec.abs()
 
     return spec
 

@@ -37,6 +37,8 @@ class TextEncoder(nn.Module):
         p_dropout: float,
         embedding_dim: int,
         f0: bool = True,
+        checkpointing: bool = False,
+        use_sdpa: bool = True,
     ):
         super(TextEncoder, self).__init__()
         self.out_channels = out_channels
@@ -44,6 +46,15 @@ class TextEncoder(nn.Module):
         self.emb_phone = nn.Linear(embedding_dim, hidden_channels)
         self.lrelu = nn.LeakyReLU(0.1, inplace=True)
         self.emb_pitch = torch.nn.Embedding(256, hidden_channels) if f0 else None
+        self.continuous_pitch = (
+            nn.Sequential(
+                nn.Linear(2, hidden_channels),
+                nn.SiLU(),
+                nn.Linear(hidden_channels, hidden_channels),
+            )
+            if f0
+            else None
+        )
 
         self.encoder = TransformerEncoder(
             hidden_channels,
@@ -52,6 +63,8 @@ class TextEncoder(nn.Module):
             n_layers,
             kernel_size,
             p_dropout,
+            checkpointing=checkpointing,
+            use_sdpa=use_sdpa,
         )
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
@@ -59,6 +72,7 @@ class TextEncoder(nn.Module):
         self,
         phone: torch.Tensor,
         pitch: torch.Tensor,
+        pitchf: Optional[torch.Tensor],
         lengths: torch.Tensor,
         skip_head: Optional[torch.Tensor] = None,
     ):
@@ -66,6 +80,12 @@ class TextEncoder(nn.Module):
             x = self.emb_phone(phone)
         else:
             x = self.emb_phone(phone) + self.emb_pitch(pitch)
+            if pitchf is not None:
+                voiced = (pitchf > 0).to(phone.dtype)
+                continuous = torch.stack(
+                    (torch.log1p(pitchf.clamp_min(0.0)) / 8.0, voiced), dim=-1
+                ).to(phone.dtype)
+                x = x + self.continuous_pitch(continuous)
 
         x = x * math.sqrt(self.hidden_channels)  # [b, t, h]
         x = self.lrelu(x)

@@ -42,6 +42,7 @@ class PosteriorEncoder(nn.Module):
 		dilation_rate: int,
 		n_layers: int,
 		gin_channels: int = 0,
+		checkpointing: bool = False,
 	):
 		super(PosteriorEncoder, self).__init__()
 		self.in_channels = in_channels
@@ -51,6 +52,7 @@ class PosteriorEncoder(nn.Module):
 		self.dilation_rate = dilation_rate
 		self.n_layers = n_layers
 		self.gin_channels = gin_channels
+		self.checkpointing = checkpointing
 
 		self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
 		self.enc = WaveNet(
@@ -59,6 +61,7 @@ class PosteriorEncoder(nn.Module):
 			dilation_rate,
 			n_layers,
 			gin_channels=gin_channels,
+			checkpointing=checkpointing,
 		)
 		self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
@@ -72,7 +75,10 @@ class PosteriorEncoder(nn.Module):
 		x = self.enc(x, x_mask, g=g)
 		stats = self.proj(x) * x_mask
 		m, logs = torch.split(stats, self.out_channels, dim=1)
-		z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
+		z = (
+			m.float()
+			+ torch.randn_like(m, dtype=torch.float32) * torch.exp(logs.float())
+		).to(m.dtype) * x_mask
 		return z, m, logs, x_mask
 
 	def remove_weight_norm(self):

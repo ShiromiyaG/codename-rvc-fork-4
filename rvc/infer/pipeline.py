@@ -5,6 +5,7 @@ import gc
 import re
 import torch
 import torch.nn.functional as F
+from torch.amp import autocast
 import torchcrepe
 import faiss
 import librosa
@@ -307,7 +308,12 @@ class Pipeline:
             seed: Seed for randomization of noise.
         """
 
-        with torch.no_grad():
+        amp_enabled = self.config.is_half and str(self.device).startswith("cuda")
+        with torch.no_grad(), autocast(
+            device_type="cuda",
+            enabled=amp_enabled,
+            dtype=torch.float16,
+        ):
             pitch_guidance = pitch != None and pitchf != None
 
             # prepare source audio
@@ -317,6 +323,7 @@ class Pipeline:
             assert feats.dim() == 1, feats.dim()
 
             feats = feats.view(1, -1).to(self.device)
+            source_waveform = feats
 
             # extract features with contentvec on audio0
             feats = model(feats)["last_hidden_state"]
@@ -334,19 +341,51 @@ class Pipeline:
                     feats, index, big_npy, index_rate
                 )
 
-            # feature upsampling
-            feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(
-                0, 2, 1
+            # Mel-VITS uses the pc-NSF clock (44.1 kHz / hop 512).  ContentVec
+            # and the pitch extractors run on a 10 ms grid, so both are
+            # resampled to the exact number of vocoder frames.
+            target_frames = max(
+                1, round(audio0.shape[0] * 44100 / (self.sample_rate * 512))
             )
-
-            # adjust the length if the audio is short
-            p_len = min(audio0.shape[0] // self.window, feats.shape[1])
+            feats = F.interpolate(
+                feats.permute(0, 2, 1),
+                size=target_frames,
+                mode="linear",
+                align_corners=False,
+            ).permute(0, 2, 1)
+            p_len = target_frames
+            source_energy = F.adaptive_avg_pool1d(
+                source_waveform.abs().unsqueeze(1), target_frames
+            ).squeeze(1)
+            source_onset = F.relu(
+                torch.diff(
+                    source_energy,
+                    dim=-1,
+                    prepend=source_energy[:, :1],
+                )
+            )
+            source_onset = source_onset / source_onset.amax(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-5)
 
             if pitch_guidance:
-                feats0 = F.interpolate(feats0.permute(0, 2, 1), scale_factor=2).permute(
-                    0, 2, 1
-                )
-                pitch, pitchf = pitch[:, :p_len], pitchf[:, :p_len]
+                feats0 = F.interpolate(
+                    feats0.permute(0, 2, 1),
+                    size=target_frames,
+                    mode="linear",
+                    align_corners=False,
+                ).permute(0, 2, 1)
+                pitch = F.interpolate(
+                    pitch.float().unsqueeze(1),
+                    size=target_frames,
+                    mode="nearest",
+                ).squeeze(1).long()
+                pitchf = F.interpolate(
+                    pitchf.unsqueeze(1),
+                    size=target_frames,
+                    mode="linear",
+                    align_corners=False,
+                ).squeeze(1)
                 # Pitch protection blending
                 if protect < 0.5:
                     pitchff = pitchf.clone()
@@ -361,15 +400,18 @@ class Pipeline:
             p_len = torch.tensor([p_len], device=self.device).long()
 
             # Inference
+            infer_kwargs = dict(
+                phone=feats.float(),
+                phone_lengths=p_len,
+                pitch=pitch,
+                nsff0=pitchf.float(),
+                sid=sid,
+                seed=seed,
+            )
+            if str(version).startswith("hybrid-fsq"):
+                infer_kwargs["source_onset"] = source_onset
             audio1 = (
-                net_g.infer(
-                    phone=feats.float(),        # phone
-                    phone_lengths=p_len,        # phone_lengths
-                    pitch=pitch,                # quantized f0 curve
-                    nsff0=pitchf.float(),       # float f0 curve
-                    sid=sid,                    # speaker id
-                    seed=seed                  # inference seed
-                )[0][0, 0]
+                net_g.infer(**infer_kwargs)[0][0, 0]
                 .detach()
                 .cpu()
                 .float()
@@ -383,7 +425,7 @@ class Pipeline:
         return audio1
 
     def _retrieve_speaker_embeddings(self, feats, index, big_npy, index_rate):
-        npy = feats[0].cpu().numpy()
+        npy = feats[0].float().cpu().numpy()
         score, ix = index.search(npy, k=8)
         weight = np.square(1 / score)
         weight /= weight.sum(axis=1, keepdims=True)

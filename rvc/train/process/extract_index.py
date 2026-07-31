@@ -31,10 +31,12 @@ try:
 
         for name in listdir_res:
             file_path = os.path.join(feature_dir, name)
-            phone = np.load(file_path)
+            phone = np.asarray(np.load(file_path), dtype=np.float32)
             npys.append(phone)
 
-        big_npy = np.concatenate(npys, axis=0)
+        big_npy = np.ascontiguousarray(
+            np.concatenate(npys, axis=0), dtype=np.float32
+        )
 
         big_npy_idx = np.arange(big_npy.shape[0])
         np.random.shuffle(big_npy_idx)
@@ -54,6 +56,7 @@ try:
                 .fit(big_npy)
                 .cluster_centers_
             )
+            big_npy = np.ascontiguousarray(big_npy, dtype=np.float32)
 
 
         n_ivf = min(int(16 * np.sqrt(big_npy.shape[0])), big_npy.shape[0] // 39)

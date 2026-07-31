@@ -4,19 +4,23 @@ from tqdm import tqdm
 import requests 
 
 url_base = "https://huggingface.co/IAHispano/Applio/resolve/main/Resources" # Might change in future
+pc_nsf_hifigan_base_url = (
+    "https://huggingface.co/shiromiya/RIFT-SVC/resolve/main/"
+    "Vocoders/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02"
+)
 
-pretraineds_hifigan_list = [
+pretraineds_hifigan_list = []
+
+vocoders_list = [
     (
-        "pretrained_v2/",
+        "vocoders/",
         [
-            "f0D32k.pth",
-            "f0D40k.pth",
-            "f0D48k.pth",
-            "f0G32k.pth",
-            "f0G40k.pth",
-            "f0G48k.pth",
+            (
+                "model.ckpt",
+                "pc_nsf_hifigan_44.1k_hop512_128bin.pth",
+            )
         ],
-        "https://huggingface.co/Codename0/codename-rvc-fork-4-assets/resolve/main/pretrained_models/rvc_nsf_hifigan/v2",
+        pc_nsf_hifigan_base_url,
     )
 ]
 
@@ -48,20 +52,40 @@ executables_list = [
 ]
 
 folder_mapping_list = {
-    "pretrained_v2/": "rvc/models/pretraineds/hifi-gan/",
     "embedders/contentvec/": "rvc/models/embedders/contentvec/",
     "embedders/spin_v1": "rvc/models/embedders/spin_v1/",
     "embedders/spin_v2": "rvc/models/embedders/spin_v2/",
     "predictors/": "rvc/models/predictors/",
     "formant/": "rvc/models/formant/",
-    "smartcutter/": "rvc/models/smartcutter/"
+    "smartcutter/": "rvc/models/smartcutter/",
+    "vocoders/": "rvc/models/vocoders/",
 }
+
+
+def resolve_file_names(file_spec):
+    """Return the remote and local names for a download entry."""
+    if isinstance(file_spec, (tuple, list)):
+        return file_spec
+    return file_spec, file_spec
+
+
+def has_missing_files(file_list):
+    """Check whether at least one mapped file is absent locally."""
+    for entry in file_list:
+        remote_folder, files = entry[:2]
+        local_folder = folder_mapping_list.get(remote_folder, "")
+        for file_spec in files:
+            _, local_name = resolve_file_names(file_spec)
+            if not os.path.exists(os.path.join(local_folder, local_name)):
+                return True
+    return False
 
 
 def get_file_size_if_missing(file_list):
     """
     Calculate the total size of files to be downloaded only if they do not exist locally.
     Supports optional third element (custom base URL) in the tuple.
+    File entries may be strings or (remote name, local name) pairs.
     """
     total_size = 0
     for entry in file_list:
@@ -72,15 +96,17 @@ def get_file_size_if_missing(file_list):
             remote_folder, files, base_url = entry
 
         local_folder = folder_mapping_list.get(remote_folder, "")
-        for file in files:
-            destination_path = os.path.join(local_folder, file)
+        for file_spec in files:
+            remote_name, local_name = resolve_file_names(file_spec)
+            destination_path = os.path.join(local_folder, local_name)
             if not os.path.exists(destination_path):
                 # Construct URL depending on whether it's using the shared base or custom one
                 if base_url == url_base:
-                    url = f"{base_url}/{remote_folder}{file}"
+                    url = f"{base_url}/{remote_folder}{remote_name}"
                 else:
-                    url = f"{base_url}/{file}"
-                response = requests.head(url)
+                    url = f"{base_url}/{remote_name}"
+                response = requests.head(url, allow_redirects=True)
+                response.raise_for_status()
                 total_size += int(response.headers.get("content-length", 0))
     return total_size
 
@@ -95,12 +121,19 @@ def download_file(url, destination_path, global_bar):
     dir_name = os.path.dirname(destination_path)
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
+    partial_path = f"{destination_path}.part"
     response = requests.get(url, stream=True)
+    response.raise_for_status()
     block_size = 1024
-    with open(destination_path, "wb") as file:
-        for data in response.iter_content(block_size):
-            file.write(data)
-            global_bar.update(len(data))
+    try:
+        with open(partial_path, "wb") as file:
+            for data in response.iter_content(block_size):
+                file.write(data)
+                global_bar.update(len(data))
+        os.replace(partial_path, destination_path)
+    finally:
+        if os.path.exists(partial_path):
+            os.remove(partial_path)
 
 
 def download_mapping_files(file_mapping_list, global_bar):
@@ -119,13 +152,14 @@ def download_mapping_files(file_mapping_list, global_bar):
                 remote_folder, file_list, base_url = entry
 
             local_folder = folder_mapping_list.get(remote_folder, "")
-            for file in file_list:
-                destination_path = os.path.join(local_folder, file)
+            for file_spec in file_list:
+                remote_name, local_name = resolve_file_names(file_spec)
+                destination_path = os.path.join(local_folder, local_name)
                 if not os.path.exists(destination_path):
                     if base_url == url_base:
-                        url = f"{base_url}/{remote_folder}{file}"
+                        url = f"{base_url}/{remote_folder}{remote_name}"
                     else:
-                        url = f"{base_url}/{file}"
+                        url = f"{base_url}/{remote_name}"
                     futures.append(
                         executor.submit(
                             download_file, url, destination_path, global_bar
@@ -172,6 +206,7 @@ def calculate_total_size(
     if models:
         total_size += get_file_size_if_missing(models_list)
         total_size += get_file_size_if_missing(embedders_list)
+        total_size += get_file_size_if_missing(vocoders_list)
 
     if exe and os.name == "nt":
         total_size += get_file_size_if_missing(executables_list)
@@ -199,13 +234,34 @@ def prequisites_download_pipeline(
         smartcutter,
     )
 
-    if total_size > 0:
+    download_required = (
+        (
+            models
+            and (
+                has_missing_files(models_list)
+                or has_missing_files(embedders_list)
+                or has_missing_files(vocoders_list)
+            )
+        )
+        or (exe and os.name == "nt" and has_missing_files(executables_list))
+        or (smartcutter and has_missing_files(smartcutter_list))
+        or (
+            pretraineds_hifigan
+            and has_missing_files(pretraineds_hifigan_list)
+        )
+    )
+
+    if download_required:
         with tqdm(
-            total=total_size, unit="iB", unit_scale=True, desc="Downloading all files"
+            total=total_size or None,
+            unit="iB",
+            unit_scale=True,
+            desc="Downloading all files",
         ) as global_bar:
             if models:
                 download_mapping_files(models_list, global_bar)
                 download_mapping_files(embedders_list, global_bar)
+                download_mapping_files(vocoders_list, global_bar)
             if exe:
                 if os.name == "nt":
                     download_mapping_files(executables_list, global_bar)

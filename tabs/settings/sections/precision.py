@@ -10,7 +10,11 @@ def precision_tab():
 
             precision = gr.Radio(
                 label="Precision",
-                info="Select the precision you want to use for training and inference.",
+                info=(
+                    "FP16 uses automatic mixed precision on CUDA while keeping "
+                    "numerically sensitive operations in FP32. This setting "
+                    "controls inference immediately and the next training run."
+                ),
                 choices=["fp16", "fp32"],
                 value=config.get_precision(),
                 interactive=True,

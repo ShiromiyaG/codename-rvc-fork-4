@@ -1,0 +1,72 @@
+{
+    "architecture": "Mel-VITS",
+    "train": {
+        "seed": 1234,
+        "learning_rate_g": 0.0001,
+        "betas": [
+            0.8,
+            0.99
+        ],
+        "eps": 1e-09,
+        "fp16_run": true,
+        "lr_decay": 0.999875,
+        "segment_size": 196608,
+        "c_mel": 45.0,
+        "c_kl": 1.0,
+        "c_delta": 2.0,
+        "c_conversion": 1.0,
+        "conversion_probability": 0.5,
+        "gradient_accumulation_steps": 1,
+        "kl_warmup_epochs": 20,
+        "kl_free_bits": 0.5,
+        "waveform_loss_weight": 1.0,
+        "waveform_loss_interval": 4,
+        "waveform_loss_frames": 128,
+        "validation_ratio": 0.05,
+        "ema_decay": 0.999,
+        "ema_in_ram": true,
+        "ema_update_interval": 10,
+        "branchwise_training": true,
+        "waveform_microbatch_size": 1,
+        "vocoder_validation_only": false,
+        "validation_vocoder_batches": 1,
+        "speaker_balance_temperature": 0.5,
+        "content_adversarial_weight": 0.1,
+        "speaker_classification_weight": 0.5
+    },
+    "data": {
+        "max_wav_value": 32768.0,
+        "sample_rate": 44100,
+        "filter_length": 2048,
+        "hop_length": 512,
+        "win_length": 2048,
+        "n_mel_channels": 128,
+        "mel_fmin": 40.0,
+        "mel_fmax": 16000.0,
+        "f0_min": 30.0,
+        "f0_max": 1600.0,
+        "pitch_augmentation_probability": 0.2,
+        "pitch_augmentation_semitones": 2.0
+    },
+    "model": {
+        "inter_channels": 192,
+        "hidden_channels": 192,
+        "filter_channels": 768,
+        "text_enc_hidden_dim": 768,
+        "n_heads": 2,
+        "n_layers": 6,
+        "kernel_size": 3,
+        "p_dropout": 0.0,
+        "gin_channels": 256,
+        "spk_embed_dim": 109,
+        "mel_channels": 128,
+        "mel_decoder_layers": 8,
+        "mel_decoder_kernel_size": 5,
+        "use_sdpa": true
+    },
+    "vocoder": {
+        "type": "pc-nsf-hifigan",
+        "checkpoint": "rvc/models/vocoders/pc_nsf_hifigan_44.1k_hop512_128bin.pth",
+        "config": "rvc/models/vocoders/config.json"
+    }
+}

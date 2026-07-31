@@ -9,6 +9,7 @@ import numpy as np
 import concurrent.futures
 import multiprocessing as mp
 import json
+import shutil
 
 now_dir = os.getcwd()
 sys.path.append(os.path.join(now_dir))
@@ -24,12 +25,12 @@ mp.set_start_method("spawn", force=True)
 
 
 class FeatureInput:
-    def __init__(self, f0_method="rmvpe", device="cpu"):
+    def __init__(self, f0_method="rmvpe", device="cpu", f0_min=30.0, f0_max=1600.0):
         self.hop_size = 160  # default
         self.sample_rate = 16000  # default
         self.f0_bin = 256
-        self.f0_max = 1100.0
-        self.f0_min = 50.0
+        self.f0_max = float(f0_max)
+        self.f0_min = float(f0_min)
         self.f0_mel_min = 1127 * np.log(1 + self.f0_min / 700)
         self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
         self.device = device
@@ -69,7 +70,7 @@ class FeatureInput:
             1,
             self.f0_bin - 1,
         )
-        return np.rint(f0_mel).astype(int)
+        return np.rint(f0_mel).astype(np.uint8)
 
     def process_file(self, file_info):
         inp_path, opt_path_coarse, opt_path_full, _ = file_info
@@ -78,7 +79,7 @@ class FeatureInput:
 
         try:
             np_arr = load_audio_16k(inp_path)
-            feature_pit = self.compute_f0(np_arr)
+            feature_pit = np.asarray(self.compute_f0(np_arr), dtype=np.float32)
             np.save(opt_path_full, feature_pit, allow_pickle=False)
             coarse_pit = self.coarse_f0(feature_pit)
             np.save(opt_path_coarse, coarse_pit, allow_pickle=False)
@@ -88,8 +89,10 @@ class FeatureInput:
             )
 
 
-def process_files(files, f0_method, device, threads):
-    fe = FeatureInput(f0_method=f0_method, device=device)
+def process_files(files, f0_method, device, threads, f0_min, f0_max):
+    fe = FeatureInput(
+        f0_method=f0_method, device=device, f0_min=f0_min, f0_max=f0_max
+    )
 
     with tqdm.tqdm(total=len(files), leave=True) as pbar:
         for file_info in files:
@@ -97,7 +100,7 @@ def process_files(files, f0_method, device, threads):
             pbar.update(1)
 
 
-def run_pitch_extraction(files, devices, f0_method, threads):
+def run_pitch_extraction(files, devices, f0_method, threads, f0_min, f0_max):
     devices_str = ", ".join(devices)
     print(
         f"Starting pitch extraction with {num_processes} threads on {devices_str} using {f0_method}..."
@@ -112,6 +115,8 @@ def run_pitch_extraction(files, devices, f0_method, threads):
                 f0_method,
                 devices[i],
                 threads // len(devices),
+                f0_min,
+                f0_max,
             )
             for i in range(len(devices))
         ]
@@ -137,7 +142,11 @@ def process_file_embedding(
             result = model(feats)["last_hidden_state"]
         feats_out = result.squeeze(0).float().cpu().numpy()
         if not np.isnan(feats_out).any():
-            np.save(out_file_path, feats_out, allow_pickle=False)
+            np.save(
+                out_file_path,
+                feats_out.astype(np.float16),
+                allow_pickle=False,
+            )
         else:
             print(f"{wav_file_path} produced NaN values; skipping.")
 
@@ -179,11 +188,20 @@ if __name__ == "__main__":
     f0_method = sys.argv[2]
     num_processes = int(sys.argv[3])
     gpus = sys.argv[4]
-    sample_rate = sys.argv[5]
+    sample_rate = int(sys.argv[5])
     vocoder_arch = sys.argv[6]
     embedder_model = sys.argv[7]
     embedder_model_custom = sys.argv[8] if len(sys.argv) > 8 else None
     include_mutes = int(sys.argv[9]) if len(sys.argv) > 9 else 2
+    cleanup_16k = (
+        str(sys.argv[10]).lower() in ("1", "true", "yes")
+        if len(sys.argv) > 10
+        else True
+    )
+    f0_min = float(sys.argv[11]) if len(sys.argv) > 11 else 30.0
+    f0_max = float(sys.argv[12]) if len(sys.argv) > 12 else 1600.0
+    if not 10.0 <= f0_min < f0_max <= 4000.0:
+        raise ValueError("F0 range must satisfy 10 <= min < max <= 4000 Hz")
 
     wav_path = os.path.join(exp_dir, "sliced_audios_16k")
     os.makedirs(os.path.join(exp_dir, "f0"), exist_ok=True)
@@ -200,27 +218,57 @@ if __name__ == "__main__":
     else:
         data = {}
     data["embedder_model"] = chosen_embedder_model
+    data["feature_storage_dtype"] = "float16"
+    data["continuous_f0_storage_dtype"] = "float32"
+    data["coarse_f0_storage_dtype"] = "uint8"
+    data["f0_range_hz"] = [f0_min, f0_max]
+    data["cleanup_16k_after_extraction"] = cleanup_16k
     with open(file_path, "w") as f:
         json.dump(data, f, indent=4)
 
     files = []
     for file in glob.glob(os.path.join(wav_path, "*")):
         file_name = os.path.basename(file)
+        file_stem = os.path.splitext(file_name)[0]
         file_info = [
             file,
             os.path.join(exp_dir, "f0", file_name + ".npy"),
             os.path.join(exp_dir, "f0_voiced", file_name + ".npy"),
-            os.path.join(exp_dir, "extracted", file_name.replace("wav", "npy")),
+            os.path.join(exp_dir, "extracted", file_stem + ".npy"),
         ]
         files.append(file_info)
 
+    if not files:
+        raise FileNotFoundError(
+            f"No temporary 16 kHz audio found in {wav_path}. "
+            "Run preprocessing before feature extraction."
+        )
+
     devices = ["cpu"] if gpus == "-" else [f"cuda:{idx}" for idx in gpus.split("-")]
 
-    run_pitch_extraction(files, devices, f0_method, num_processes)
+    run_pitch_extraction(
+        files, devices, f0_method, num_processes, f0_min, f0_max
+    )
 
     run_embedding_extraction(
         files, devices, embedder_model, embedder_model_custom, num_processes
     )
 
-    generate_config(sample_rate, exp_dir, vocoder_arch)
+    missing_outputs = [
+        output_path
+        for _, coarse_f0_path, voiced_f0_path, feature_path in files
+        for output_path in (coarse_f0_path, voiced_f0_path, feature_path)
+        if not os.path.isfile(output_path)
+    ]
+    if missing_outputs:
+        raise RuntimeError(
+            f"Extraction did not produce {len(missing_outputs)} expected files. "
+            "Temporary 16 kHz audio was preserved."
+        )
+
+    generate_config(sample_rate, exp_dir, vocoder_arch, f0_min, f0_max)
     generate_filelist(exp_dir, sample_rate, include_mutes, embedder_model, vocoder_arch)
+
+    if cleanup_16k and os.path.isdir(wav_path):
+        shutil.rmtree(wav_path)
+        print("Removed temporary 16 kHz audio after successful extraction.")

@@ -16,20 +16,14 @@ noisereduce
 pedalboard
 stftpitchshift
 flatten-dict==0.4.2
-torch-dct==0.1.6
 pyloudnorm==0.1.1
 
 # Machine learning and deep learning
 numba==0.64.0
-torch==2.7.1
-torchaudio==2.7.1
-torchvision==0.22.1
 torchcrepe==0.0.23
 torch-optimizer
 einops
 transformers==4.44.2
-nnaudio==0.3.3
-ring-attention-pytorch @ https://github.com/codename0og/codename-essentials/raw/refs/heads/main/ring_attention_pytorch-0.5.17-py3-none-any.whl
 triton==3.3.1; sys_platform == "linux"
 triton-windows==3.3.1.post21; sys_platform == "win32"
 peft==0.17.1

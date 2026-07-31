@@ -1,10 +1,13 @@
 import os
+import random
 import numpy as np
+import soundfile as sf
 import torch
 import torch.utils.data
+from torch.nn import functional as F
 
-from mel_processing import spectrogram_torch
-from utils import load_filepaths_and_text, load_wav_to_torch
+from mel_processing import mel_spectrogram_torch
+from rvc.train.utils import load_filepaths_and_text, load_wav_to_torch
 
 debug_shapes = False
 
@@ -17,16 +20,31 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         hparams: Hyperparameters.
     """
 
-    def __init__(self, hparams):
-        self.audiopaths_and_text = load_filepaths_and_text(hparams.training_files)
+    def __init__(self, hparams, entries=None, augment=False):
+        self.audiopaths_and_text = (
+            entries
+            if entries is not None
+            else load_filepaths_and_text(hparams.training_files)
+        )
         self.max_wav_value = hparams.max_wav_value
         self.sample_rate = hparams.sample_rate
         self.filter_length = hparams.filter_length
         self.hop_length = hparams.hop_length
         self.win_length = hparams.win_length
-        self.sample_rate = hparams.sample_rate
+        self.n_mel_channels = hparams.n_mel_channels
+        self.mel_fmin = hparams.mel_fmin
+        self.mel_fmax = hparams.mel_fmax
         self.min_text_len = getattr(hparams, "min_text_len", 1)
         self.max_text_len = getattr(hparams, "max_text_len", 5000)
+        self.f0_min = float(getattr(hparams, "f0_min", 30.0))
+        self.f0_max = float(getattr(hparams, "f0_max", 1600.0))
+        self.augment = augment
+        self.pitch_augmentation_probability = float(
+            getattr(hparams, "pitch_augmentation_probability", 0.0)
+        )
+        self.pitch_augmentation_semitones = float(
+            getattr(hparams, "pitch_augmentation_semitones", 0.0)
+        )
         self._filter()
 
     def _filter(self):
@@ -38,7 +56,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         for audiopath, text, pitch, pitchf, dv in self.audiopaths_and_text:
             if self.min_text_len <= len(text) and len(text) <= self.max_text_len:
                 audiopaths_and_text_new.append([audiopath, text, pitch, pitchf, dv])
-                lengths.append(os.path.getsize(audiopath) // (3 * self.hop_length))
+                lengths.append(sf.info(audiopath).frames // self.hop_length)
         self.audiopaths_and_text = audiopaths_and_text_new
         self.lengths = lengths
 
@@ -70,7 +88,20 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         dv = audiopath_and_text[4]
 
         phone, pitch, pitchf = self.get_labels(phone, pitch, pitchf)
-        spec, wav = self.get_audio(file)
+        semitones = 0.0
+        if (
+            self.augment
+            and self.pitch_augmentation_semitones > 0
+            and random.random() < self.pitch_augmentation_probability
+        ):
+            semitones = random.uniform(
+                -self.pitch_augmentation_semitones,
+                self.pitch_augmentation_semitones,
+            )
+            ratio = 2.0 ** (semitones / 12.0)
+            pitchf = pitchf * ratio
+            pitch = self._f0_to_coarse(pitchf)
+        spec, wav = self.get_audio(file, semitones)
         dv = self.get_sid(dv)
 
         if debug_shapes:
@@ -82,21 +113,28 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
             print(f"        pitchf.shape= {pitchf.shape}")
 
 
-        len_phone = phone.size()[0]
-        len_spec = spec.size()[-1]
-        if len_phone != len_spec:
-            if debug_shapes:
-                print(f"  └── [LEN MISMATCH] spec={len_spec}  phone={len_phone}  → trimming everything to {min(len_phone, len_spec)}")
-
-            len_min = min(len_phone, len_spec)
-            len_wav = len_min * self.hop_length
-
-            spec = spec[:, :len_min]
-            wav = wav[:, :len_wav]
-
-            phone = phone[:len_min, :]
-            pitch = pitch[:len_min]
-            pitchf = pitchf[:len_min]
+        # The pc-NSF frontend (44.1 kHz / hop 512) does not share RVC's old
+        # 10 ms grid.  Mel is the canonical clock and all conditioning is
+        # resampled to its exact frame count.
+        mel_frames = spec.size(-1)
+        if phone.size(0) != mel_frames:
+            phone = F.interpolate(
+                phone.transpose(0, 1).unsqueeze(0),
+                size=mel_frames,
+                mode="linear",
+                align_corners=False,
+            ).squeeze(0).transpose(0, 1)
+        if pitch.size(0) != mel_frames:
+            pitch = F.interpolate(
+                pitch.float().view(1, 1, -1), size=mel_frames, mode="nearest"
+            ).view(-1).long()
+            pitchf = F.interpolate(
+                pitchf.view(1, 1, -1),
+                size=mel_frames,
+                mode="linear",
+                align_corners=False,
+            ).view(-1)
+        wav = wav[:, : mel_frames * self.hop_length]
 
         return (spec, wav, phone, pitch, pitchf, dv)
 
@@ -116,7 +154,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
 
         pitch = np.load(pitch)
         pitchf = np.load(pitchf)
-        n_num = min(phone.shape[0], 900)
+        n_num = min(phone.shape[0], pitch.shape[0], pitchf.shape[0])
         phone = phone[:n_num, :]
         pitch = pitch[:n_num]
         pitchf = pitchf[:n_num]
@@ -125,7 +163,15 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         pitchf = torch.FloatTensor(pitchf)
         return phone, pitch, pitchf
 
-    def get_audio(self, filename):
+    def _f0_to_coarse(self, f0: torch.Tensor) -> torch.Tensor:
+        mel_min = 1127.0 * np.log1p(self.f0_min / 700.0)
+        mel_max = 1127.0 * np.log1p(self.f0_max / 700.0)
+        mel = 1127.0 * torch.log1p(f0.clamp_min(0.0) / 700.0)
+        coarse = 1.0 + (mel - mel_min) * 254.0 / max(1e-6, mel_max - mel_min)
+        coarse = torch.where(f0 > 0, coarse.clamp(1, 255), torch.ones_like(coarse))
+        return coarse.round().long()
+
+    def get_audio(self, filename, pitch_shift_steps=0.0):
         """
         Loads and processes audio data.
 
@@ -138,32 +184,51 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
                 f"{sample_rate} SR doesn't match target {self.sample_rate} SR"
             )
         audio_norm = audio
+        if pitch_shift_steps:
+            import librosa
+
+            shifted = librosa.effects.pitch_shift(
+                audio_norm.numpy(),
+                sr=self.sample_rate,
+                n_steps=pitch_shift_steps,
+                res_type="soxr_hq",
+            )
+            audio_norm = torch.from_numpy(shifted.copy()).float()
         audio_norm = audio_norm.unsqueeze(0)
-        spec_filename = os.path.splitext(filename)[0] + ".spec.pt"
-        if os.path.exists(spec_filename):
+        spec_filename = os.path.splitext(filename)[0] + ".mel.pt"
+        if not pitch_shift_steps and os.path.exists(spec_filename):
             try:
                 spec = torch.load(spec_filename, weights_only=True)
             except Exception as error:
                 print(f"An error occurred getting spec from {spec_filename}: {error}")
-                spec = spectrogram_torch(
+                spec = mel_spectrogram_torch(
                     audio_norm,
                     self.filter_length,
+                    self.n_mel_channels,
+                    self.sample_rate,
                     self.hop_length,
                     self.win_length,
+                    self.mel_fmin,
+                    self.mel_fmax,
                     center=False,
                 )
                 spec = torch.squeeze(spec, 0)
                 torch.save(spec, spec_filename, _use_new_zipfile_serialization=False)
         else:
-            spec = spectrogram_torch(
+            spec = mel_spectrogram_torch(
                 audio_norm,
                 self.filter_length,
+                self.n_mel_channels,
+                self.sample_rate,
                 self.hop_length,
                 self.win_length,
+                self.mel_fmin,
+                self.mel_fmax,
                 center=False,
             )
             spec = torch.squeeze(spec, 0)
-            torch.save(spec, spec_filename, _use_new_zipfile_serialization=False)
+            if not pitch_shift_steps:
+                torch.save(spec, spec_filename, _use_new_zipfile_serialization=False)
         return spec, audio_norm
 
     def __getitem__(self, index):
@@ -293,11 +358,13 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         num_replicas=None,
         rank=None,
         shuffle=True,
+        speaker_balance_temperature=1.0,
     ):
         super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle)
         self.lengths = dataset.lengths
         self.batch_size = batch_size
         self.boundaries = boundaries
+        self.speaker_balance_temperature = float(speaker_balance_temperature)
 
         self.buckets, self.num_samples_per_bucket = self._create_buckets()
         self.total_size = sum(self.num_samples_per_bucket)
@@ -352,12 +419,38 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             ids_bucket = indices[i]
             num_samples_bucket = self.num_samples_per_bucket[i]
 
-            rem = num_samples_bucket - len_bucket
-            ids_bucket = (
-                ids_bucket
-                + ids_bucket * (rem // len_bucket)
-                + ids_bucket[: (rem % len_bucket)]
-            )
+            if self.speaker_balance_temperature < 0.999:
+                by_speaker = {}
+                for local_index in ids_bucket:
+                    sid = int(self.dataset.audiopaths_and_text[bucket[local_index]][4])
+                    by_speaker.setdefault(sid, []).append(local_index)
+                speakers = list(by_speaker)
+                counts = torch.tensor(
+                    [len(by_speaker[sid]) for sid in speakers], dtype=torch.float64
+                )
+                probabilities = counts.pow(self.speaker_balance_temperature)
+                probabilities /= probabilities.sum()
+                chosen = torch.multinomial(
+                    probabilities,
+                    num_samples_bucket,
+                    replacement=True,
+                    generator=g,
+                ).tolist()
+                positions = {sid: 0 for sid in speakers}
+                ids_bucket = []
+                for speaker_index in chosen:
+                    sid = speakers[speaker_index]
+                    options = by_speaker[sid]
+                    position = positions[sid] % len(options)
+                    ids_bucket.append(options[position])
+                    positions[sid] += 1
+            else:
+                rem = num_samples_bucket - len_bucket
+                ids_bucket = (
+                    ids_bucket
+                    + ids_bucket * (rem // len_bucket)
+                    + ids_bucket[: (rem % len_bucket)]
+                )
 
             ids_bucket = ids_bucket[self.rank :: self.num_replicas]
 

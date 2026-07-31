@@ -1,27 +1,22 @@
+"""Export compact mel-VITS acoustic checkpoints."""
+
+from __future__ import annotations
+
 import datetime
 import hashlib
 import json
 import os
-import sys
 from collections import OrderedDict
 
 import torch
 
-now_dir = os.getcwd()
-sys.path.append(now_dir)
 
-
-def replace_keys_in_dict(d, old_key_part, new_key_part):
-    if isinstance(d, OrderedDict):
-        updated_dict = OrderedDict()
-    else:
-        updated_dict = {}
-    for key, value in d.items():
-        new_key = key.replace(old_key_part, new_key_part)
-        if isinstance(value, dict):
-            value = replace_keys_in_dict(value, old_key_part, new_key_part)
-        updated_dict[new_key] = value
-    return updated_dict
+def _plain(value):
+    if hasattr(value, "items"):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
 
 
 def extract_model(
@@ -32,118 +27,91 @@ def extract_model(
     epoch,
     step,
     hps,
-    vocoder,
-    architecture,
+    vocoder="pc-NSF-HiFiGAN",
+    architecture="Mel-VITS",
     pitch_guidance=True,
-    version="v2",
+    version="mel-vits-1",
 ):
-    try:
-        model_dir = os.path.dirname(model_path)
-        os.makedirs(model_dir, exist_ok=True)
+    model_dir = os.path.dirname(model_path)
+    os.makedirs(model_dir, exist_ok=True)
 
-        if os.path.exists(os.path.join(model_dir, "model_info.json")):
-            with open(os.path.join(model_dir, "model_info.json"), "r") as f:
-                data = json.load(f)
-                dataset_length = data.get("total_dataset_duration", None)
-                embedder_model = data.get("embedder_model", None)
-                speakers_id = data.get("speakers_id", 1)
-                vocoder_architecture = data.get("vocoder_architecture", None)
-        else:
-            dataset_length = None
+    metadata = {}
+    info_path = os.path.join(os.getcwd(), "logs", name, "model_info.json")
+    if os.path.isfile(info_path):
+        with open(info_path, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
 
-        with open(os.path.join(now_dir, "assets", "config.json"), "r") as f:
-            data = json.load(f)
-            model_author = data.get("model_author", None)
-
-        opt = OrderedDict(
-            weight={
-                key: value.half() for key, value in ckpt.items() if "enc_q" not in key
-            }
+    model_config = _plain(hps.model)
+    model_config.update(
+        {
+            "spec_channels": hps.data.n_mel_channels,
+            "mel_channels": hps.data.n_mel_channels,
+            "segment_size": hps.train.segment_size // hps.data.hop_length,
+            "sr": hps.data.sample_rate,
+            "use_f0": True,
+        }
+    )
+    if architecture == "Mel-VITS":
+        model_config["training_auxiliaries"] = False
+    vocoder_config = _plain(hps.vocoder) if hasattr(hps, "vocoder") else {}
+    training_only_prefixes = (
+        ("enc_q.", "content_speaker_classifier.", "mel_speaker_classifier.")
+        if architecture == "Mel-VITS"
+        else (
+            "global_posterior.",
+            "slow_posterior.",
+            "fast_posterior.",
+            "slow_prequant.",
+            "fast_prequant.",
         )
-
-        # Base configuration list
-        config_list = [
-            hps.data.filter_length // 2 + 1,
-            32,
-            hps.model.inter_channels,
-            hps.model.hidden_channels,
-            hps.model.filter_channels,
-            hps.model.n_heads,
-            hps.model.n_layers,
-            hps.model.kernel_size,
-            hps.model.p_dropout,
-            hps.model.resblock,
-            hps.model.resblock_kernel_sizes,
-            hps.model.resblock_dilation_sizes,
-            hps.model.upsample_rates,
-            hps.model.upsample_initial_channel,
-            hps.model.upsample_kernel_sizes,
-            hps.model.spk_embed_dim,
-            hps.model.gin_channels,
-            hps.data.sample_rate,
-        ]
-
-        # Assigning to opt config
-        opt["config"] = config_list
-
-
-        opt["epoch"] = epoch
-        opt["step"] = step
-        opt["sr"] = sr
-        opt["f0"] = pitch_guidance
-        opt["version"] = version
-        opt["creation_date"] = datetime.datetime.now().isoformat()
-
-        hash_input = f"{name}-{epoch}-{step}-{sr}-{version}-{opt['config']}"
-        opt["model_hash"] = hashlib.sha256(hash_input.encode()).hexdigest()
-        opt["dataset_length"] = dataset_length
-        opt["model_name"] = name
-        opt["author"] = model_author
-        opt["embedder_model"] = embedder_model
-        opt["speakers_id"] = speakers_id
-        opt["vocoder"] = vocoder
-        opt["vocoder_architecture"] = vocoder_architecture
-
-        if vocoder in ["RingFormer_v1", "RingFormer_v2"]:
-            opt["ringformer_istft"] = [
-                hps.model.gen_istft_n_fft,
-                hps.model.gen_istft_hop_size,
+    )
+    weights = OrderedDict(
+        (key, value.detach().cpu().half())
+        for key, value in ckpt.items()
+        if not key.startswith(training_only_prefixes)
+    )
+    hash_input = f"{name}-{epoch}-{step}-{version}-{model_config}"
+    payload = OrderedDict(
+        weight=weights,
+        model_config=model_config,
+        vocoder_config=vocoder_config,
+        config=(
+            [
+                hps.data.n_mel_channels,
+                model_config["segment_size"],
+                hps.model.inter_channels,
+                hps.model.hidden_channels,
+                hps.model.filter_channels,
+                hps.model.n_heads,
+                hps.model.n_layers,
+                hps.model.kernel_size,
+                hps.model.p_dropout,
+                hps.model.spk_embed_dim,
+                hps.model.gin_channels,
+                hps.data.sample_rate,
             ]
-
-        if vocoder == "APEX-GAN":
-            opt["apex_gan_istft"] = [
-                hps.model.gen_istft_n_fft,
-                hps.model.gen_istft_hop_size,
+            if architecture == "Mel-VITS"
+            else [
+                hps.data.n_mel_channels,
+                model_config["segment_size"],
+                hps.model.hidden_channels,
+                hps.model.spk_embed_dim,
+                hps.model.gin_channels,
+                hps.data.sample_rate,
             ]
-
-        # Since fork uses new API for weight norm ( parametrizations )
-        # and mainline RVC ( Original ), W-okada and such rely on old API, we're performing keys conversion.
-        #
-        #   Old API:  .weight_g / .weight_v
-        #   New API:  .parametrizations.weight.original0 (direction) / .original1 (gain)
-
-        NEW_TO_OLD = [
-            (".parametrizations.weight.original1", ".weight_g"),
-            (".parametrizations.weight.original0", ".weight_v"),
-        ]
-        OLD_TO_NEW = [
-            (".weight_g", ".parametrizations.weight.original1"),
-            (".weight_v", ".parametrizations.weight.original0"),
-        ]
-
-        has_new = any("parametrizations.weight.original" in k for k in opt)
-        has_old = any(k.endswith(".weight_v") or k.endswith(".weight_g") for k in opt)
-
-        if architecture == "RVC" and has_new: # RVC Arch models TRAIN with new api, but are SAVED with old-API compatibility in mind.
-            for old, new in NEW_TO_OLD:
-                opt = replace_keys_in_dict(opt, old, new)
-
-        elif architecture != "RVC" and has_old: # Fork arch doesn't use old API but this is a safety-fallback for whatever
-            for old, new in OLD_TO_NEW:
-                opt = replace_keys_in_dict(opt, old, new)
-
-        torch.save(opt, model_path)
-        print(f"Saved model '{model_path}' (epoch {epoch} and step {step})")
-
-    except Exception as error:
-        print(f"An error occurred extracting the model: {error}")
+        ),
+        epoch=epoch,
+        step=step,
+        sr=sr,
+        f0=pitch_guidance,
+        version=version,
+        architecture=architecture,
+        vocoder=vocoder,
+        creation_date=datetime.datetime.now().isoformat(),
+        model_hash=hashlib.sha256(hash_input.encode()).hexdigest(),
+        model_name=name,
+        embedder_model=metadata.get("embedder_model"),
+        speakers_id=metadata.get("speakers_id", hps.model.spk_embed_dim),
+    )
+    torch.save(payload, model_path)
+    print(f"Saved {architecture} model '{model_path}' (epoch {epoch}, step {step})")

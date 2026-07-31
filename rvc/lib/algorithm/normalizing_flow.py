@@ -4,6 +4,7 @@ from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
 
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from rvc.lib.algorithm.wavenet import WaveNet
 
 
@@ -113,6 +114,7 @@ class ResidualCouplingBlock(nn.Module):
         n_flows=4,
         gin_channels=0,
         p_dropout=0.0,
+        checkpointing=False,
     ):
         super(ResidualCouplingBlock, self).__init__()
         self.channels = channels
@@ -122,6 +124,7 @@ class ResidualCouplingBlock(nn.Module):
         self.n_layers = n_layers
         self.n_flows = n_flows
         self.gin_channels = gin_channels
+        self.checkpointing = checkpointing
 
         self.flows = nn.ModuleList()
         for i in range(n_flows):
@@ -148,10 +151,40 @@ class ResidualCouplingBlock(nn.Module):
     ):
         if not reverse:
             for flow in self.flows:
-                x, _ = flow(x, x_mask, g=g, reverse=reverse)
+                if (
+                    self.checkpointing
+                    and self.training
+                    and isinstance(flow, ResidualCouplingLayer)
+                ):
+                    x = checkpoint(
+                        lambda value, mask, condition, current=flow: current(
+                            value, mask, g=condition, reverse=False
+                        )[0],
+                        x,
+                        x_mask,
+                        g,
+                        use_reentrant=False,
+                    )
+                else:
+                    x, _ = flow(x, x_mask, g=g, reverse=reverse)
         else:
             for flow in self.flows[::-1]:
-                x, _ = flow.forward(x, x_mask, g=g, reverse=reverse)
+                if (
+                    self.checkpointing
+                    and self.training
+                    and isinstance(flow, ResidualCouplingLayer)
+                ):
+                    x = checkpoint(
+                        lambda value, mask, condition, current=flow: current(
+                            value, mask, g=condition, reverse=True
+                        )[0],
+                        x,
+                        x_mask,
+                        g,
+                        use_reentrant=False,
+                    )
+                else:
+                    x, _ = flow.forward(x, x_mask, g=g, reverse=reverse)
         return x
 
     def remove_weight_norm(self):

@@ -33,6 +33,8 @@ class MultiHeadAttention(nn.Module):
         block_length: int = None,
         proximal_bias: bool = False,
         proximal_init: bool = False,
+        use_sdpa: bool = True,
+        sdpa_relative_chunk_size: int = 64,
     ):
         super(MultiHeadAttention, self).__init__()
         assert (channels % n_heads == 0), "Channels must be divisible by the number of heads."
@@ -46,6 +48,8 @@ class MultiHeadAttention(nn.Module):
         self.block_length = block_length
         self.proximal_bias = proximal_bias
         self.proximal_init = proximal_init
+        self.use_sdpa = use_sdpa and hasattr(F, "scaled_dot_product_attention")
+        self.sdpa_relative_chunk_size = max(1, int(sdpa_relative_chunk_size))
         self.attn = None
 
         self.k_channels = channels // n_heads
@@ -105,6 +109,13 @@ class MultiHeadAttention(nn.Module):
         key = key.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
         value = value.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
 
+        # SDPA selects FlashAttention or the memory-efficient CUDA kernel when
+        # the installed torch/device supports it. Relative-value attention is
+        # recomputed in query chunks, preserving the original VITS formulation
+        # without materializing its full probability matrix.
+        if self.use_sdpa and (not self.training or self.p_dropout == 0.0):
+            return self._sdpa_attention(query, key, value, mask)
+
         scores = torch.matmul(query / math.sqrt(self.k_channels), key.transpose(-2, -1))
         if self.window_size is not None:
             assert (
@@ -148,6 +159,122 @@ class MultiHeadAttention(nn.Module):
             output.transpose(2, 3).contiguous().view(b, d, t_t)
         )  # [b, n_h, t_t, d_k] -> [b, d, t_t]
         return output, p_attn
+
+    def _relative_matrix(self, embeddings, query_start, query_end, key_length):
+        query_positions = torch.arange(
+            query_start, query_end, device=embeddings.device
+        ).unsqueeze(1)
+        key_positions = torch.arange(
+            key_length, device=embeddings.device
+        ).unsqueeze(0)
+        relative = key_positions - query_positions
+        indices = (relative + self.window_size).clamp(
+            0, 2 * self.window_size
+        )
+        matrix = embeddings[:, indices, :]
+        if matrix.size(0) == 1 and self.n_heads > 1:
+            matrix = matrix.expand(self.n_heads, -1, -1, -1)
+        valid = (relative.abs() <= self.window_size).to(matrix.dtype)
+        return matrix * valid.unsqueeze(0).unsqueeze(-1)
+
+    def _sdpa_bias(self, query, mask, query_start=0, query_end=None):
+        query_end = query.size(2) if query_end is None else query_end
+        key_length = mask.size(-1) if mask is not None else query.size(2)
+        bias = None
+        if self.window_size is not None:
+            scaled_query = (
+                query[:, :, query_start:query_end]
+                / math.sqrt(self.k_channels)
+            )
+            if (
+                query_start == 0
+                and query_end == query.size(2)
+                and key_length == query.size(2)
+            ):
+                relative_keys = self._get_relative_embeddings(
+                    self.emb_rel_k, key_length
+                )
+                relative_logits = self._matmul_with_relative_keys(
+                    scaled_query, relative_keys
+                )
+                bias = self._relative_position_to_absolute_position(
+                    relative_logits
+                )
+            else:
+                relative_keys = self._relative_matrix(
+                    self.emb_rel_k, query_start, query_end, key_length
+                )
+                bias = torch.einsum(
+                    "bhqd,hqkd->bhqk", scaled_query, relative_keys
+                )
+        if self.proximal_bias:
+            proximal = self._attention_bias_proximal(key_length).to(
+                device=query.device, dtype=query.dtype
+            )[..., query_start:query_end, :]
+            bias = proximal if bias is None else bias + proximal
+        if mask is not None:
+            padding = torch.zeros(
+                mask.shape[0],
+                1,
+                query_end - query_start,
+                key_length,
+                device=query.device,
+                dtype=query.dtype,
+            ).masked_fill(mask[..., query_start:query_end, :] == 0, -1e4)
+            bias = padding if bias is None else bias + padding
+        if self.block_length is not None:
+            positions = torch.arange(key_length, device=query.device)
+            local = (
+                positions.unsqueeze(0)
+                - torch.arange(
+                    query_start, query_end, device=query.device
+                ).unsqueeze(1)
+            ).abs() <= self.block_length
+            local_bias = torch.zeros(
+                1,
+                1,
+                query_end - query_start,
+                key_length,
+                device=query.device,
+                dtype=query.dtype,
+            ).masked_fill(~local.unsqueeze(0).unsqueeze(0), -1e4)
+            bias = local_bias if bias is None else bias + local_bias
+        return bias
+
+    def _sdpa_attention(self, query, key, value, mask):
+        bias = self._sdpa_bias(query, mask)
+        dropout = self.p_dropout if self.training else 0.0
+        output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=bias,
+            dropout_p=dropout,
+            is_causal=False,
+        )
+        if self.window_size is not None:
+            relative_output = torch.zeros_like(output)
+            scale = 1.0 / math.sqrt(self.k_channels)
+            for start in range(0, query.size(2), self.sdpa_relative_chunk_size):
+                end = min(query.size(2), start + self.sdpa_relative_chunk_size)
+                scores = torch.matmul(
+                    query[:, :, start:end] * scale, key.transpose(-2, -1)
+                )
+                chunk_bias = self._sdpa_bias(query, mask, start, end)
+                if chunk_bias is not None:
+                    scores = scores + chunk_bias
+                probabilities = torch.softmax(scores, dim=-1)
+                relative_values = self._relative_matrix(
+                    self.emb_rel_v, start, end, key.size(2)
+                )
+                relative_output[:, :, start:end] = torch.einsum(
+                    "bhqk,hqkd->bhqd", probabilities, relative_values
+                )
+            output = output + relative_output
+        output = output.transpose(2, 3).contiguous().view(
+            query.size(0), self.channels, query.size(2)
+        )
+        return output, None
 
     def _matmul_with_relative_values(self, x, y):
         """
@@ -323,6 +450,3 @@ class FFN(nn.Module):
             [pad_l, pad_r, 0, 0, 0, 0],
         )
         return x
-
-
-

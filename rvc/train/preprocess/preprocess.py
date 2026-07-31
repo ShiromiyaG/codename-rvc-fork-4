@@ -37,8 +37,8 @@ logging.getLogger("numba.core.byteflow").setLevel(logging.WARNING)
 logging.getLogger("numba.core.ssa").setLevel(logging.WARNING)
 logging.getLogger("numba.core.interpreter").setLevel(logging.WARNING)
 
-OVERLAP = 0.3
-PERCENTAGE = 3.0
+OVERLAP = 0.1
+PERCENTAGE = 6.0
 MAX_AMPLITUDE = 0.9
 ALPHA = 0.75
 HIGH_PASS_CUTOFF = 48
@@ -148,7 +148,7 @@ class PreProcess:
         while i < len(audio):
             chunk = audio[i : i + chunk_len_smpl]
 
-            # If the last slice's below 3 seconds, we're padding it to 3 secs.
+            # Pad the final usable slice to the configured chunk length.
             if len(chunk) < chunk_len_smpl:
                 padding_needed = chunk_len_smpl - len(chunk)
                 if len(chunk) > self.sr * 1.0: 
@@ -471,15 +471,19 @@ def save_dataset_duration(file_path, dataset_duration, normalization_mode, rms_n
         json.dump(data, f, indent=4)
 
 def cleanup_dirs(exp_dir):
-    gt_wavs_dir = os.path.join(exp_dir, "sliced_audios")
-    wavs16k_dir = os.path.join(exp_dir, "sliced_audios_16k")
-    logger.info("Cleaning up partially processed audio directories if they exist...")
-    if os.path.exists(gt_wavs_dir):
-        shutil.rmtree(gt_wavs_dir)
-        logger.info(f"Deleted directory: {gt_wavs_dir}")
-    if os.path.exists(wavs16k_dir):
-        shutil.rmtree(wavs16k_dir)
-        logger.info(f"Deleted directory: {wavs16k_dir}")
+    generated_directories = (
+        "sliced_audios",
+        "sliced_audios_16k",
+        "extracted",
+        "f0",
+        "f0_voiced",
+    )
+    logger.info("Cleaning up generated dataset directories if they exist...")
+    for directory_name in generated_directories:
+        directory = os.path.join(exp_dir, directory_name)
+        if os.path.exists(directory):
+            shutil.rmtree(directory)
+            logger.info(f"Deleted directory: {directory}")
 
 
 def run_smart_cutter_stage(input_root, exp_dir, sr):
@@ -623,6 +627,7 @@ def preprocess_training_set(
     cleanup_dirs(exp_dir)
 
     total_audio_length = 0
+    source_manifest = {}
 
     # Slicing & Resampling
     print("\n[Stage 1: Slicing & Resampling]")
@@ -674,6 +679,11 @@ def preprocess_training_set(
                 )
                 for idx, f_path in enumerate(current_batch_paths)
             ]
+            for idx, original_path in enumerate(audio_paths):
+                source_manifest[f"{sid}_{idx}"] = {
+                    "speaker_id": sid,
+                    "source_path": os.path.abspath(original_path),
+                }
 
             for result in pool.imap_unordered(_process_audio_worker, arg_list):
                 if result:
@@ -688,6 +698,17 @@ def preprocess_training_set(
         
     if use_smart_cutter and sc_engine:
         sc_engine.unload()
+
+    with open(
+        os.path.join(exp_dir, "preprocess_manifest.json"),
+        "w",
+        encoding="utf-8",
+    ) as manifest_file:
+        json.dump(
+            {"version": 1, "sources": source_manifest},
+            manifest_file,
+            indent=2,
+        )
 
     POST_NORM_MODES = {
         "post_rms":      "RMS Normalization",

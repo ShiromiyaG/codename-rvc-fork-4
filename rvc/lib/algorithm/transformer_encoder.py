@@ -5,6 +5,7 @@ import numpy as np
 import math
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from rvc.lib.algorithm.attentions import MultiHeadAttention, FFN
 
@@ -33,6 +34,8 @@ class TransformerEncoder(nn.Module):
         kernel_size: int = 1,
         p_dropout: float = 0.0,
         window_size: int = 10,
+        checkpointing: bool = False,
+        use_sdpa: bool = True,
         **kwargs
     ):
         super(TransformerEncoder, self).__init__()
@@ -43,6 +46,7 @@ class TransformerEncoder(nn.Module):
         self.kernel_size = kernel_size
         self.p_dropout = p_dropout
         self.window_size = window_size
+        self.checkpointing = checkpointing
 
         self.drop = nn.Dropout(p_dropout)
         self.attn_layers = nn.ModuleList()
@@ -57,6 +61,7 @@ class TransformerEncoder(nn.Module):
                     n_heads,
                     p_dropout=p_dropout,
                     window_size=window_size,
+                    use_sdpa=use_sdpa,
                 )
             )
             self.norm_layers_1.append(LayerNorm(hidden_channels))
@@ -78,12 +83,27 @@ class TransformerEncoder(nn.Module):
             self.attn_layers, self.norm_layers_1, self.ffn_layers, self.norm_layers_2
         )
         for attn_layers, norm_layers_1, ffn_layers, norm_layers_2 in zippep:
-            y = attn_layers(x, x, attn_mask)
-            y = self.drop(y)
-            x = norm_layers_1(x + y)
+            def layer(
+                value,
+                value_mask,
+                attention_mask,
+                attention=attn_layers,
+                norm_1=norm_layers_1,
+                feed_forward=ffn_layers,
+                norm_2=norm_layers_2,
+            ):
+                residual = attention(value, value, attention_mask)
+                residual = self.drop(residual)
+                value = norm_1(value + residual)
+                residual = feed_forward(value, value_mask)
+                residual = self.drop(residual)
+                return norm_2(value + residual)
 
-            y = ffn_layers(x, x_mask)
-            y = self.drop(y)
-            x = norm_layers_2(x + y)
+            if self.checkpointing and self.training:
+                x = checkpoint(
+                    layer, x, x_mask, attn_mask, use_reentrant=False
+                )
+            else:
+                x = layer(x, x_mask, attn_mask)
         x = x * x_mask
         return x

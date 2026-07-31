@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import hashlib
 import datetime
@@ -27,31 +28,64 @@ def extract_small_model(
         pth_file = f"{name}.pth"
         final_pth_path = os.path.join(output_dir, pth_file)
 
-        ckpt = torch.load(path, map_location="cpu")
+        checkpoint_path = path if isinstance(path, str) else path.name
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        config_path = os.path.join(os.path.dirname(checkpoint_path), "config.json")
+        if not os.path.isfile(config_path):
+            raise FileNotFoundError(
+                f"Acoustic config.json not found beside checkpoint: {config_path}"
+            )
+        with open(config_path, "r", encoding="utf-8") as handle:
+            training_config = json.load(handle)
 
-        if "model" in ckpt:
-            ckpt = ckpt["model"]
+        ckpt = checkpoint.get("model", checkpoint.get("weight", checkpoint))
 
+        architecture = training_config.get("architecture", "Mel-VITS")
+        excluded = (
+            ("enc_q.", "content_speaker_classifier.", "mel_speaker_classifier.")
+            if architecture == "Mel-VITS"
+            else (
+                "global_posterior.",
+                "slow_posterior.",
+                "fast_posterior.",
+                "slow_prequant.",
+                "fast_prequant.",
+            )
+        )
         opt = OrderedDict(
             weight={
-                key: value.half() for key, value in ckpt.items() if "enc_q" not in key
+                key.removeprefix("module."): value.half()
+                for key, value in ckpt.items()
+                if not key.removeprefix("module.").startswith(excluded)
             }
         )
 
-        config_map = {
-            "40000": [1025, 32, 192, 192, 768, 2, 6, 3, 0, "1", [3, 7, 11], [[1, 3, 5]] * 3, [10, 10, 2, 2], 512, [16, 16, 4, 4], 109, 256, 40000],
-            "48000": [1025, 32, 192, 192, 768, 2, 6, 3, 0, "1", [3, 7, 11], [[1, 3, 5]] * 3, [12, 10, 2, 2] if version != "v1" else [10, 6, 2, 2, 2], 512, [24, 20, 4, 4] if version != "v1" else [16, 16, 4, 4, 4], 109, 256, 48000],
-            "32000": [513, 32, 192, 192, 768, 2, 6, 3, 0, "1", [3, 7, 11], [[1, 3, 5]] * 3, [10, 8, 2, 2] if version != "v1" else [10, 4, 2, 2, 2], 512, [20, 16, 4, 4] if version != "v1" else [16, 16, 4, 4, 4], 109, 256, 32000],
-        }
-        opt["config"] = config_map.get(str(sr), [])
+        model_config = dict(training_config["model"])
+        model_config.update(
+            spec_channels=128,
+            mel_channels=128,
+            segment_size=training_config["train"]["segment_size"] // 512,
+            sr=44100,
+            use_f0=True,
+        )
+        model_config["spk_embed_dim"] = opt["weight"]["emb_g.weight"].shape[0]
+        opt["model_config"] = model_config
+        opt["vocoder_config"] = training_config["vocoder"]
+        opt["config"] = [128, model_config["segment_size"], 44100]
 
         opt.update(
             {
-                "sr": sr,
-                "f0": int(pitch_guidance),
-                "version": version,
+                "sr": "44.1k",
+                "f0": 1,
+                "version": (
+                    "hybrid-fsq-1"
+                    if architecture == "Hybrid-FSQ"
+                    else "mel-vits-1"
+                ),
+                "architecture": architecture,
+                "vocoder": "pc-NSF-HiFiGAN",
                 "creation_date": datetime.datetime.now().isoformat(),
-                "speakers_id": opt["config"][15] if len(opt["config"]) > 15 else 1,
+                "speakers_id": model_config["spk_embed_dim"],
             }
         )
 
@@ -97,10 +131,10 @@ def extract_small_model_tab():
         with gr.Row():
             sr_input = gr.Dropdown(
                 label="Sample Rate of the model (sr)",
-                choices=[32000, 40000, 48000],
-                value=48000, 
+                choices=[44100],
+                value=44100,
                 type="value",
-                interactive=True,
+                interactive=False,
                 scale=1
             )
             pitch_guidance_input = gr.Checkbox(
@@ -113,9 +147,9 @@ def extract_small_model_tab():
             version_input = gr.Dropdown(
                 label="Version",
                 info="Select one that corresponds to your training.",
-                choices=['v1', 'v2'],
-                value='v2',
-                interactive=True,
+                choices=['mel-vits-1'],
+                value='mel-vits-1',
+                interactive=False,
                 scale=1
             )
 

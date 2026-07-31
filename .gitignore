@@ -19,6 +19,11 @@
 !rvc/models/pretraineds/custom/.gitkeep
 # Files to be ignored  ==========================
 env/
+rvc/models/vocoders/pc_nsf_hifigan_44.1k_hop512_128bin.pth
+env.python-incompatible-*/
+miniconda3/
+miniconda3.incomplete-*/
+.conda-pkgs/
 utmos/
 ffprobe.exe
 ffmpeg.exe

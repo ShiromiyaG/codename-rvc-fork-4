@@ -6,6 +6,7 @@ process_pids = []
 import shutil
 import sys
 import json
+import re
 from multiprocessing import cpu_count
 
 import gradio as gr
@@ -19,7 +20,12 @@ from core import (
     stop_train_script,
     early_save_stop,
 )
-from rvc.configs.config import get_gpu_info, get_number_of_gpus, max_vram_gpu, microarchitecture_capability_checker, check_if_fp16
+from rvc.configs.config import (
+    get_gpu_info,
+    get_number_of_gpus,
+    max_vram_gpu,
+    microarchitecture_capability_checker,
+)
 from rvc.lib.utils import format_title
 from tabs.train.descs import *
 
@@ -72,11 +78,28 @@ if not os.path.exists(datasets_path):
 datasets_path_relative = os.path.relpath(datasets_path, now_dir)
 
 def get_datasets_list():
-    return [
-        dirpath
-        for dirpath, _, filenames in os.walk(datasets_path_relative)
-        if any(filename.endswith(tuple(supported_audio_ext)) for filename in filenames)
-    ]
+    datasets = []
+    for dirpath, dirnames, filenames in os.walk(datasets_path_relative):
+        speaker_ids = []
+        for directory in dirnames:
+            match = re.fullmatch(r"(\d+)_.+", directory)
+            if match:
+                speaker_ids.append(int(match.group(1)))
+        is_multispeaker_root = (
+            len(speaker_ids) >= 2
+            and sorted(speaker_ids) == list(range(len(speaker_ids)))
+            and len(speaker_ids) == len(dirnames)
+        )
+        if is_multispeaker_root:
+            datasets.append(dirpath)
+            dirnames.clear()
+            continue
+        if any(
+            filename.lower().endswith(tuple(supported_audio_ext))
+            for filename in filenames
+        ):
+            datasets.append(dirpath)
+    return datasets
 
 def refresh_datasets():
     return {"choices": sorted(get_datasets_list()), "__type__": "update"}
@@ -265,23 +288,12 @@ def auto_enable_checkpointing():
         return False
 
 # Init state for certain options.
-initial_sample_rate_choices = ["32000", "40000", "48000"]
-initial_sample_rate = "48000"
-
-# Microarch. dependent features, options, functionalities etc.. Might expand in future.
-fp16_check = None
-has_ampere = microarchitecture_capability_checker()
+initial_sample_rate_choices = ["44100"]
+initial_sample_rate = "44100"
 
 initial_optimizer = "AdamW"
 initial_optimizer_choices = [("AdamW", "AdamW"), ("AdaBelief", "AdaBelief"), ("RAdam", "RAdam"), ("Ranger21", "Ranger21"), ("Sched-Free AdamW", "Sched-Free AdamW"), ("Sched-Free RAdam", "Sched-Free RAdam")]
-architecture_choices = ["RVC", "Fork"]
-fp16_check = True
-
-# FP16 checker
-if fp16_check:
-    if check_if_fp16():
-        initial_optimizer = "AdamW"
-        initial_optimizer_choices = [("AdamW", "AdamW"), ("AdaBelief", "AdaBelief"), ("RAdam", "RAdam"), ("Ranger21", "Ranger21"), ("Sched-Free AdamW", "Sched-Free AdamW"), ("Sched-Free RAdam", "Sched-Free RAdam")]
+architecture_choices = ["Mel-VITS", "Hybrid-FSQ"]
 
 
 # Train Tab
@@ -317,14 +329,17 @@ def train_tab():
                 )
                 architecture = gr.Radio(
                     label="Architecture",
-                    info="Choose the model architecture:\n- **RVC (V2):ㅤDefault/OG-Architecture - Compatible with all clients.**\n- **Fork:ㅤRefineGAN, RingFormer, APEX-GAN** - Only for this Fork. \n ( RingFormer / APEX-GAN require Ampere GPU or newer. )",
+                    info=(
+                        "Mel-VITS or the lighter stationary compositional "
+                        "ControlVAE + slow/fast FSQ model. Both render with pc-NSF."
+                    ),
                     choices=architecture_choices,
-                    value="RVC",
+                    value="Mel-VITS",
                     interactive=True,
                     visible=True,
                     key='architecture'
                 )
-                vocoder_arch = gr.State("hifi")
+                vocoder_arch = gr.State("melvits")
                 optimizer_choice_g = gr.Radio(
                     label="Optimizer (G)",
                     info=OPTIMIZER_INFO,
@@ -335,12 +350,12 @@ def train_tab():
                     key='optimizer_choice_g'
                 )
                 optimizer_choice_d = gr.Radio(
-                    label="Optimizer (D)",
+                    label="Legacy discriminator optimizer (unused)",
                     info="",
                     choices=initial_optimizer_choices,
                     value=initial_optimizer,
                     interactive=True,
-                    visible=True,
+                    visible=False,
                     key='optimizer_choice_d'
                 )
             with gr.Column():
@@ -354,9 +369,9 @@ def train_tab():
                 )
                 vocoder = gr.Radio(
                     label="Vocoder",
-                    info=VOCODER_INFO_RVC,
-                    choices=["HiFi-GAN"],
-                    value="HiFi-GAN",
+                    info="Shared frozen pc-NSF-HiFiGAN renderer.",
+                    choices=["pc-NSF-HiFiGAN"],
+                    value="pc-NSF-HiFiGAN",
                     interactive=False,
                     visible=True,
                     key='vocoder'
@@ -416,7 +431,7 @@ def train_tab():
                     label="Dataset Format",
                     info=DATASET_FORMAT_INFO,
                     choices=["WAV", "FLAC"],
-                    value="WAV",
+                    value="FLAC",
                     interactive=True,
                     scale=1.05,
                     key='dataset_format'
@@ -432,10 +447,10 @@ def train_tab():
                 )
                 use_smart_cutter = gr.Checkbox(
                     label="SmartCutter",
-                    info=SMARTCUTTER_INFO,
+                    info="Disabled: no native 44.1 kHz SmartCutter checkpoint is bundled.",
                     value=False,
-                    interactive=True,
-                    visible=True,
+                    interactive=False,
+                    visible=False,
                     key='use_smart_cutter'
                 )
                 normalization_mode = gr.Radio(
@@ -468,8 +483,8 @@ def train_tab():
                 )
                 chunk_len = gr.Slider(
                     0.5,
-                    30.0,
-                    3.0,
+                    8.0,
+                    6.0,
                     step=0.1,
                     label="Chunk length (sec)",
                     info="Length of the audio slice for 'Simple' method.",
@@ -480,7 +495,7 @@ def train_tab():
                 overlap_len = gr.Slider(
                     0.0,
                     0.4,
-                    0.3,
+                    0.1,
                     step=0.1,
                     label="Overlap length (sec)",
                     info="Length of the overlap between slices for 'Simple' method.",
@@ -584,6 +599,31 @@ def train_tab():
             interactive=True,
             key='include_mutes'
         )
+        cleanup_16k = gr.Checkbox(
+            label="Remove temporary 16 kHz audio after extraction",
+            info=(
+                "Saves disk space after ContentVec and F0 have been extracted. "
+                "The files are removed only when every expected output exists."
+            ),
+            value=True,
+            interactive=True,
+            key="cleanup_16k",
+        )
+        with gr.Row():
+            f0_min = gr.Slider(
+                20, 200, 30, step=5,
+                label="Minimum F0 (Hz)",
+                info="Lower bound used by pitch extraction and coarse-F0 quantization.",
+                interactive=True,
+                key="f0_min",
+            )
+            f0_max = gr.Slider(
+                600, 2400, 1600, step=50,
+                label="Maximum F0 (Hz)",
+                info="Raise this for soprano vocals or high harmonics.",
+                interactive=True,
+                key="f0_max",
+            )
         with gr.Row(visible=False) as embedder_custom:
             with gr.Accordion("Custom Embedder", open=True):
                 with gr.Row():
@@ -625,6 +665,10 @@ def train_tab():
                 embedder_model,
                 embedder_model_custom,
                 include_mutes,
+                cleanup_16k,
+                f0_min,
+                f0_max,
+                architecture,
             ],
             outputs=[extract_output_info],
         )
@@ -666,8 +710,8 @@ def train_tab():
             with gr.Row():
                 with gr.Column(scale=0.9):
                     save_only_latest_net_models = gr.Checkbox(
-                        label="Save Only Latest G/D",
-                        info="Don't disable it unless you need each 'G' and 'D' model saved every epoch. \n( It has its use for pretrains creation, but not for finetuning. )",
+                        label="Save Only Latest Acoustic Checkpoint",
+                        info="Keep only the latest full acoustic training checkpoint.",
                         value=True,
                         interactive=True,
                         key='save_only_latest_net_models'
@@ -694,11 +738,24 @@ def train_tab():
                         key='cleanup'
                     )
                     use_checkpointing = gr.Checkbox(
-                        label="Checkpointing",
-                        info="Enables memory-efficient training. \n This reduces the vram usage in exchange for slower training speed.",
-                        value=auto_enable_checkpointing,
+                        label="Full-model activation checkpointing",
+                        info=(
+                            "Checkpoints TextEncoder, PosteriorEncoder, flow and "
+                            "mel decoder to reduce VRAM at the cost of recomputation."
+                        ),
+                        value=True,
                         interactive=True,
                         key='use_checkpointing'
+                    )
+                    use_sdpa = gr.Checkbox(
+                        label="Memory-efficient SDPA attention",
+                        info=(
+                            "Uses Flash/memory-efficient scaled-dot-product attention "
+                            "when supported, while preserving relative-position terms."
+                        ),
+                        value=True,
+                        interactive=True,
+                        key="use_sdpa",
                     )
                     use_tf32 = gr.Checkbox(
                         label="use 'TF32' precision",
@@ -782,17 +839,17 @@ def train_tab():
                     )
                 with gr.Column(scale=0.9):
                     spectral_loss = gr.Radio(
-                        label="Spectral loss",
+                        label="Acoustic loss",
                         info=SPECTRAL_LOSS_INFO,
-                        choices=["L1 Mel Loss", "Multi-Scale Mel Loss", "Hybrid L1"],
-                        value="L1 Mel Loss",
-                        interactive=True,
+                        choices=["Mel + Delta + KL + Conversion"],
+                        value="Mel + Delta + KL + Conversion",
+                        interactive=False,
                         key='spectral_loss'
                     )
                     lr_scheduler_g = gr.Radio(
                         label="LR scheduler (G)",
                         info=LR_SCHEDULER_INFO,
-                        choices=["exp decay step", "exp decay epoch", "cosine annealing", "none"],
+                        choices=["exp decay step", "exp decay epoch", "cosine annealing epoch", "none"],
                         value="exp decay epoch",
                         interactive=True,
                         key='lr_scheduler_g'
@@ -800,9 +857,10 @@ def train_tab():
                     lr_scheduler_d = gr.Radio(
                         label="LR scheduler (D)",
                         info="",
-                        choices=["exp decay step", "exp decay epoch", "cosine annealing", "none"],
-                        value="exp decay epoch",
-                        interactive=True,
+                        choices=["none"],
+                        value="none",
+                        interactive=False,
+                        visible=False,
                         key='lr_scheduler_d'
                     )
                     exp_decay_gamma_g = gr.Radio(
@@ -819,27 +877,159 @@ def train_tab():
                         info="",
                         choices=["0.9999996", "0.999875", "0.999", "0.9975", "0.995"],
                         value="0.999875",
-                        interactive=True,
-                        visible=True,
+                        interactive=False,
+                        visible=False,
                         key='exp_decay_gamma_d'
                     )
                     use_kl_annealing = gr.Checkbox(
-                        label="KL loss annealing",
-                        info=KL_ANNEALING_INFO,
-                        value=False,
+                        label="Monotonic KL warmup",
+                        info="Raises the KL weight linearly from zero to one, then keeps it at one.",
+                        value=True,
                         interactive=True,
                         key='use_kl_annealing'
                     )
                     kl_annealing_cycle_duration = gr.Slider(
                         1,
                         100,
-                        3,
+                        20,
                         step=1,
-                        label="KL annealing cycle duration",
-                        info=KL_ANNEALING_CYCLE_INFO,
+                        label="KL warmup duration (epochs)",
+                        info="Number of epochs used for the one-way KL warmup.",
                         interactive=True,
-                        visible="hidden",
+                        visible=True,
                         key='kl_annealing_cycle_duration'
+                    )
+                    gradient_accumulation_steps = gr.Slider(
+                        1, 16, 1, step=1,
+                        label="Gradient accumulation steps",
+                        info="Simulates a larger batch while keeping GPU memory use lower.",
+                        interactive=True,
+                        key="gradient_accumulation_steps",
+                    )
+                    kl_free_bits = gr.Slider(
+                        0.0, 4.0, 0.5, step=0.05,
+                        label="KL free bits",
+                        info="Minimum KL budget in nats; helps prevent posterior collapse.",
+                        interactive=True,
+                        key="kl_free_bits",
+                    )
+                    waveform_loss_weight = gr.Slider(
+                        0.0, 5.0, 1.0, step=0.05,
+                        label="Frozen pc-NSF waveform loss weight",
+                        info="Set to zero to disable waveform-domain supervision.",
+                        interactive=True,
+                        key="waveform_loss_weight",
+                    )
+                    waveform_loss_interval = gr.Slider(
+                        1, 16, 4, step=1,
+                        label="Waveform loss interval",
+                        info="Apply the expensive multi-resolution STFT loss every N optimizer steps.",
+                        interactive=True,
+                        key="waveform_loss_interval",
+                    )
+                    waveform_loss_frames = gr.Slider(
+                        32, 384, 128, step=16,
+                        label="Waveform loss frames",
+                        info="Number of mel frames rendered by pc-NSF for each waveform-loss update.",
+                        interactive=True,
+                        key="waveform_loss_frames",
+                    )
+                    vocoder_validation_only = gr.Checkbox(
+                        label="Render validation previews with pc-NSF",
+                        info=(
+                            "Loads pc-NSF only during validation, saves generated/reference "
+                            "WAV files and mel PNGs, logs them to TensorBoard, then unloads it."
+                        ),
+                        value=False,
+                        interactive=True,
+                        key="vocoder_validation_only",
+                    )
+                    validation_vocoder_batches = gr.Slider(
+                        1, 16, 1, step=1,
+                        label="Validation preview samples",
+                        info=(
+                            "Number of deterministic validation examples saved per epoch. "
+                            "One example is taken from each of the first N batches."
+                        ),
+                        interactive=True,
+                        key="validation_vocoder_batches",
+                    )
+                    validation_ratio = gr.Slider(
+                        0.0, 0.2, 0.05, step=0.01,
+                        label="Validation split",
+                        info="Speaker-stratified held-out fraction. Zero disables validation.",
+                        interactive=True,
+                        key="validation_ratio",
+                    )
+                    ema_decay = gr.Slider(
+                        0.0, 0.9999, 0.999, step=0.0001,
+                        label="EMA decay",
+                        info="Exponential moving average used for validation and exported checkpoints.",
+                        interactive=True,
+                        key="ema_decay",
+                    )
+                    ema_in_ram = gr.Checkbox(
+                        label="Store EMA in system RAM",
+                        info="Saves GPU memory. EMA transfers run at the configured interval.",
+                        value=True,
+                        interactive=True,
+                        key="ema_in_ram",
+                    )
+                    ema_update_interval = gr.Slider(
+                        1, 100, 10, step=1,
+                        label="RAM EMA update interval",
+                        info="Uses a decay-adjusted approximation; larger values reduce PCIe traffic.",
+                        interactive=True,
+                        key="ema_update_interval",
+                    )
+                    branchwise_training = gr.Checkbox(
+                        label="Branchwise conversion and waveform training",
+                        info=(
+                            "Backpropagates SID conversion separately, then the "
+                            "acoustic branch, then a recomputed pc-NSF microbatch."
+                        ),
+                        value=True,
+                        interactive=True,
+                        key="branchwise_training",
+                    )
+                    waveform_microbatch_size = gr.Slider(
+                        1, 8, 1, step=1,
+                        label="Waveform branch microbatch",
+                        info="One is recommended for 8 GB GPUs.",
+                        interactive=True,
+                        key="waveform_microbatch_size",
+                    )
+                    speaker_balance_temperature = gr.Slider(
+                        0.0, 1.0, 0.5, step=0.05,
+                        label="Speaker sampling temperature",
+                        info="Zero is uniform by speaker; one follows the natural dataset distribution.",
+                        interactive=True,
+                        key="speaker_balance_temperature",
+                    )
+                    content_adversarial_weight = gr.Slider(
+                        0.0, 1.0, 0.1, step=0.01,
+                        label="Content speaker-adversarial weight",
+                        interactive=True,
+                        key="content_adversarial_weight",
+                    )
+                    speaker_classification_weight = gr.Slider(
+                        0.0, 2.0, 0.5, step=0.05,
+                        label="Decoded speaker-classification weight",
+                        interactive=True,
+                        key="speaker_classification_weight",
+                    )
+                    pitch_augmentation_probability = gr.Slider(
+                        0.0, 1.0, 0.2, step=0.05,
+                        label="Pitch augmentation probability",
+                        interactive=True,
+                        key="pitch_augmentation_probability",
+                    )
+                    pitch_augmentation_semitones = gr.Slider(
+                        0.0, 6.0, 2.0, step=0.25,
+                        label="Maximum pitch shift (semitones)",
+                        info="Audio, continuous F0, UV and coarse F0 remain aligned.",
+                        interactive=True,
+                        key="pitch_augmentation_semitones",
                     )
                     use_2_sample_kl = gr.Checkbox(
                         label="Use 2-sample KL",
@@ -849,8 +1039,8 @@ def train_tab():
                         key='use_2_sample_kl'
                     )
                     use_best_step = gr.Checkbox(
-                        label="Best in-epoch step",
-                        info="Tracks the step with lowest FM+Mel loss each epoch and uses those weights for eval preview and model extraction.",
+                        label="Save best epoch",
+                        info="Preserves checkpoints whenever the epoch acoustic loss improves.",
                         value=True,
                         interactive=True,
                         key='use_best_step'
@@ -859,7 +1049,8 @@ def train_tab():
                         label="Double Discriminator Update",
                         info="Runs the discriminator backward/update step twice per batch. Gives D more gradient signal on small datasets.",
                         value=False,
-                        interactive=True,
+                        interactive=False,
+                        visible=False,
                         key='double_d_updates'
                     )
             with gr.Column():
@@ -940,8 +1131,8 @@ def train_tab():
                         )
 
                 use_custom_lr = gr.Checkbox(
-                    label="Custom lr for gen and disc",
-                    info="Enables customization of learning rate for Generator and Discriminator.",
+                    label="Custom acoustic-model learning rate",
+                    info="Overrides the acoustic-model learning rate.",
                     value=False,
                     interactive=True,
                     key='use_custom_lr'
@@ -949,17 +1140,20 @@ def train_tab():
                 with gr.Column(visible=False) as custom_lr_settings:
                     with gr.Accordion("Custom lr settings"):
                         custom_lr_g = gr.Textbox(
-                            label="Learning rate for Generator",
+                            label="Learning rate for the acoustic model",
+                            value="1e-4",
                             placeholder="Default is 1e-4 / 0.0001",
-                            info="Define the lr for generator. **Accepts** both **decimals and scientific notation** e.g.: **1e-4** or **0.0001**. \n If using custom lr, **both for G/D must be provided.**",
+                            info="Accepts decimals or scientific notation, e.g. 1e-4.",
                             interactive=True,
                             key='custom_lr_g'
                         )
                         custom_lr_d = gr.Textbox(
                             label="Learning rate for Discriminator",
+                            value="1e-4",
                             placeholder="Default is 1e-4 / 0.0001",
                             info="Define the lr for discriminator. **Accepts** both **decimals and scientific notation** e.g.: **1e-4** or **0.0001**. \n If using custom lr, **both for G/D must be provided.**",
-                            interactive=True,
+                            interactive=False,
+                            visible=False,
                             key='custom_lr_d'
                         )
 
@@ -1044,6 +1238,25 @@ def train_tab():
                     use_2_sample_kl,
                     use_best_step,
                     double_d_updates,
+                    gradient_accumulation_steps,
+                    kl_free_bits,
+                    waveform_loss_weight,
+                    waveform_loss_interval,
+                    waveform_loss_frames,
+                    validation_ratio,
+                    ema_decay,
+                    speaker_balance_temperature,
+                    content_adversarial_weight,
+                    speaker_classification_weight,
+                    pitch_augmentation_probability,
+                    pitch_augmentation_semitones,
+                    ema_in_ram,
+                    ema_update_interval,
+                    branchwise_training,
+                    waveform_microbatch_size,
+                    use_sdpa,
+                    vocoder_validation_only,
+                    validation_vocoder_batches,
                 ],
                 outputs=[train_output_info],
             )
@@ -1123,104 +1336,28 @@ def train_tab():
             def toggle_visible_gamma(lr_scheduler):
                 return {"visible": lr_scheduler in ["exp decay step", "exp decay epoch"], "__type__": "update"}
 
-            def download_prerequisites():
-                    gr.Info(
-                        "Checking for prerequisites with pitch guidance... Missing files will be downloaded. If you already have them, this step will be skipped."
-                    )
-                    run_prerequisites_script(
-                        pretraineds_hifigan=True,
-                        models=False,
-                        exe=False,
-                    )
-                    gr.Info(
-                        "Prerequisites check complete. Missing files were downloaded, and you may now start preprocessing."
-                    )
-
             def toggle_visible_embedder_custom(embedder_model):
                 return {"visible": embedder_model == "custom", "__type__": "update"}
 
-            def toggle_architecture(architecture, vocoder_arch):
-                if architecture == "Fork":
-                    fork_vocoders = ["RefineGAN"]
-                    if has_ampere:
-                        fork_vocoders += ["RingFormer_v1", "RingFormer_v2", "APEX-GAN"]
-                    default_vocoder = "RefineGAN" if not has_ampere else "APEX-GAN"
-                    default_vocoder_arch = "refine" if not has_ampere else "apex_gan"
-                    return (
-                        {
-                            "choices": ["24000", "32000", "40000", "48000"],
-                            "__type__": "update",
-                            "value": "48000",
-                        },
-                        {
-                            "choices": fork_vocoders,
-                            "__type__": "update",
-                            "interactive": True,
-                            "value": default_vocoder,
-                            "info": VOCODER_INFO_FORK,
-                        },
-                        default_vocoder_arch,
-                    )
-                else:
-                    vocoder_arch_value = "hifi"
-                    return (
-                        {
-                            "choices": ["32000", "40000", "48000"],
-                            "__type__": "update",
-                            "value": "48000",
-                        },
-                        {
-                            "choices": ["HiFi-GAN"],
-                            "__type__": "update",
-                            "value": "HiFi-GAN",
-                            "interactive": False,
-                            "info": VOCODER_INFO_RVC,
-                        },
-                        vocoder_arch_value,
-                    )
+            def toggle_architecture(architecture, vocoder_arch=None):
+                config_arch = (
+                    "hybrid_fsq" if architecture == "Hybrid-FSQ" else "melvits"
+                )
+                return (
+                    {"choices": ["44100"], "__type__": "update", "value": "44100"},
+                    {
+                        "choices": ["pc-NSF-HiFiGAN"],
+                        "__type__": "update",
+                        "interactive": False,
+                        "value": "pc-NSF-HiFiGAN",
+                    },
+                    config_arch,
+                )
             def fork_vocoder_handler(architecture, vocoder_arch, vocoder):
-                if architecture == "Fork" and vocoder == "RefineGAN":
-                    vocoder_arch_value = "refine"
-                    return (
-                        {
-                            "choices": ["32000", "40000", "48000"],
-                            "__type__": "update",
-                            "value": "48000",
-                        },
-                        vocoder_arch_value,
-                    )
-                elif architecture == "Fork" and vocoder == "RingFormer_v1":
-                    vocoder_arch_value = "ringformer_v1"
-                    return (
-                        {
-                            "choices": ["24000", "32000", "40000", "48000"],
-                            "__type__": "update",
-                            "value": "48000",
-                        },
-                        vocoder_arch_value,
-                    )
-                elif architecture == "Fork" and vocoder == "RingFormer_v2":
-                    vocoder_arch_value = "ringformer_v2"
-                    return (
-                        {
-                            "choices": ["24000", "32000", "40000", "48000"],
-                            "__type__": "update",
-                            "value": "48000",
-                        },
-                        vocoder_arch_value,
-                    )
-                elif architecture == "Fork" and vocoder == "APEX-GAN":
-                    vocoder_arch_value = "apex_gan"
-                    return (
-                        {
-                            "choices": ["24000", "32000", "40000", "48000"],
-                            "__type__": "update",
-                            "value": "48000",
-                        },
-                        vocoder_arch_value,
-                    )
-                else:
-                    return gr.skip()
+                return (
+                    {"choices": ["44100"], "__type__": "update", "value": "44100"},
+                    "hybrid_fsq" if architecture == "Hybrid-FSQ" else "melvits",
+                )
 
             def update_noise_reduce_slider_visibility(noise_reduction):
                 if noise_reduction:
@@ -1242,7 +1379,7 @@ def train_tab():
                 process_effects, noise_reduction, clean_strength,
 
                 # Feature extract
-                f0_method, embedder_model, include_mutes,
+                f0_method, embedder_model, include_mutes, f0_min, f0_max,
                 embedder_model_custom,
 
                 # Training
@@ -1257,7 +1394,15 @@ def train_tab():
                 custom_lr_d, use_kl_annealing, kl_annealing_cycle_duration,
                 rolling_loss_steps, grad_clip_scheduling, grad_clip_steps_duration,
                 grad_clip_value_g_cap, grad_clip_value_d_cap, grad_clip_value_g_release,
-                grad_clip_value_d_release, index_algorithm, use_2_sample_kl, use_best_step, double_d_updates
+                grad_clip_value_d_release, index_algorithm, use_2_sample_kl, use_best_step,
+                double_d_updates, gradient_accumulation_steps, kl_free_bits,
+                waveform_loss_weight, waveform_loss_interval, waveform_loss_frames,
+                validation_ratio, ema_decay, speaker_balance_temperature,
+                content_adversarial_weight, speaker_classification_weight,
+                pitch_augmentation_probability, pitch_augmentation_semitones,
+                ema_in_ram, ema_update_interval, branchwise_training,
+                waveform_microbatch_size, use_sdpa, vocoder_validation_only,
+                validation_vocoder_batches
             ])
 
             def save_training_preset(inputs):
@@ -1397,19 +1542,14 @@ def train_tab():
                 outputs=[kl_annealing_cycle_duration]
             )
             grad_clip_scheduling.change(
-                fn=lambda v: [{"visible": True, "__type__": "update"} for _ in range(5)] if v else [{"visible": "hidden", "__type__": "update"} for _ in range(5)],
+                fn=lambda v: [{"visible": True, "__type__": "update"} for _ in range(3)] if v else [{"visible": "hidden", "__type__": "update"} for _ in range(3)],
                 inputs=[grad_clip_scheduling],
-                outputs=[grad_clip_steps_duration, grad_clip_value_g_cap, grad_clip_value_d_cap, grad_clip_value_g_release, grad_clip_value_d_release]
+                outputs=[grad_clip_steps_duration, grad_clip_value_g_cap, grad_clip_value_g_release]
             )
             lr_scheduler_g.change(
                 fn=toggle_visible_gamma,
                 inputs=[lr_scheduler_g],
                 outputs=[exp_decay_gamma_g],
-            )
-            lr_scheduler_d.change(
-                fn=toggle_visible_gamma,
-                inputs=[lr_scheduler_d],
-                outputs=[exp_decay_gamma_d],
             )
             multiple_gpu.change(
                 fn=toggle_visible,

@@ -450,7 +450,7 @@ def run_preprocess_script(
     normalization_mode: str = "post_rms",
     loading_resampling: str = "librosa",
     use_smart_cutter: bool = False,
-    dataset_format: str = "WAV",
+    dataset_format: str = "FLAC",
     rms_norm_db: float = -18.0
 ):
     preprocess_script_path = os.path.join("rvc", "train", "preprocess", "preprocess.py")
@@ -478,7 +478,7 @@ def run_preprocess_script(
             ],
         ),
     ]
-    subprocess.run(command)
+    subprocess.run(command, check=True)
     return f"Model {model_name} preprocessed successfully."
 
 
@@ -493,8 +493,15 @@ def run_extract_script(
     embedder_model: str,
     embedder_model_custom: str = None,
     include_mutes: int = 2,
+    cleanup_16k: bool = True,
+    f0_min: float = 30.0,
+    f0_max: float = 1600.0,
+    architecture: str | None = None,
 ):
-
+    if architecture is not None:
+        vocoder_arch = (
+            "hybrid_fsq" if architecture == "Hybrid-FSQ" else "melvits"
+        )
     model_path = os.path.join(logs_path, model_name)
     extract = os.path.join("rvc", "train", "extract", "extract.py")
 
@@ -513,11 +520,14 @@ def run_extract_script(
                 embedder_model,
                 embedder_model_custom,
                 include_mutes,
+                cleanup_16k,
+                f0_min,
+                f0_max,
             ],
         ),
     ]
 
-    subprocess.run(command_1)
+    subprocess.run(command_1, check=True)
 
     return f"Model {model_name} extracted successfully."
 
@@ -540,21 +550,21 @@ def run_train_script(
     custom_pretrained: bool = False,
     g_pretrained_path: str = None,
     d_pretrained_path: str = None,
-    vocoder: str = "HiFi-GAN",
-    architecture: str = "RVC",
+    vocoder: str = "pc-NSF-HiFiGAN",
+    architecture: str = "Mel-VITS",
     optimizer_choice_g: str = "AdamW",
     optimizer_choice_d: str = "AdamW",
-    use_checkpointing: bool = False,
+    use_checkpointing: bool = True,
     use_tf32: bool = False,
     use_benchmark: bool = True,
     use_deterministic: bool = False,
-    spectral_loss: str = "L1 Mel Loss",
+    spectral_loss: str = "Mel + Delta + KL + Conversion",
     lr_scheduler_g: str = "exp decay step",
     lr_scheduler_d: str = "exp decay step",
     exp_decay_gamma_g: str = "0.999875",
     exp_decay_gamma_d: str = "0.999875",
-    use_kl_annealing: bool = False,
-    kl_annealing_cycle_duration: int = 3,
+    use_kl_annealing: bool = True,
+    kl_annealing_cycle_duration: int = 20,
     rolling_loss_steps: int = 50,
     grad_clip_scheduling: bool = False,
     grad_clip_steps_duration: int = 0,
@@ -568,8 +578,33 @@ def run_train_script(
     use_2_sample_kl: bool = False,
     use_best_step: bool = True,
     double_d_updates: bool = False,
+    gradient_accumulation_steps: int = 1,
+    kl_free_bits: float = 0.5,
+    waveform_loss_weight: float = 1.0,
+    waveform_loss_interval: int = 4,
+    waveform_loss_frames: int = 128,
+    validation_ratio: float = 0.05,
+    ema_decay: float = 0.999,
+    speaker_balance_temperature: float = 0.5,
+    content_adversarial_weight: float = 0.1,
+    speaker_classification_weight: float = 0.5,
+    pitch_augmentation_probability: float = 0.2,
+    pitch_augmentation_semitones: float = 2.0,
+    ema_in_ram: bool = True,
+    ema_update_interval: int = 10,
+    branchwise_training: bool = True,
+    waveform_microbatch_size: int = 1,
+    use_sdpa: bool = True,
+    vocoder_validation_only: bool = False,
+    validation_vocoder_batches: int = 1,
+    use_fp16: bool | None = None,
+    use_torch_compile: bool = False,
 ):
     global training_process
+    if use_fp16 is None:
+        from rvc.configs.config import check_if_fp16
+
+        use_fp16 = check_if_fp16()
 
     if pretrained == True:
         from rvc.lib.tools.pretrained_selector import pretrained_selector
@@ -629,7 +664,28 @@ def run_train_script(
                 custom_lr_d,
                 use_2_sample_kl,
                 use_best_step,
-                double_d_updates
+                double_d_updates,
+                use_torch_compile,
+                use_fp16,
+                gradient_accumulation_steps,
+                kl_free_bits,
+                waveform_loss_weight,
+                waveform_loss_interval,
+                waveform_loss_frames,
+                validation_ratio,
+                ema_decay,
+                speaker_balance_temperature,
+                content_adversarial_weight,
+                speaker_classification_weight,
+                pitch_augmentation_probability,
+                pitch_augmentation_semitones,
+                ema_in_ram,
+                ema_update_interval,
+                branchwise_training,
+                waveform_microbatch_size,
+                use_sdpa,
+                vocoder_validation_only,
+                validation_vocoder_batches,
             ],
         ),
     ]
@@ -1864,7 +1920,7 @@ def parse_arguments():
         "--sample_rate",
         type=int,
         help="Target sampling rate for the audio data.",
-        choices=[24000, 32000, 40000, 48000],
+        choices=[44100],
         required=True,
     )
     preprocess_parser.add_argument(
@@ -1906,15 +1962,15 @@ def parse_arguments():
         "--chunk_len",
         type=float,
         help="Chunk length.",
-        choices=[i * 0.5 for i in range(1, 11)],
-        default=3.0,
+        choices=[i * 0.5 for i in range(1, 17)],
+        default=6.0,
     )
     preprocess_parser.add_argument(
         "--overlap_len",
         type=float,
         help="Overlap length.",
         choices=[0.0, 0.1, 0.2, 0.3, 0.4],
-        default=0.3,
+        default=0.1,
     )
     preprocess_parser.add_argument(
         "--normalization_mode",
@@ -1936,6 +1992,13 @@ def parse_arguments():
         choices=[True, False],
         help="Enable SmartCutter silence-truncation during preprocessing.",
         default=False,
+    )
+    preprocess_parser.add_argument(
+        "--dataset_format",
+        type=str,
+        choices=["WAV", "FLAC"],
+        help="Storage format for preprocessed audio.",
+        default="FLAC",
     )
     # Parser for 'extract' mode
     extract_parser = subparsers.add_parser(
@@ -1973,7 +2036,7 @@ def parse_arguments():
         "--sample_rate",
         type=int,
         help="Target sampling rate for the audio data.",
-        choices=[24000, 32000, 40000, 48000],
+        choices=[44100],
         required=True,
     )
     extract_parser.add_argument(
@@ -1981,13 +2044,10 @@ def parse_arguments():
         type=str,
         help="Choose the vocoder architecture",
         choices=[
-            "hifi",
-            "refine",
-            "ringformer_v1",
-            "ringformer_v2",
-            "apex_gan",
+            "melvits",
+            "hybrid_fsq",
         ],
-        default="hifi",
+        default="melvits",
     )
     extract_parser.add_argument(
         "--embedder_model",
@@ -2017,6 +2077,15 @@ def parse_arguments():
         choices=range(0, 11),
         default=2,
     )
+    extract_parser.add_argument(
+        "--cleanup_16k",
+        type=lambda x: bool(strtobool(x)),
+        choices=[True, False],
+        help="Remove temporary 16 kHz audio after successful extraction.",
+        default=True,
+    )
+    extract_parser.add_argument("--f0_min", type=float, default=30.0)
+    extract_parser.add_argument("--f0_max", type=float, default=1600.0)
 
     # Parser for 'train' mode
     train_parser = subparsers.add_parser("train", help="Train an RVC model.")
@@ -2027,15 +2096,15 @@ def parse_arguments():
         "--vocoder",
         type=str,
         help="Vocoder name",
-        choices=["HiFi-GAN", "APEX-GAN", "RefineGAN", "RingFormer_v1", "RingFormer_v2"],
-        default="HiFi-GAN",
+        choices=["pc-NSF-HiFiGAN"],
+        default="pc-NSF-HiFiGAN",
     )
     train_parser.add_argument(
         "--architecture",
         type=str,
         help="Choose the architecture. ( Only RVC is universal, others need their respective forks / frameworks.",
-        choices=["RVC", "Fork"],
-        default="RVC",
+        choices=["Mel-VITS", "Hybrid-FSQ"],
+        default="Mel-VITS",
     )  
     train_parser.add_argument(
         "--optimizer_choice_g",
@@ -2056,7 +2125,79 @@ def parse_arguments():
         type=lambda x: bool(strtobool(x)),
         choices=[True, False],
         help="Enables usage of checkpointing.",
+        default=True,
+    )
+    train_parser.add_argument(
+        "--use_torch_compile",
+        type=lambda x: bool(strtobool(x)),
+        choices=[True, False],
+        help="Compile the acoustic model on Linux with torch.compile.",
         default=False,
+    )
+    train_parser.add_argument(
+        "--use_fp16",
+        type=lambda x: bool(strtobool(x)),
+        choices=[True, False],
+        help=(
+            "Override the precision configured in Settings. If omitted, the "
+            "global precision setting is used."
+        ),
+        default=None,
+    )
+    train_parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    train_parser.add_argument("--kl_free_bits", type=float, default=0.5)
+    train_parser.add_argument("--waveform_loss_weight", type=float, default=1.0)
+    train_parser.add_argument("--waveform_loss_interval", type=int, default=4)
+    train_parser.add_argument("--waveform_loss_frames", type=int, default=128)
+    train_parser.add_argument("--validation_ratio", type=float, default=0.05)
+    train_parser.add_argument("--ema_decay", type=float, default=0.999)
+    train_parser.add_argument(
+        "--speaker_balance_temperature", type=float, default=0.5
+    )
+    train_parser.add_argument(
+        "--content_adversarial_weight", type=float, default=0.1
+    )
+    train_parser.add_argument(
+        "--speaker_classification_weight", type=float, default=0.5
+    )
+    train_parser.add_argument(
+        "--pitch_augmentation_probability", type=float, default=0.2
+    )
+    train_parser.add_argument(
+        "--pitch_augmentation_semitones", type=float, default=2.0
+    )
+    train_parser.add_argument(
+        "--ema_in_ram",
+        type=lambda x: bool(strtobool(x)),
+        choices=[True, False],
+        default=True,
+    )
+    train_parser.add_argument("--ema_update_interval", type=int, default=10)
+    train_parser.add_argument(
+        "--branchwise_training",
+        type=lambda x: bool(strtobool(x)),
+        choices=[True, False],
+        default=True,
+    )
+    train_parser.add_argument("--waveform_microbatch_size", type=int, default=1)
+    train_parser.add_argument(
+        "--use_sdpa",
+        type=lambda x: bool(strtobool(x)),
+        choices=[True, False],
+        default=True,
+    )
+    train_parser.add_argument(
+        "--vocoder_validation_only",
+        type=lambda x: bool(strtobool(x)),
+        choices=[True, False],
+        default=False,
+        help="Render a small validation WAV/mel preview set with pc-NSF.",
+    )
+    train_parser.add_argument(
+        "--validation_vocoder_batches",
+        type=int,
+        default=1,
+        help="Number of validation preview samples saved per epoch.",
     )
     train_parser.add_argument(
         "--custom_lr_g",
@@ -2069,13 +2210,6 @@ def parse_arguments():
         type=float,
         help="Custom learning rate for discriminator.",
         default=1e-4,
-    )
-    train_parser.add_argument(
-        "--use_2_sample_kl",
-        type=lambda x: bool(strtobool(x)),
-        choices=[True, False],
-        help="uses 2 samples to calculate KL Loss.",
-        default=False,
     )
     train_parser.add_argument(
         "--use_2_sample_kl",
@@ -2130,7 +2264,7 @@ def parse_arguments():
         "--sample_rate",
         type=int,
         help="Sampling rate of the training data.",
-        choices=[24000, 32000, 40000, 48000],
+        choices=[44100],
         required=True,
     )
     train_parser.add_argument(
@@ -2212,23 +2346,23 @@ def parse_arguments():
     train_parser.add_argument(
         "--spectral_loss",
         type=str,
-        choices=["L1 Mel Loss", "Multi-Scale Mel Loss", "Hybrid L1"],
-        help="Available types of spectral loss functions. ",
-        default="L1 Mel Loss",
+        choices=["Mel + Delta + KL + Conversion"],
+        help="Fixed Mel-VITS acoustic objective.",
+        default="Mel + Delta + KL + Conversion",
     )
     train_parser.add_argument(
         "--lr_scheduler_g",
         type=str,
-        choices=["exp decay step", "exp decay epoch", "cosine annealing", "none"],
-        help="Pick a LR scheduler for generator. Viable: exp decay step, exp decay epoch, cosine annealing, none ",
-        default="exp decay",
+        choices=["exp decay step", "exp decay epoch", "cosine annealing epoch", "none"],
+        help="Learning-rate scheduler for Mel-VITS.",
+        default="exp decay epoch",
     )
     train_parser.add_argument(
         "--lr_scheduler_d",
         type=str,
         choices=["exp decay step", "exp decay epoch", "cosine annealing epoch", "none"],
         help="Pick a LR scheduler for discriminator. Viable: exp decay step, exp decay epoch, cosine annealing, none ",
-        default="exp decay step",
+        default="none",
     )
     train_parser.add_argument(
         "--exp_decay_gamma_g",
@@ -2248,14 +2382,14 @@ def parse_arguments():
         "--use_kl_annealing",
         type=lambda x: bool(strtobool(x)),
         choices=[True, False],
-        help="Whether you wanna use kl annealing.",
-        default=False,
+        help="Enable a monotonic KL warmup.",
+        default=True,
     )
     train_parser.add_argument(
         "--kl_annealing_cycle_duration",
         type=int,
-        help="Duration of kl annealing phase (in epochs).",
-        default=3,
+        help="Duration of the monotonic KL warmup (in epochs).",
+        default=20,
     )
     train_parser.add_argument(
         "--rolling_loss_steps",
@@ -2601,6 +2735,7 @@ def main():
                 normalization_mode=args.normalization_mode,
                 loading_resampling=args.loading_resampling,
                 use_smart_cutter=args.use_smart_cutter,
+                dataset_format=args.dataset_format,
             )
         elif args.mode == "extract":
             run_extract_script(
@@ -2613,6 +2748,9 @@ def main():
                 embedder_model=args.embedder_model,
                 embedder_model_custom=args.embedder_model_custom,
                 include_mutes=args.include_mutes,
+                cleanup_16k=args.cleanup_16k,
+                f0_min=args.f0_min,
+                f0_max=args.f0_max,
             )
         elif args.mode == "train":
             run_train_script(
@@ -2655,6 +2793,32 @@ def main():
                 use_custom_lr=args.use_custom_lr,
                 custom_lr_g=args.custom_lr_g,
                 custom_lr_d=args.custom_lr_d,
+                use_kl_annealing=args.use_kl_annealing,
+                kl_annealing_cycle_duration=args.kl_annealing_cycle_duration,
+                use_2_sample_kl=args.use_2_sample_kl,
+                use_best_step=args.use_best_step,
+                double_d_updates=args.double_d_updates,
+                use_fp16=args.use_fp16,
+                use_torch_compile=args.use_torch_compile,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                kl_free_bits=args.kl_free_bits,
+                waveform_loss_weight=args.waveform_loss_weight,
+                waveform_loss_interval=args.waveform_loss_interval,
+                waveform_loss_frames=args.waveform_loss_frames,
+                validation_ratio=args.validation_ratio,
+                ema_decay=args.ema_decay,
+                speaker_balance_temperature=args.speaker_balance_temperature,
+                content_adversarial_weight=args.content_adversarial_weight,
+                speaker_classification_weight=args.speaker_classification_weight,
+                pitch_augmentation_probability=args.pitch_augmentation_probability,
+                pitch_augmentation_semitones=args.pitch_augmentation_semitones,
+                ema_in_ram=args.ema_in_ram,
+                ema_update_interval=args.ema_update_interval,
+                branchwise_training=args.branchwise_training,
+                waveform_microbatch_size=args.waveform_microbatch_size,
+                use_sdpa=args.use_sdpa,
+                vocoder_validation_only=args.vocoder_validation_only,
+                validation_vocoder_batches=args.validation_vocoder_batches,
             )
         elif args.mode == "index":
             run_index_script(

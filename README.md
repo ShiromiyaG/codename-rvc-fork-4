@@ -1,157 +1,181 @@
-# <p align="center">` Codename-RVC-Fork 🍇 4 ` </p>
-<div align="center">
-  
-` " The spiritual successor to Mangio-RVC-Fork "`
+# Codename RVC Fork 4 — Mel-VITS + pc-NSF-HiFiGAN
 
-</div>
+This variant uses a single conversion architecture:
 
-#### <p align="center"> ✨ Originally based on Applio, evolved into its own independent project ✨</p>
+```text
+source audio → ContentVec + F0 → speaker-conditioned Mel-VITS
+             → 128-bin log-mel → frozen pc-NSF-HiFiGAN → waveform
+```
 
-<p align="center">
-  ㅤㅤTo stay up-to-date with advancements, hang out or get supportㅤㅤ<br>
-  ㅤㅤyou can join my 👇 discord server 👇 ( RVC / AI Audio friendly )ㅤㅤ
-</p>
+The trainable model contains a content encoder, VAE posterior, normalizing
+flow, speaker embedding, and mel decoder. The vocoder is shared by all models,
+does not receive gradients, and is not included in voice checkpoints.
 
-<p align="center">
-  <!-- GitHub Release Version -->
-  <a href="https://github.com/codename0og/codename-rvc-fork-4/releases" target="_blank">
-    <img src="https://img.shields.io/github/v/release/codename0og/codename-rvc-fork-4?include_prereleases&style=flat-for-the-badge&color=8a2be2" alt="Latest Release">
-  </a>
-  
-  <!-- Discord Invite -->
-  <a href="https://discord.gg/ymfdwx5jwZ" target="_blank">
-    <img src="https://img.shields.io/badge/Discord-Join_Sanctuary-7289da?style=flat-for-the-badge&logo=discord&logoColor=white" alt="Discord Online">
-  </a>
-  
-  <!-- GitHub Repo Size -->
-  <img src="https://img.shields.io/github/repo-size/codename0og/codename-rvc-fork-4?style=flat-for-the-badge&color=333" alt="Repository Size">
+## Acoustic format
 
-  <!-- License -->
-  <img src="https://img.shields.io/github/license/codename0og/codename-rvc-fork-4?style=flat-for-the-badge&color=success" alt="License">
-</p>
-ㅤ
+- sample rate: 44,100 Hz
+- FFT/window: 2048
+- hop: 512
+- mel bins: 128
+- frequency range: 40–16,000 Hz
+- compression: natural logarithm
 
-# ⚠️ㅤ**IMPORTANT** ㅤ⚠️
-<br/>
- 
-`1. Datasets must be processed properly:`
-- In case of wild dynamic range or inconsistent recording sessions, peak / rms compression is advised.
-- silence-truncating your dataset ( Or at least ensure the gaps / silences aren't too crazy or inconsistent. ) 
+ContentVec and F0 are interpolated to the exact mel time grid.
 
-`2. Experimental things are experimental for a reason:`
-- If you don't understand what it does, what it brings or how it works? preferably don't use it or ask on my server.
-- Certain features / currently chosen params can be potentially unstable or broken and are a subject to change.
-- Some experimental things can get removed at any point if deemed too unstable / not worth the risk.
+## Dataset preprocessing and storage
 
-`3. Clarification on pretrained models, architectures & vocoders:`
-- **Each Architecture/Vocoder requires own dedicated pretrains.**
-##### 1. HiFi-GAN ( RVC architecture ):
-- The original architecture. ( HiFi-GAN + MPD, MSD )
-- Its pretrained models are auto-downloaded during the first launch.
-- Available for sample rates: 48, 40 and 32khz. <br/><br/>`Models made with this arch ARE cross-compatible: RVC, Applio and codename-rvc-fork-4.` 
-##### 2. RefineGAN ( Fork architecture ):
-- Custom architecture. ( RefineGAN + MPD, MSD, MRD )
-- **There are no available pretrained models for it yet. ( Applio's one is incompatible. )**<br/><br/>`Models made with this arch ARE NOT cross-compatible: codename-rvc-fork-4`
-##### 3. RingFormer ( Fork architecture ):
-- This architecture remains in question ~ Might get removed, might get updated.
-##### 4. APEX-GAN ( Fork architecture ):
-- Custom architecture. ( APEX-GAN + MPD, SBD, MRD )
-- **There are no available pretrained models for it yet. Currently in "trials+polishing" phase.**
-- Supported sample rates: 24, 32, 40 and 48khz.<br/><br/>`Models made with this arch ARE NOT cross-compatible: codename-rvc-fork-4` 
-<br/>
+The default profile is optimized for Mel-VITS context and disk usage:
 
-# **Things exclusive to my fork:**
- 
-- F0 / Pitch curve editor for inference integrated in the UI.
- 
-- Many available optimizers.  ` ( AdamW, AdaBelief, RAdam, Ranger21, Schedule-Free AdamW/RAdam ) `
- 
-- Decoupled G/D Tweaking: Schedulers, Optims, Learning Rates etc.
- 
-- Support for Multi-scale L1 Mel, classic L1 mel and Hybrid ( L1 Mel + MS-STFT ) spectral losses.
- 
-- Extras such as: Kl loss annealing, 2-sample KL loss calculation, Double-Update for Discriminator and more..
- 
-- Support for the following vocoders: HiFi-GAN-NSF, Refine-GAN, RingFormer, APEX-GAN.<br/>
-`( And potentially more in future ..)`
- 
-- Support for many discriminator stacks: Avocodo's, mps/msd/mrd, mpd/sbd/mrd, hmddd and more..<br/>
-`( Naturally they require pretrained models. )`
- 
-- Much better loss logging handling.<br/>
-`( Per-epoch-avg loss as the main one, rolling avg as the long-term one. )`
- 
-- More dataset-preprocessing options and generally simplified workflow ( RMS norm has dbFS auto-correction. ).
- 
-- Lots of deeper training-related tweaks directly in the ui.<br/>
-` ( lr for g/d, schedulers, linear warmup, kl loss annealing and much more .. )`
- 
-- Direct integration of `SmartCutter` - My own ml-based silence-truncation approach.
-<br/>[More info](https://github.com/codename0og/SmartCutter)
- 
-- Various speed, performance and QOL improvements.
- 
-- A much cleaner, continuously evolving codebase compared to existing alternatives.
- 
-**Any new / experimental features are always described in releases so, feel free to check it out there.**
-  
- 
- 
- <br/>
- 
- 
-✨ to-do list ✨
-> - Need to figure out a better / more appropriate validation..
- 
-💡 Ideas / concepts 💡
-> - Upscaling / Refinement for Inference output and for datasets.
-> - If you have some nice ideas, feel free to share 'em or PR!
- 
- 
-### ❗ For contact, please join my discord server ❗
- <br/>
- <br/>
+- 6-second slices with 0.1 seconds of overlap;
+- FLAC PCM24 storage for 44.1 kHz ground-truth audio;
+- 384-frame training crops (about 4.46 seconds);
+- ContentVec features stored as float16 and restored to float32 when loaded;
+- continuous F0 stored as float32 and coarse F0 stored as uint8;
+- temporary 16 kHz audio removed only after all feature and F0 files have
+  been verified.
 
-## Getting Started:
+The extraction panel provides an option to retain the temporary 16 kHz audio
+when repeated feature extraction is required. Running preprocessing again
+clears previously generated audio, feature, and F0 directories so stale files
+cannot be mixed with a new slicing configuration.
+The F0 extraction range is configurable (30–1,600 Hz by default) and is saved
+into the experiment config so training uses the same coarse-F0 mapping.
 
-### 1. Installation of the Fork
+## Linux installation
 
-Run the installation script:
+```bash
+chmod +x run-install.bat run-fork.bat
+./run-install.bat
+```
 
-- Double-click `run-install.bat`.
+The `.bat` extension is kept for compatibility with the project layout, but
+both files are Bash scripts for Linux.
 
-### 2. Running the Fork
+The installer downloads Miniconda to `miniconda3/` inside the repository and
+creates `env/` as a Conda environment with Python 3.10.18. It does not use the
+system Python. If it finds a `venv`-based `env/` or one using another Python
+version, it preserves it with the `.python-incompatible-<date>` suffix before
+creating the correct environment. The launcher runs the application with
+`conda run`.
 
-Use the run script:
+The pc-NSF-HiFiGAN checkpoint is downloaded automatically from RIFT-SVC when
+the interface starts. It is stored at
+`rvc/models/vocoders/pc_nsf_hifigan_44.1k_hop512_128bin.pth`. The compatible
+`config.json` is already in the same directory.
 
-- Double-click `run-fork.bat`.
- 
-This launches the Gradio interface in your default browser.
+Start the interface:
 
-### 3. Optional: TensorBoard Monitoring
- 
-To monitor training or visualize data:
-- Drag the 'eval' folder onto "run_tensorboard_in_model_folder.bat" ( you can copy it from logs dir -> your model's dir ).
-</br></br>If it doesn't work for you due to blocked port, open up CMD with admin rights and use this command:</br>`` netsh advfirewall firewall add rule name="Open Port 25565" dir=in action=allow protocol=TCP localport=25565 ``</br></br>
-- Alternatively if the above method fails, run the tensorboard manually in cmd:</br> ``tensorboard --logdir="path/to/your/model/folder" --bind_all``</br>
-(PS. Make sure you have tensorboard installed. ( in cmd:  pip install tensorboard )
- 
-## Referenced projects
-+ [Retrieval-based-Voice-Conversion-WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
-+ [Applio](https://github.com/IAHispano/Applio)
-+ [RingFormer](https://github.com/seongho608/RingFormer)
-+ [RiFornet](https://github.com/Respaired/RiFornet_Vocoder)
-+ [BigVGAN](https://github.com/NVIDIA/BigVGAN/tree/main)
-+ [Pytorch-Snake](https://github.com/falkaer/pytorch-snake)
-+ [wavehax](https://github.com/chomeyama/wavehax)
-+ [auraloss](https://github.com/csteinmetz1/auraloss/tree/main)
-+ [Avocodo](https://github.com/ncsoft/avocodo)
-+ [HiFTNet](https://github.com/yl4579/HiFTNet)
- 
-## Disclaimer
-``The creators, maintainers, and contributors of the original Applio repository, as well as the creator of this fork (Codename;0), which is based on Applio, and the contributors of this fork, are not liable for any legal issues, damages, or consequences arising from the use of this repository or any content generated from it. By using this fork, you acknowledge and accept the following terms:``
- 
-- The use of this fork is at your own risk.
-- This repository is intended solely for educational, and experimental purposes.
-- Any misuse, including but not limited to illegal activities or violation of third-party rights, <br/> is not the responsibility of the original creators, contributors, or this fork’s maintainer.
-- You willingly agree to comply with this repository's [Terms of Use](https://github.com/codename0og/codename-rvc-fork-4/blob/main/TERMS_OF_USE.md)
+```bash
+./run-fork.bat
+```
+
+To enable `torch.compile` on Linux:
+
+```bash
+RVC_TORCH_COMPILE=1 ./run-fork.bat
+```
+
+You can also set:
+
+- `RVC_PC_NSF_CHECKPOINT`: path to the exported generator;
+- `RVC_PC_NSF_CONFIG`: path to the vocoder JSON file;
+- `TORCH_INDEX_URL`: PyTorch package index used by the installer;
+- `PYTHON_VERSION`: Python version used to create the environment;
+- `MINICONDA_VERSION`: Miniconda release to download (`latest` by default).
+
+## Training
+
+Training retains AdamW, AdaBelief, RAdam, Ranger21, Schedule-Free AdamW/RAdam,
+warmup, exponential decay, cosine annealing, AMP, TF32, gradient checkpointing,
+gradient clipping, two-sample KL, DDP, and checkpoints. It also supports
+gradient accumulation, monotonic KL warmup, configurable KL free bits,
+speaker-balanced batches, a speaker-stratified validation split, and EMA
+weights for validation and export.
+
+For memory-constrained GPUs, EMA can be stored in system RAM and updated with a
+decay-adjusted interval. Branchwise waveform training completes the acoustic
+backward first, then recomputes only a configurable microbatch for the frozen
+pc-NSF/STFT objective. The vocoder and STFT branches also use activation
+recomputation, reducing peak VRAM without shortening the 384-frame context.
+The SID conversion cycle is a separate branch as well, so its graph is
+released before the reconstruction branch is built.
+
+Full-model checkpointing covers every TextEncoder transformer layer, the
+PosteriorEncoder WaveNet, each normalizing-flow coupling layer, and the mel
+decoder. The attention path uses PyTorch SDPA when available, allowing CUDA to
+select FlashAttention or its memory-efficient kernel. Relative-key and
+relative-value terms are preserved; relative values are recomputed in query
+chunks instead of retaining a full attention-probability tensor.
+Training reports peak allocated/reserved CUDA memory in the console and under
+the TensorBoard `memory/` group, resetting the peak counters each epoch.
+
+FP16 automatic mixed precision is enabled by default on CUDA for both training
+and inference. Model weights remain in FP32 during training, while autocast
+uses FP16 for supported kernels and keeps Gaussian sampling, KL, and acoustic
+loss accumulation in FP32. Dynamic loss scaling is used to protect gradients.
+CPU execution automatically falls back to FP32 without changing the configured
+default. The precision selector in the Settings tab is the single source of
+truth for the interface; CLI training can override it with `--use_fp16`.
+
+The frozen pc-NSF-HiFiGAN participates in training as a differentiable
+renderer: its weights never change, but a multi-resolution waveform STFT loss
+can send gradients back to the predicted mel. The interval and rendered frame
+count are configurable to control VRAM and training time.
+
+Alternatively, `Use pc-NSF only during validation` keeps the vocoder entirely
+out of the training loop. It is loaded lazily for a configurable number of
+held-out waveform-metric batches and immediately unloaded afterward. In this
+mode Mel-VITS is optimized only by its acoustic, KL, conversion, and speaker
+objectives.
+
+The Linux launchers set
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` by default to reduce CUDA
+allocator fragmentation. An explicitly supplied environment value is
+preserved.
+
+In addition to mel reconstruction, multi-speaker batches can perform SID
+swapping and cycle consistency in content space. Gradient-reversal speaker
+classification removes identity leakage from content, while decoded-mel
+classification reinforces the requested target identity. Continuous log-F0
+and an explicit voiced/unvoiced channel complement the coarse F0 embedding.
+Optional pitch augmentation shifts the waveform and both F0 representations
+together. Multi-speaker-only objectives are automatically harmless for a
+single-speaker dataset.
+
+Checkpoints from the previous waveform architectures are incompatible and are
+explicitly rejected.
+
+## Hybrid-FSQ acoustic alternative
+
+The training tab offers **Hybrid-FSQ** alongside **Mel-VITS**. Both predict the
+same 128-bin, 44.1 kHz / hop-512 mel representation rendered by the bundled
+pc-NSF-HiFiGAN. Hybrid-FSQ uses:
+
+- an architecturally coarse deterministic mel path;
+- an 8-dimensional rate-controlled global Gaussian latent constrained to a
+  time-constant low-rank DCT correction;
+- parallel slow `[8, 8, 8]` and fast `[5, 5, 5]` FSQ paths;
+- a two-component crop-level mixture-of-products prior.
+
+Training is end-to-end in one phase and does not load the waveform vocoder.
+The first run creates `hybrid_stats.pt` and `hybrid_manifest.json` in the
+experiment folder using only the training split. Exported inference `.pth`
+files retain the required normalization and residual-cap tensors while
+omitting all three training-only posterior networks.
+
+For large datasets, the first optimized run converts derived `.mel.pt` caches
+to crop-readable `.mel.npy` memory maps and removes the replaced `.mel.pt`
+files. This is a one-time I/O pass and does not alter source audio or extracted
+features. Subsequent epochs read only the requested 256-frame mel,
+ContentVec and F0 ranges; training does not decode source audio. Loader
+parallelism can be tuned with `data.loader_workers` and
+`data.prefetch_factor`.
+
+CLI users should select `--vocoder_arch hybrid_fsq` during extraction and
+`--architecture Hybrid-FSQ` during training. The UI selects the matching
+configuration automatically.
+
+## Responsible use
+
+Only use voices and recordings for which you have permission, and clearly
+disclose when audio has been synthesized or converted.
